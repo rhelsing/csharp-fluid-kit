@@ -1,40 +1,53 @@
 #version 450
-// dct_1d — one separable 1D cosine transform along x or y.
+// dct_1d — one separable 1D trig transform along x or y, in either the COSINE or SINE
+// basis. The basis is not cosmetic: it IS the boundary condition.
 //
-// WHY DCT AND NOT DST. solver-ledger.md §7c said "spectral DST/DCT". The boundary
-// condition decides it, and ours is not a choice: every solve body addresses neighbours
-// with clamp(c + off, 0, mx), so at the wall x(-1) = x(0) — zero flux, i.e. NEUMANN.
-// The eigenvectors of the Neumann Laplacian on a cell-centred grid are the DCT-II basis
-// cos(pi*(i+1/2)*p/N). DST diagonalizes the DIRICHLET Laplacian (x = 0 at the wall) and
-// would silently solve a differently-walled tank. So: DCT-II forward, DCT-III inverse.
+//   basis 0 — DCT-II / DCT-III   <->  NEUMANN walls   x(-1) := x(0)     (zero flux)
+//   basis 1 — DST-II / DST-III   <->  DIRICHLET walls x(-1) := -x(0)    (clamped, at the face)
 //
-// Eigenvalue of the 1D second difference in this basis:  -4*sin^2(pi*p/(2N)).
-// (Used by dct_scale, not here.)
+// WHICH ONE MATCHES THE STAMP. Every solve body addresses neighbours with
+// clamp(c + off, 0, mx), i.e. x(-1) = x(0) — NEUMANN. So for the wave-tank stamp the cosine
+// basis is the exact one and the sine basis is not: DST will be right in the interior and
+// wrong in a boundary layer at every wall, and its residual will say so.
 //
-// Pair, unnormalized-forward / 1-over-N-inverse:
-//   DCT-II   X_p = sum_i  x_i * cos(pi*(i+1/2)*p/N)
-//   DCT-III  x_i = ( X_0 + 2*sum_{p>=1} X_p * cos(pi*(i+1/2)*p/N) ) / N
+// SO WHY KEEP DST. Two real uses, neither of them "solve this tank":
+//  1. PRECONDITIONER. Inside CG the operator only has to be approximately inverted. A sine
+//     transform is a perfectly good approximate inverse of a Neumann operator away from the
+//     walls, and it is exact on the part of the spectrum that matters most (the long
+//     wavelengths that relaxation cannot touch — solver-ledger.md §4).
+//  2. IT IS THE EXACT BASIS FOR A CLAMPED STAMP. Scene 06's plate reverb has clamped
+//     Dirichlet edges (mna-next-steps.md §1). For that stamp the roles swap: DST is exact and
+//     DCT is the approximation. Building both now means the plate synth gets an exact solver
+//     for free rather than a second spectral project later.
 //
-// COST: this is the direct O(N) -per-output form, so O(N^2) per axis pass. That is
-// deliberate for v1 — it is ~30 lines and provably correct, and the point of the spectral
-// solver in the plan is the EXACTNESS datapoint (residual at float epsilon in one step),
-// not throughput. The O(N log N) replacement is a port, not a research problem: the
-// working butterfly chain is ../water-kit/kit/waves/shaders/fft_butterfly_{h,v}.glsl
-// with its host in kit/waves/wave_simulation.gd (solver-ledger.md §7e), and a DCT-II is
-// a real FFT plus a symmetric extension and a twiddle.
+// Pairs (unnormalized forward, 1/N inverse), both exactly invertible:
+//   DCT-II   X_p = sum_i x_i cos(pi*(i+1/2)*p/N)
+//   DCT-III  x_i = ( X_0 + 2*sum_{p>=1} X_p cos(pi*(i+1/2)*p/N) ) / N
+//   DST-II   X_p = sum_i x_i sin(pi*(i+1/2)*(p+1)/N)
+//   DST-III  x_i = ( 2*sum_{p<N-1} X_p sin(pi*(i+1/2)*(p+1)/N) + (-1)^i * X_{N-1} ) / N
+// The DST-III tail term is the p = N-1 mode, whose basis vector is (-1)^i and whose norm^2
+// is N rather than N/2 — drop it and the transform is silently not an inverse.
+//
+// COST: direct O(N)-per-output, so O(N^2) per axis pass. Deliberate for v1. The O(N log N)
+// replacement is a port of a WORKING butterfly chain, not research:
+// ../water-kit/kit/waves/shaders/fft_butterfly_{h,v}.glsl + kit/waves/wave_simulation.gd
+// (solver-ledger.md §7e). It is also more ACCURATE — log2(N) accumulation depth instead of
+// N, which is what currently holds this solver ~10x above the float floor (§8c).
 
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 
 layout(r32f, set = 2, binding = 0) uniform image2D src;
 layout(r32f, set = 3, binding = 0) uniform image2D dst;
 
+// 16 bytes, fixed. Flags rather than extra fields on purpose: a push constant whose size
+// disagrees with the host is the bug class that cost this project days (solver-ledger.md §3a).
 layout(push_constant, std430) uniform P {
     vec2 size;
-    uint axis;      // 0 = along x, 1 = along y
-    uint inverse;   // 0 = DCT-II (forward), 1 = DCT-III (inverse)
+    uint axis;    // 0 = along x, 1 = along y
+    uint flags;   // bit 0: 1 = inverse (type III)   bit 1: 1 = sine basis (DST)
 } pc;
 
-const float DCT_PI = 3.141592653589793;
+const float TRIG_PI = 3.141592653589793;
 
 void main() {
     ivec2 c = ivec2(gl_GlobalInvocationID.xy);
@@ -43,24 +56,47 @@ void main() {
         return;
     }
 
-    bool alongX = (pc.axis == 0u);
+    bool alongX  = (pc.axis == 0u);
+    bool inverse = (pc.flags & 1u) != 0u;
+    bool sine    = (pc.flags & 2u) != 0u;
+
     int n = alongX ? int(pc.size.x) : int(pc.size.y);
     int idx = alongX ? c.x : c.y;     // forward: output mode p. inverse: output sample i.
 
-    float acc;
-    if (pc.inverse == 0u) {
-        float w = DCT_PI * float(idx) / float(n);
-        acc = 0.0;
-        for (int i = 0; i < n; i++) {
-            ivec2 s = alongX ? ivec2(i, c.y) : ivec2(c.x, i);
-            acc += imageLoad(src, s).r * cos(w * (float(i) + 0.5));
+    float acc = 0.0;
+
+    if (!inverse) {
+        // ---- forward: type II ----
+        if (sine) {
+            float w = TRIG_PI * float(idx + 1) / float(n);
+            for (int i = 0; i < n; i++) {
+                ivec2 s = alongX ? ivec2(i, c.y) : ivec2(c.x, i);
+                acc += imageLoad(src, s).r * sin(w * (float(i) + 0.5));
+            }
+        } else {
+            float w = TRIG_PI * float(idx) / float(n);
+            for (int i = 0; i < n; i++) {
+                ivec2 s = alongX ? ivec2(i, c.y) : ivec2(c.x, i);
+                acc += imageLoad(src, s).r * cos(w * (float(i) + 0.5));
+            }
         }
     } else {
-        float t = DCT_PI * (float(idx) + 0.5) / float(n);
-        acc = imageLoad(src, alongX ? ivec2(0, c.y) : ivec2(c.x, 0)).r;   // the p = 0 term, unweighted
-        for (int p = 1; p < n; p++) {
-            ivec2 s = alongX ? ivec2(p, c.y) : ivec2(c.x, p);
-            acc += 2.0 * imageLoad(src, s).r * cos(t * float(p));
+        // ---- inverse: type III ----
+        float t = TRIG_PI * (float(idx) + 0.5) / float(n);
+        if (sine) {
+            for (int p = 0; p < n - 1; p++) {
+                ivec2 s = alongX ? ivec2(p, c.y) : ivec2(c.x, p);
+                acc += 2.0 * imageLoad(src, s).r * sin(t * float(p + 1));
+            }
+            // p = n-1: basis vector is (-1)^i, norm^2 = n (not n/2) -> weight 1, not 2
+            ivec2 sl = alongX ? ivec2(n - 1, c.y) : ivec2(c.x, n - 1);
+            acc += ((idx & 1) == 0 ? 1.0 : -1.0) * imageLoad(src, sl).r;
+        } else {
+            acc = imageLoad(src, alongX ? ivec2(0, c.y) : ivec2(c.x, 0)).r;   // p = 0, unweighted
+            for (int p = 1; p < n; p++) {
+                ivec2 s = alongX ? ivec2(p, c.y) : ivec2(c.x, p);
+                acc += 2.0 * imageLoad(src, s).r * cos(t * float(p));
+            }
         }
         acc /= float(n);
     }

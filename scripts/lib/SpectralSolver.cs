@@ -27,6 +27,14 @@ namespace GodotCsharpExperiments.Lib;
 // butterfly chain (../water-kit/kit/waves/, solver-ledger.md §7e), not new research.
 public sealed class SpectralSolver : IStampSolver
 {
+    // The basis IS the boundary condition (see dct_1d.glslinc):
+    //   Cosine — Neumann walls, which is what clamp() gives, so it matches THIS stamp exactly.
+    //   Sine   — Dirichlet (clamped) walls. Wrong BC for the wave tank, on purpose: it is the
+    //            exact basis for a clamped plate (scene 06), and a usable approximate inverse
+    //            for CG preconditioning where matching the walls does not matter.
+    public enum Basis { Cosine, Sine }
+
+    private readonly Basis _basis;
     // stamp push-constant field offsets
     private const int OffBeta = 8, OffA = 12, OffLeak = 16, OffCn = 20, OffSpongeA = 28;
     private const int OffExtraY = 116, OffExtraZ = 120, OffExtraW = 124;
@@ -54,15 +62,16 @@ public sealed class SpectralSolver : IStampSolver
     private bool _warned;
 
     public bool Ready { get; private set; }
-    public string ModeName => "Spectral";
+    public string ModeName => _basis == Basis.Sine ? "SpectralDST" : "SpectralDCT";
     public Rid HeightRid => _hCurr;
     public Rid PrevRid => _hPrev;
     public float LastResidual { get; private set; }
 
-    public SpectralSolver(RenderingDevice rd, Vector2I grid, string stampPath)
+    public SpectralSolver(RenderingDevice rd, Vector2I grid, string stampPath, Basis basis = Basis.Cosine)
     {
         _rd = rd;
         _grid = grid;
+        _basis = basis;
         _gx = (uint)((grid.X - 1) / 8 + 1);
         _gy = (uint)((grid.Y - 1) / 8 + 1);
         _numWg = _gx * _gy;
@@ -117,7 +126,15 @@ public sealed class SpectralSolver : IStampSolver
         }
 
         Ready = true;
-        GD.Print($"[SpectralSolver] DCT-II/III {grid.X}x{grid.Y}, 6 dispatches/step, residual={_resReady}");
+        string kind = _basis == Basis.Sine ? "DST-II/III (Dirichlet walls)" : "DCT-II/III (Neumann walls)";
+        GD.Print($"[SpectralSolver] {kind} {grid.X}x{grid.Y}, 6 dispatches/step, residual={_resReady}");
+        if (_basis == Basis.Sine)
+        {
+            GD.PushWarning("[SpectralSolver] SINE basis assumes Dirichlet walls, but the solve bodies " +
+                           "use clamp() = Neumann. Expect a boundary-layer error at every wall and a " +
+                           "residual well above the cosine basis. This mode is for CG preconditioning " +
+                           "and for clamped stamps (scene 06), not for solving the tank.");
+        }
     }
 
     // Fixed cost — no iteration. The `iters` slider does nothing here, which is itself the
@@ -165,7 +182,7 @@ public sealed class SpectralSolver : IStampSolver
 
         _rd.ComputeListBindComputePipeline(cl, _pSc);
         Bind(cl, _scT2_2, 2); Bind(cl, _scT1_3, 3);
-        _rd.ComputeListSetPushConstant(cl, PcScale(baseDiag, g), 16);
+        _rd.ComputeListSetPushConstant(cl, PcScale(baseDiag, g), 32);
         _rd.ComputeListDispatch(cl, _gx, _gy, 1);
         _rd.ComputeListAddBarrier(cl);
 
@@ -204,19 +221,21 @@ public sealed class SpectralSolver : IStampSolver
 
     private byte[] PcDct(uint axis, bool inverse)
     {
+        uint flags = (inverse ? 1u : 0u) | (_basis == Basis.Sine ? 2u : 0u);
         var b = new byte[16];
         Buffer.BlockCopy(BitConverter.GetBytes((float)_grid.X), 0, b, 0, 4);
         Buffer.BlockCopy(BitConverter.GetBytes((float)_grid.Y), 0, b, 4, 4);
         Buffer.BlockCopy(BitConverter.GetBytes(axis), 0, b, 8, 4);
-        Buffer.BlockCopy(BitConverter.GetBytes(inverse ? 1u : 0u), 0, b, 12, 4);
+        Buffer.BlockCopy(BitConverter.GetBytes(flags), 0, b, 12, 4);
         return b;
     }
 
     private byte[] PcScale(float baseDiag, float g)
     {
+        var b = new byte[32];
         float[] v = { _grid.X, _grid.Y, baseDiag, g };
-        var b = new byte[16];
         Buffer.BlockCopy(v, 0, b, 0, 16);
+        Buffer.BlockCopy(BitConverter.GetBytes(_basis == Basis.Sine ? 1u : 0u), 0, b, 16, 4);
         return b;
     }
 

@@ -32,10 +32,20 @@ layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 layout(r32f, set = 2, binding = 0) uniform image2D src;
 layout(r32f, set = 3, binding = 0) uniform image2D dst;
 
+// The mode index differs by basis, and this is the ONLY place that difference lives:
+//   cosine (Neumann):   mode p = 0..N-1  ->  the p = 0 term is the DC mode, eigenvalue = base
+//   sine (Dirichlet):   mode p+1 = 1..N  ->  there is NO zero mode; a clamped wall cannot
+//                       hold a constant offset, so Lambda > base everywhere.
+// That is also why the sine basis needs no null-mode special case even with leak = 0, while
+// the cosine one leans on base > 0 (solver-ledger.md §4: the leak term exists to pin DC).
 layout(push_constant, std430) uniform P {
     vec2  size;
     float base;   // 1 + a + aMu*leak
     float g;      // aMu * beta_scale * depth
+    uint  sine;   // 0 = cosine/Neumann, 1 = sine/Dirichlet — must match dct_1d's flag bit 1
+    uint  _p0;
+    uint  _p1;
+    uint  _p2;
 } pc;
 
 const float DCT_PI = 3.141592653589793;
@@ -47,8 +57,10 @@ void main() {
         return;
     }
 
-    float sx = sin(DCT_PI * float(c.x) / (2.0 * pc.size.x));
-    float sy = sin(DCT_PI * float(c.y) / (2.0 * pc.size.y));
+    float mp = (pc.sine != 0u) ? float(c.x + 1) : float(c.x);
+    float mq = (pc.sine != 0u) ? float(c.y + 1) : float(c.y);
+    float sx = sin(DCT_PI * mp / (2.0 * pc.size.x));
+    float sy = sin(DCT_PI * mq / (2.0 * pc.size.y));
     float lambda = pc.base + 4.0 * pc.g * (sx * sx + sy * sy);
 
     imageStore(dst, c, vec4(imageLoad(src, c).r / lambda, 0.0, 0.0, 0.0));

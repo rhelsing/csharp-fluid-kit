@@ -41,6 +41,11 @@ public sealed class GpuStampSolver : IStampSolver
 
     // CG scalar-buffer slots
     private const uint SRsold = 0, SPap = 1, SAlpha = 2, SRsnew = 3, SBeta = 4, SNegAlpha = 5, SOne = 6, SZero = 7;
+    // STrueRes holds ||b - Ax|| RECOMPUTED from the field. rsnew (slot 3) is CG's RECURSIVE
+    // residual (maintained by `R -= alpha*AP`, never recomputed) and it drifts far below the
+    // true one — reporting it made CG read ~1e-16 against everyone else's ~1e-07 and made the
+    // whole residual column non-comparable. See solver-ledger.md §8a.
+    private const uint STrueRes = 8;
 
     private readonly RenderingDevice _rd;
     private readonly Vector2I _grid;
@@ -146,10 +151,10 @@ public sealed class GpuStampSolver : IStampSolver
             _cgP = MakeTex(tf);
             _cgAp = MakeTex(tf);
 
-            var scInit = new byte[32];
-            float[] scVals = { 0f, 0f, 0f, 0f, 0f, 0f, 1f, 0f };   // ONE @6, ZERO @7
-            Buffer.BlockCopy(scVals, 0, scInit, 0, 32);
-            _cgScalars = _rd.StorageBufferCreate(32u, scInit);
+            var scInit = new byte[64];
+            float[] scVals = { 0f, 0f, 0f, 0f, 0f, 0f, 1f, 0f, 0f, 0f, 0f, 0f, 0f, 0f, 0f, 0f };   // ONE @6, ZERO @7, true-residual @8
+            Buffer.BlockCopy(scVals, 0, scInit, 0, 64);
+            _cgScalars = _rd.StorageBufferCreate(64u, scInit);
 
             _resH0 = MakeImageSet(_hCurr, 0, _cgRes);
             _resH1 = MakeImageSet(_hPrev, 1, _cgRes);
@@ -332,13 +337,24 @@ public sealed class GpuStampSolver : IStampSolver
             SaxpyBuf(cl, _saxR2, _saxP3, SBeta, SOne);       // P = beta P + R
             _rd.ComputeListAddBarrier(cl);
         }
+
+        if (measure)
+        {
+            // RECOMPUTE ||b - Ax|| from the converged X. Reusing cg_residual (the same kernel
+            // CG already uses to seed R) means this is the same quantity reduce_residual gives
+            // every other solver, so the readouts are finally comparable. Clobbering _cgR is
+            // safe: the next Step re-seeds it from scratch. See solver-ledger.md §8a.
+            DispatchStamp(cl, _cgResPipe, _resH0, _resH1, _resX2, _resR3, stampPc);
+            _rd.ComputeListAddBarrier(cl);
+            DotBuf(cl, _dotR2, _dotR3, STrueRes);
+            _rd.ComputeListAddBarrier(cl);
+        }
         _rd.ComputeListEnd();
 
         if (measure)
         {
             byte[] d = _rd.BufferGetData(_cgScalars);
-            float rsnew = BitConverter.ToSingle(d, (int)SRsnew * 4);
-            LastResidual = Mathf.Sqrt(Mathf.Max(rsnew, 0f));
+            LastResidual = Mathf.Sqrt(Mathf.Max(BitConverter.ToSingle(d, (int)STrueRes * 4), 0f));
         }
 
         var size = new Vector3(_grid.X, _grid.Y, 1);

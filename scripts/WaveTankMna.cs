@@ -261,7 +261,11 @@ public partial class WaveTankMna : Node3D
             5 => new MgDeepSolver(rd, grid, stamp),
             6 => new SchwarzSolver(rd, grid, stamp),
             // Exact only at bathymetry coupling 0 AND sponge 0 — it warns when it isn't.
-            7 => new SpectralSolver(rd, grid, stamp),
+            7 => new SpectralSolver(rd, grid, stamp, SpectralSolver.Basis.Cosine),
+            // Sine basis = Dirichlet walls, which this stamp does NOT have (clamp = Neumann).
+            // Kept as an option because it is the exact basis for a clamped stamp (scene 06)
+            // and a usable CG preconditioner. It warns on construction.
+            8 => new SpectralSolver(rd, grid, stamp, SpectralSolver.Basis.Sine),
             _ => new GpuStampSolver(rd, grid, stamp, (GpuStampSolver.Mode)Mathf.Clamp(_solverMode, 0, 1)),
         };
     }
@@ -875,7 +879,8 @@ public partial class WaveTankMna : Node3D
             "Multigrid (uniform β)",   // the control: scalar-β operator, 2 levels
             "Multigrid (deep)",        // stamp operator, full pyramid
             "Schwarz (block-dense)",
-            "Spectral (uniform depth)",
+            "Spectral DCT (Neumann)",   // matches this stamp's clamp() walls
+            "Spectral DST (Dirichlet)", // wrong walls here on purpose — see SpectralSolver
         }, _solverMode, i =>
         {
             _solverMode = i;
