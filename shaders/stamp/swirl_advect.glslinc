@@ -1,0 +1,79 @@
+#version 450
+
+// swirl_advect.glslinc — foam v3b (docs/scene50-foam.md): the swirl fluid's
+// advect + force pass. Semi-Lagrangian self-advection (backtrace + bilinear sample —
+// unconditionally stable) with dissipation, then the hull forcing: a propwash JET at
+// the stern (the counter-rotating vortex pair emerges from the pressure projection,
+// exactly as it does behind a real transom) and a lateral SHED splat when turning.
+// An edge falloff (window-space, via the toroidal map) kills velocity near the
+// border so scrolled-in strips arrive ~zero.
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(rg16f, set = 0, binding = 0) uniform image2D vel_in;
+layout(rg16f, set = 1, binding = 0) uniform image2D vel_out;
+
+layout(push_constant, std430) uniform Params {
+    vec2  size;
+    float dt;
+    float dissip;      // velocity retention/tick
+    float cell;        // metres per texel
+    float tex_off_x;   // toroidal scroll offset (texels)
+    float tex_off_y;
+    float edge_w;      // edge falloff width (texels, window space)
+    float jet_x;       // jet centre (window-space texels)
+    float jet_y;
+    float jet_dx;      // jet velocity (m/s)
+    float jet_dy;
+    float jet_r;       // jet radius (texels)
+    float shed_x;      // turn-shed centre (window-space texels)
+    float shed_y;
+    float shed_dx;     // shed velocity (m/s)
+    float shed_dy;
+    float shed_r;
+    float _p0;
+    float _p1;
+} pc;
+
+vec2 sw_sample(ivec2 N, vec2 p) {
+    vec2 pf = p - 0.5;
+    ivec2 i0 = ivec2(floor(pf));
+    vec2 fr = pf - vec2(i0);
+    ivec2 i1 = i0 + ivec2(1);
+    i0 = ((i0 % N) + N) % N;
+    i1 = ((i1 % N) + N) % N;
+    vec2 a = imageLoad(vel_in, ivec2(i0.x, i0.y)).rg;
+    vec2 b = imageLoad(vel_in, ivec2(i1.x, i0.y)).rg;
+    vec2 c = imageLoad(vel_in, ivec2(i0.x, i1.y)).rg;
+    vec2 d = imageLoad(vel_in, ivec2(i1.x, i1.y)).rg;
+    return mix(mix(a, b, fr.x), mix(c, d, fr.x), fr.y);
+}
+
+void main() {
+    ivec2 c = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 N = ivec2(pc.size);
+    if (c.x >= N.x || c.y >= N.y) {
+        return;
+    }
+
+    // self-advect: where did the fluid here come from? (velocity in m/s -> texels)
+    vec2 vHere = imageLoad(vel_in, c).rg;
+    vec2 back = vec2(c) + 0.5 - vHere * (pc.dt / pc.cell);
+    vec2 v = sw_sample(N, back) * pc.dissip;
+
+    // window-space cell (toroidal map) for forcing positions + edge falloff
+    ivec2 wc = ((c - ivec2(pc.tex_off_x, pc.tex_off_y)) % N + N) % N;
+    vec2 wcf = vec2(wc) + 0.5;
+
+    vec2 dj = wcf - vec2(pc.jet_x, pc.jet_y);
+    v += vec2(pc.jet_dx, pc.jet_dy) * exp(-dot(dj, dj) / max(pc.jet_r * pc.jet_r, 1e-3));
+    vec2 ds = wcf - vec2(pc.shed_x, pc.shed_y);
+    v += vec2(pc.shed_dx, pc.shed_dy) * exp(-dot(ds, ds) / max(pc.shed_r * pc.shed_r, 1e-3));
+
+    // edge falloff: velocity dies at the window border (scroll strips arrive clean)
+    vec2 de = min(vec2(wc), pc.size - 1.0 - vec2(wc));
+    float edge = clamp(min(de.x, de.y) / max(pc.edge_w, 1.0), 0.0, 1.0);
+    v *= edge * edge;
+
+    imageStore(vel_out, c, vec4(v, 0.0, 0.0));
+}

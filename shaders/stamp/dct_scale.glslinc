@@ -1,0 +1,55 @@
+#version 450
+// dct_scale — the actual solve. In the DCT-II basis the operator is DIAGONAL, so the whole
+// linear system collapses to one divide per mode. No iteration, no residual to drive down.
+//
+// The operator (uniform depth, no sponge):
+//     A = (1 + a + aMu*leak)*I  -  g*(D_x + D_y)          g = aMu * beta_scale * depth
+//     aMu = 1 - 0.5*cn                                     (the implicit stiffness weight)
+// derived from the stamp by expanding st_diag = 1 + a + aMu*(4*g/aMu + leak) and noting the
+// 4-neighbour sum equals D_x + D_y + 4I, so the +4g on the diagonal cancels exactly.
+//
+// Neumann second-difference eigenvalue on a cell-centred grid:  D -> -4*sin^2(pi*p/(2N))
+// therefore
+//     Lambda(p,q) = base + 4*g*( sin^2(pi*p/(2N)) + sin^2(pi*q/(2M)) )
+//     base        = 1 + a + aMu*leak
+//
+// base > 0 always (a and leak are non-negative losses), so Lambda is never zero and there
+// is no null-mode special case — including at p = q = 0, which is the DC mode the leak term
+// exists to pin (solver-ledger.md §4).
+//
+// WHERE THIS IS EXACT — and it is worth being blunt, because a spectral solver that is
+// quietly wrong looks like a fast correct one:
+//   * bathymetry coupling (extra.z) must be 0. Otherwise st_beta_face varies per face, the
+//     operator is not constant-coefficient, and the cosine basis does not diagonalize it.
+//   * sponge_a must be 0. st_damp/st_leak add a spatially varying loss near the edges;
+//     same problem.
+// Outside those, the transform is still a good APPROXIMATION of the operator, which is the
+// real use: as a preconditioner inside CG. As a standalone solver it is exact or it is
+// wrong, and the residual readout will say which.
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(r32f, set = 2, binding = 0) uniform image2D src;
+layout(r32f, set = 3, binding = 0) uniform image2D dst;
+
+layout(push_constant, std430) uniform P {
+    vec2  size;
+    float base;   // 1 + a + aMu*leak
+    float g;      // aMu * beta_scale * depth
+} pc;
+
+const float DCT_PI = 3.141592653589793;
+
+void main() {
+    ivec2 c = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 mx = ivec2(pc.size) - ivec2(1);
+    if (c.x > mx.x || c.y > mx.y) {
+        return;
+    }
+
+    float sx = sin(DCT_PI * float(c.x) / (2.0 * pc.size.x));
+    float sy = sin(DCT_PI * float(c.y) / (2.0 * pc.size.y));
+    float lambda = pc.base + 4.0 * pc.g * (sx * sx + sy * sy);
+
+    imageStore(dst, c, vec4(imageLoad(src, c).r / lambda, 0.0, 0.0, 0.0));
+}

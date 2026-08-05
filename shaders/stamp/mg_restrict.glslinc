@@ -1,0 +1,30 @@
+#version 450
+// mg_restrict — transfer a fine-grid field to the next coarser grid by 2×2 averaging
+// (full-weighting-ish). Dispatched over the COARSE grid: coarse cell c gathers fine
+// cells 2c, 2c+x, 2c+y, 2c+xy. r_fine = set 2, r_coarse = set 3.
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(r32f, set = 2, binding = 0) uniform image2D r_fine;
+layout(r32f, set = 3, binding = 0) uniform image2D r_coarse;
+
+layout(push_constant, std430) uniform P {
+    vec2 coarse_size;
+    vec2 fine_size;
+} pc;
+
+void main() {
+    ivec2 c = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 cmx = ivec2(pc.coarse_size) - ivec2(1);
+    if (c.x > cmx.x || c.y > cmx.y) {
+        return;
+    }
+    ivec2 fmx = ivec2(pc.fine_size) - ivec2(1);
+    ivec2 f = c * 2;
+    float v = 0.25 * (
+        imageLoad(r_fine, min(f, fmx)).r +
+        imageLoad(r_fine, min(f + ivec2(1, 0), fmx)).r +
+        imageLoad(r_fine, min(f + ivec2(0, 1), fmx)).r +
+        imageLoad(r_fine, min(f + ivec2(1, 1), fmx)).r);
+    imageStore(r_coarse, c, vec4(v, 0.0, 0.0, 0.0));
+}

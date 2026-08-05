@@ -1,0 +1,14 @@
+[remap]
+
+importer="glsl"
+type="RDShaderFile"
+uid="uid://c3urp4i35efje"
+path="res://.godot/imported/mna_tank.glsl-c55957fb5648b119df335446cd636eff.res"
+
+[deps]
+
+source_file="res://shaders/mna_tank.glsl"
+dest_files=["res://.godot/imported/mna_tank.glsl-c55957fb5648b119df335446cd636eff.res"]
+
+[params]
+

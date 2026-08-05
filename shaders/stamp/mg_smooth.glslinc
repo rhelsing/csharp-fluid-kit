@@ -1,0 +1,38 @@
+#version 450
+// mg_smooth — one Jacobi relaxation of A_L u = rhs at grid level L:
+//     u_out = ( rhs + beta_L·Σ u_in(n) ) / (1 + a + leak + 4·beta_L)
+// where beta_L = beta_0 / 4^L (Laplacian scales with the coarse spacing; the 1/a/leak
+// point terms don't). u_in = set 2, u_out = set 3, rhs = set 4. clamp = Neumann walls.
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(r32f, set = 2, binding = 0) uniform image2D u_in;
+layout(r32f, set = 3, binding = 0) uniform image2D u_out;
+layout(r32f, set = 4, binding = 0) uniform image2D rhs;
+
+layout(push_constant, std430) uniform P {
+    vec2  size;
+    float beta;
+    float a;
+    float leak;
+    float cn;      // Crank-Nicolson blend (0 = backward-Euler); scales the implicit stiffness
+    float _p1;
+    float _p2;
+} pc;
+
+void main() {
+    ivec2 c = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 mx = ivec2(pc.size) - ivec2(1);
+    if (c.x > mx.x || c.y > mx.y) {
+        return;
+    }
+    const ivec2 offs[4] = ivec2[4](ivec2(1, 0), ivec2(-1, 0), ivec2(0, 1), ivec2(0, -1));
+    float aMu = 1.0 - 0.5 * pc.cn;                          // implicit stiffness weight
+    float diag = 1.0 + pc.a + aMu * (pc.leak + 4.0 * pc.beta);
+    float acc = imageLoad(rhs, c).r;
+    for (int k = 0; k < 4; k++) {
+        ivec2 n = clamp(c + offs[k], ivec2(0), mx);
+        acc += aMu * pc.beta * imageLoad(u_in, n).r;
+    }
+    imageStore(u_out, c, vec4(acc / diag, 0.0, 0.0, 0.0));
+}

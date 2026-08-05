@@ -1,0 +1,42 @@
+#version 450
+// cg_dotbuf — full GPU dot product Σ a·b written to a SCALAR-BUFFER slot (no CPU
+// readback). One workgroup of 256 threads grid-strides the whole field, then a
+// shared-memory tree reduces to a single value → sc[slot]. Keeps CG's dot-products
+// GPU-resident so the whole solve is one barrier-chained compute list.
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(r32f, set = 2, binding = 0) uniform image2D a_img;
+layout(r32f, set = 3, binding = 0) uniform image2D b_img;
+layout(std430, set = 5, binding = 0) buffer Scalars { float sc[]; };
+
+layout(push_constant, std430) uniform P {
+    vec2 size;
+    uint slot;
+    uint _pad;
+} pc;
+
+shared float sdata[256];
+
+void main() {
+    uint w = uint(pc.size.x);
+    uint total = uint(pc.size.x) * uint(pc.size.y);
+    uint li = gl_LocalInvocationIndex;
+
+    float acc = 0.0;
+    for (uint t = li; t < total; t += 256u) {
+        ivec2 c = ivec2(int(t % w), int(t / w));
+        acc += imageLoad(a_img, c).r * imageLoad(b_img, c).r;
+    }
+    sdata[li] = acc;
+    barrier();
+    for (uint s = 128u; s > 0u; s >>= 1u) {
+        if (li < s) {
+            sdata[li] += sdata[li + s];
+        }
+        barrier();
+    }
+    if (li == 0u) {
+        sc[pc.slot] = sdata[0];
+    }
+}

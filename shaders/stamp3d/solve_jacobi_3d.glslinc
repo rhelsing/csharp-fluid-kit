@@ -1,0 +1,24 @@
+// solve_jacobi_3d — one matrix-free Jacobi relaxation on a 3D grid (7-point stencil):
+//     x(c) = ( st_rhs(c) + Σ st_conductance(c,n)·x_in(n) ) / st_diag(c)
+//
+// The 2D solve_jacobi, lifted to a volume: 4 neighbours → 6. Generic over any 3D stamp
+// (st_diag / st_conductance / st_rhs, pc beginning with vec4 size). The solver header
+// supplies iter_in (set 2) / iter_out (set 3) as image3D. clamp() = Neumann walls.
+
+void main() {
+    ivec3 c = ivec3(gl_GlobalInvocationID.xyz);
+    ivec3 mx = ivec3(pc.size.xyz) - ivec3(1);
+    if (c.x > mx.x || c.y > mx.y || c.z > mx.z) { return; }
+
+    const ivec3 offs[6] = ivec3[6](
+        ivec3(1, 0, 0), ivec3(-1, 0, 0),
+        ivec3(0, 1, 0), ivec3(0, -1, 0),
+        ivec3(0, 0, 1), ivec3(0, 0, -1));
+
+    float acc = st_rhs(c);
+    for (int k = 0; k < 6; k++) {
+        ivec3 n = clamp(c + offs[k], ivec3(0), mx);
+        acc += st_conductance(c, n) * imageLoad(iter_in, n).r;
+    }
+    imageStore(iter_out, c, vec4(acc / st_diag(c), 0.0, 0.0, 0.0));
+}

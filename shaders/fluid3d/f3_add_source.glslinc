@@ -1,0 +1,32 @@
+#version 450
+// f3_add_source — inject velocity + dye at a 3D source, buoyancy on the whole field.
+layout(local_size_x = 4, local_size_y = 4, local_size_z = 4) in;
+layout(rgba32f, set = 0, binding = 0) uniform image3D vel;   // in-place (vx,vy,vz)
+layout(r32f,    set = 1, binding = 0) uniform image3D dye;   // in-place
+
+layout(push_constant, std430) uniform P {
+    vec4  size;
+    float dt;
+    float buoy;
+    float sx; float sy; float sz; float sr;   // source centre + radius
+    float ivx; float ivy; float ivz;          // injected velocity
+    float dye_amt;
+} p;
+
+void main() {
+    ivec3 c = ivec3(gl_GlobalInvocationID.xyz);
+    ivec3 mx = ivec3(p.size.xyz) - ivec3(1);
+    if (c.x > mx.x || c.y > mx.y || c.z > mx.z) { return; }
+
+    vec3 v = imageLoad(vel, c).xyz;
+    float d = imageLoad(dye, c).r;
+    v.y += p.dt * p.buoy * d;                                  // buoyancy → +y
+
+    vec3 rel = vec3(c) - vec3(p.sx, p.sy, p.sz);
+    float g = exp(-dot(rel, rel) / (p.sr * p.sr));
+    v += vec3(p.ivx, p.ivy, p.ivz) * g;
+    d += p.dye_amt * g;
+
+    imageStore(vel, c, vec4(v, 0.0));
+    imageStore(dye, c, vec4(d, 0.0, 0.0, 0.0));
+}

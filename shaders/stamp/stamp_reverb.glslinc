@@ -1,0 +1,61 @@
+// stamp_reverb.glslinc — Phase 3b: a 2D plate-reverb membrane for the GpuStampSolver.
+//
+// The literal audio-DSP analog that motivates the whole "stamp = circuit" thesis: a
+// reverb plate is a struck, lightly-damped membrane whose reflected modes ring on into
+// a dense, slowly-decaying tail. Physically it's the SAME damped-wave operator as
+// stamp_wave — ∂²h/∂t² = c²∇²h − γ∂h/∂t — so it reads both h_curr/h_prev naturally (no
+// set-1 gotcha). Two things make it a *plate* rather than scene 03's open pool:
+//   1. CLAMPED (Dirichlet-0) EDGES — the plate is fixed in its frame. The 1-cell border
+//      ring is pinned to 0 (diag 1, no coupling, rhs 0), so waves reflect INVERTED off
+//      the frame and interfere into the plate's standing-mode structure. (Scene 03 uses
+//      open Neumann walls.)
+//   2. Very low damping `a` → a long reverberant decay; a strike excites many modes that
+//      ring together.
+// Struck by an impulse (one-tick force, like scene 03's poke). Shown on the divergent
+// colormap so the +/- mode pattern and its nodal lines are legible.
+//
+// Solvers: Jacobi / RBGS. Contract: push constant `pc` begins with `vec2 size`.
+
+layout(r32f, set = 0, binding = 0) uniform image2D h_curr;   // displacement h(t)
+layout(r32f, set = 1, binding = 0) uniform image2D h_prev;   // h(t-dt)
+
+layout(push_constant, std430) uniform Params {
+    vec2  size;      // grid px  (REQUIRED first field)
+    float beta;      // dt^2 * c^2  -> tension / neighbour conductance
+    float a;         // gamma*dt/2  -> decay (small = long reverb tail)
+    float leak;      // tiny leak-to-ground — keeps the DC mode from lingering
+    float strike_x;  // strike centre px
+    float strike_y;
+    float strike_r;  // strike radius px
+    float strike_w;  // strike strength (0 = no strike this tick) — a ONE-tick impulse
+} pc;                // std430: 9 contiguous 4-byte scalars; host pads the push to 48B.
+
+bool st_edge(ivec2 c) {
+    ivec2 mx = ivec2(pc.size) - ivec2(1);
+    return c.x == 0 || c.y == 0 || c.x == mx.x || c.y == mx.y;   // the clamped frame
+}
+
+float st_conductance(ivec2 c, ivec2 n) {
+    if (st_edge(c)) { return 0.0; }   // frame cell: pinned, no coupling
+    return pc.beta;
+}
+
+float st_diag(ivec2 c) {
+    if (st_edge(c)) { return 1.0; }   // Dirichlet: x = rhs (= 0)
+    return 1.0 + pc.a + 4.0 * pc.beta + pc.leak;
+}
+
+float st_rhs(ivec2 c) {
+    if (st_edge(c)) { return 0.0; }   // frame clamped to rest
+
+    float hc = imageLoad(h_curr, c).r;
+    float hp = imageLoad(h_prev, c).r;
+    float base = 2.0 * hc - hp + pc.a * hp;   // leapfrog companion (the ringing)
+
+    float strike = 0.0;
+    if (pc.strike_w != 0.0) {
+        vec2 d = vec2(c) - vec2(pc.strike_x, pc.strike_y);
+        strike = pc.strike_w * exp(-dot(d, d) / (pc.strike_r * pc.strike_r));
+    }
+    return base + strike;
+}

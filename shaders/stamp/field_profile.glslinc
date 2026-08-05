@@ -1,0 +1,63 @@
+#[compute]
+#version 450
+
+// Energy profile across x — the instrument for "does the big wave actually cross the tank?"
+//
+// One workgroup per BUCKET (a vertical slab of columns). Each thread strides its slab summing
+// h^2 and tracking max|h|, then a shared-memory reduce writes one pair per bucket. Reading the
+// buckets left-to-right shows WHERE energy lives: a cliff between two buckets is the place the
+// wave dies, and a profile that fills up and then holds is a tank that rings.
+//
+// out[2*b + 0] = sum of h^2 in bucket b     (energy)
+// out[2*b + 1] = max |h| in bucket b        (amplitude)
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(r32f, set = 0, binding = 0) uniform image2D h_in;
+layout(std430, set = 1, binding = 0) restrict buffer Out { float v[]; } o;
+
+layout(push_constant, std430) uniform Params {
+	vec2 size;
+	float buckets;
+	float stride;   // sample every Nth cell — cost dial, profile shape is unaffected
+} p;
+
+shared float s_e[64];
+shared float s_m[64];
+
+void main() {
+	int b = int(gl_WorkGroupID.x);
+	int nb = int(p.buckets);
+	int t = int(gl_LocalInvocationID.x);
+	int w = int(p.size.x);
+	int h = int(p.size.y);
+	int st = max(1, int(p.stride));
+
+	int x0 = b * w / nb;
+	int x1 = (b + 1) * w / nb;
+
+	float e = 0.0;
+	float m = 0.0;
+	for (int x = x0 + t * st; x < x1; x += 64 * st) {
+		for (int y = 0; y < h; y += st) {
+			float v = imageLoad(h_in, ivec2(x, y)).r;
+			e += v * v;
+			m = max(m, abs(v));
+		}
+	}
+	s_e[t] = e;
+	s_m[t] = m;
+	barrier();
+
+	for (int s = 32; s > 0; s >>= 1) {
+		if (t < s) {
+			s_e[t] += s_e[t + s];
+			s_m[t] = max(s_m[t], s_m[t + s]);
+		}
+		barrier();
+	}
+	if (t == 0) {
+		o.v[2 * b + 0] = s_e[0];
+		o.v[2 * b + 1] = s_m[0];
+	}
+}

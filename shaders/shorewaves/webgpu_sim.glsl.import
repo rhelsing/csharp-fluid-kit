@@ -1,0 +1,14 @@
+[remap]
+
+importer="glsl"
+type="RDShaderFile"
+uid="uid://ipaiivk87teu"
+path="res://.godot/imported/webgpu_sim.glsl-3b0b714aa402a416db25cc679680829d.res"
+
+[deps]
+
+source_file="res://shaders/shorewaves/webgpu_sim.glsl"
+dest_files=["res://.godot/imported/webgpu_sim.glsl-3b0b714aa402a416db25cc679680829d.res"]
+
+[params]
+

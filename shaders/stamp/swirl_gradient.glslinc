@@ -1,0 +1,30 @@
+#version 450
+
+// swirl_gradient.glslinc — foam v3b: subtract ∇p from the velocity → divergence-free
+// field. Incompressibility is what turns pushes into ROTATION — the whole reason the
+// milk-in-coffee effect exists.
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(rg16f, set = 0, binding = 0) uniform image2D vel_in;
+layout(rg16f, set = 1, binding = 0) uniform image2D vel_out;
+layout(r16f, set = 2, binding = 0) uniform image2D pr_in;
+
+layout(push_constant, std430) uniform Params {
+    vec2 size;
+    vec2 _pad;
+} pc;
+
+void main() {
+    ivec2 c = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 N = ivec2(pc.size);
+    if (c.x >= N.x || c.y >= N.y) {
+        return;
+    }
+    float pR = imageLoad(pr_in, ((c + ivec2(1, 0)) % N + N) % N).r;
+    float pL = imageLoad(pr_in, ((c + ivec2(-1, 0)) % N + N) % N).r;
+    float pU = imageLoad(pr_in, ((c + ivec2(0, 1)) % N + N) % N).r;
+    float pD = imageLoad(pr_in, ((c + ivec2(0, -1)) % N + N) % N).r;
+    vec2 v = imageLoad(vel_in, c).rg - 0.5 * vec2(pR - pL, pU - pD);
+    imageStore(vel_out, c, vec4(v, 0.0, 0.0));
+}

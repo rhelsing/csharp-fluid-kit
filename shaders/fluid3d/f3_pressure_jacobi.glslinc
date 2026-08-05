@@ -1,0 +1,25 @@
+#version 450
+// f3_pressure_jacobi — one Jacobi relaxation of ∇²p = div in 3D (7-point):
+//     p(c) = (Σ 6 neighbours − div) / 6.
+// The same matrix-free relaxation the stamp solvers use, now the 3D pressure projection.
+layout(local_size_x = 4, local_size_y = 4, local_size_z = 4) in;
+layout(r32f, set = 0, binding = 0) uniform image3D p_in;
+layout(r32f, set = 1, binding = 0) uniform image3D div;
+layout(r32f, set = 2, binding = 0) uniform image3D p_out;
+
+layout(push_constant, std430) uniform P { vec4 size; vec4 pad; } pc;
+
+void main() {
+    ivec3 c = ivec3(gl_GlobalInvocationID.xyz);
+    ivec3 mx = ivec3(pc.size.xyz) - ivec3(1);
+    if (c.x > mx.x || c.y > mx.y || c.z > mx.z) { return; }
+    float s =
+        imageLoad(p_in, clamp(c + ivec3(1, 0, 0), ivec3(0), mx)).r +
+        imageLoad(p_in, clamp(c + ivec3(-1, 0, 0), ivec3(0), mx)).r +
+        imageLoad(p_in, clamp(c + ivec3(0, 1, 0), ivec3(0), mx)).r +
+        imageLoad(p_in, clamp(c + ivec3(0, -1, 0), ivec3(0), mx)).r +
+        imageLoad(p_in, clamp(c + ivec3(0, 0, 1), ivec3(0), mx)).r +
+        imageLoad(p_in, clamp(c + ivec3(0, 0, -1), ivec3(0), mx)).r;
+    float d = imageLoad(div, c).r;
+    imageStore(p_out, c, vec4((s - d) / 6.0, 0.0, 0.0, 0.0));
+}

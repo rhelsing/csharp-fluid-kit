@@ -1,0 +1,23 @@
+// cg_saxpy.glslinc — fused vector update  y = cy·y + cx·x  (x = iter_in @ set 2,
+// y = iter_out @ set 3, in place). Covers all three CG updates:
+//     x += α p     → (y=x, x=p,  cy=1,   cx=α)
+//     r -= α Ap    → (y=r, x=Ap, cy=1,   cx=-α)
+//     p  = r + β p → (y=p, x=r,  cy=β,   cx=1)
+// NO stamp — its own tiny push constant (size + the two coefficients).
+
+layout(push_constant, std430) uniform SaxP {
+    vec2 size;
+    float cy;
+    float cx;
+} sp;
+
+void main() {
+    ivec2 c = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 mx = ivec2(sp.size) - ivec2(1);
+    if (c.x > mx.x || c.y > mx.y) {
+        return;
+    }
+    float y = imageLoad(iter_out, c).r;
+    float x = imageLoad(iter_in, c).r;
+    imageStore(iter_out, c, vec4(sp.cy * y + sp.cx * x, 0.0, 0.0, 0.0));
+}

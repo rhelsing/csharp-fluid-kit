@@ -1,0 +1,21 @@
+# Godot 4.x — auto-generated cache & imported resources
+.godot/
+
+# .NET / C# build output
+.mono/
+bin/
+obj/
+*.user
+
+# Editor-generated
+export_presets.cfg
+*.translation
+
+# Exported binaries / packages
+*.pck
+*.zip
+*.dmg
+*.exe
+*.apk
+*.aab
+*.app/

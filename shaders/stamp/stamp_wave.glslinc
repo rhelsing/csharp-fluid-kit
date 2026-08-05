@@ -1,0 +1,79 @@
+// stamp_wave.glslinc — the implicit damped-wave stamp for the GpuStampSolver.
+//
+// Assembled by GpuStampSolver.cs AFTER the solver header (iter_in/iter_out at sets
+// 2/3) and BEFORE the solve body. Declares the problem STATE + push constant, and
+// the A x = b contract per cell:
+//     diag             = 1 + a + 4*beta + leak     (+ leak = restoring pull to rest)
+//     conductance(any) = beta = dt^2 * c^2          (pipe to each neighbour)
+//     rhs              = 2*h_curr - h_prev + a*h_prev + force   (leapfrog companion)
+//
+// `leak` is a conductance from every node to GROUND (the rest datum, 0) — an MNA
+// element on the diagonal. WITHOUT it, a closed pool's (Neumann) Laplacian has zero
+// row-sums, so the DC / mean-height mode has eigenvalue exactly 1: damping kills the
+// ripples but the mean never decays, and all-positive pokes make the surface creep
+// upward forever. leak > 0 makes the DC eigenvalue < 1 → the mean relaxes back to
+// flat (physically: gravity pulling the surface to rest). Fixes the drift at source
+// and, living in the stamp, fixes every scene that shares the operator.
+//
+// Contract every stamp must honour: the push constant `pc` begins with `vec2 size`.
+
+layout(r32f, set = 0, binding = 0) uniform image2D h_curr;   // state: h(t)
+layout(r32f, set = 1, binding = 0) uniform image2D h_prev;   // state: h(t-dt)
+
+layout(push_constant, std430) uniform Params {
+    vec2  size;     // grid px  (REQUIRED first field)
+    float beta;     // dt^2 * c^2   -> neighbour conductance
+    float a;        // gamma*dt/2   -> damping
+    float leak;     // restoring conductance to rest (0) -> kills the DC drift
+    float drop_x;   // poke centre px
+    float drop_y;
+    float drop_r;   // poke radius px
+    float drop_w;   // poke strength (0 = no poke)
+    float cn;       // scheme blend: 0 = backward-Euler (dissipative) · 1 = Crank-Nicolson (rings)
+    float poke_mode; // 0 = gaussian force · 1 = zero-net-volume dipole (stable at a standstill)
+    float _pad;
+} pc;               // std430: 12 contiguous 4-byte scalars (48B push).
+
+// θ-blend (pc.cn) of the wave operator across time levels. The implicit stiffness
+// weight aμ moves onto the diagonal at t+dt; the rest, cμ, is applied to the KNOWN past
+// level t-dt (in st_rhs). cn=0 → aμ=1, cμ=0 = fully implicit (backward-Euler, damped).
+// cn=1 → aμ=cμ=½ = Crank-Nicolson: symmetric in past/future, so no numerical dissipation
+// (ripples ring), and still unconditionally stable.
+float st_conductance(ivec2 c, ivec2 n) {
+    return (1.0 - 0.5 * pc.cn) * pc.beta;
+}
+
+float st_diag(ivec2 c) {
+    return 1.0 + pc.a + (1.0 - 0.5 * pc.cn) * (4.0 * pc.beta + pc.leak);
+}
+
+float st_rhs(ivec2 c) {
+    float hc = imageLoad(h_curr, c).r;
+    float hp = imageLoad(h_prev, c).r;
+
+    // cμ share of the stiffness on the past level: D(hp) = beta·Σ hp(n) − (4beta+leak)·hp
+    // (= dt²·L applied to h_prev). At cn=0 this term vanishes → the original scheme.
+    ivec2 mx = ivec2(pc.size) - ivec2(1);
+    float hpN = imageLoad(h_prev, clamp(c + ivec2(1, 0), ivec2(0), mx)).r
+              + imageLoad(h_prev, clamp(c + ivec2(-1, 0), ivec2(0), mx)).r
+              + imageLoad(h_prev, clamp(c + ivec2(0, 1), ivec2(0), mx)).r
+              + imageLoad(h_prev, clamp(c + ivec2(0, -1), ivec2(0), mx)).r;
+    float dhp = pc.beta * hpN - (4.0 * pc.beta + pc.leak) * hp;
+
+    float force = 0.0;
+    if (pc.drop_w != 0.0) {
+        vec2 d = vec2(c) - vec2(pc.drop_x, pc.drop_y);
+        float r2 = dot(d, d) / (pc.drop_r * pc.drop_r);
+        if (pc.poke_mode == 1.0) {
+            // Zero-net-volume dipole: gaussian depression minus a 2×-wider half-weight
+            // gaussian → ∫force dA = 0, so a stationary/slow poke can't pump the mean
+            // (the stop-sink dies at the source; leak/cutoff no longer load-bearing).
+            // ×2 peak-matches the centre to the plain gaussian; the +ring (~w/8) is the
+            // displaced water — a free bow wave.
+            force = pc.drop_w * 2.0 * (exp(-r2) - 0.5 * exp(-0.5 * r2));
+        } else {
+            force = pc.drop_w * exp(-r2);
+        }
+    }
+    return 2.0 * hc - hp + pc.a * hp + (0.5 * pc.cn) * dhp + force;
+}

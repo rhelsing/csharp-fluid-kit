@@ -1,0 +1,14 @@
+[remap]
+
+importer="glsl"
+type="RDShaderFile"
+uid="uid://twymebaas7wt"
+path="res://.godot/imported/pass_wave.glsl-ec695d2a445921357bc692077b8bdccf.res"
+
+[deps]
+
+source_file="res://shaders/shorewaves/pass_wave.glsl"
+dest_files=["res://.godot/imported/pass_wave.glsl-ec695d2a445921357bc692077b8bdccf.res"]
+
+[params]
+

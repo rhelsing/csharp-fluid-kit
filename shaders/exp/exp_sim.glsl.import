@@ -1,0 +1,14 @@
+[remap]
+
+importer="glsl"
+type="RDShaderFile"
+uid="uid://u78cexom6s1a"
+path="res://.godot/imported/exp_sim.glsl-83ef3b7b264347b1d9af80cfdd0a47c5.res"
+
+[deps]
+
+source_file="res://shaders/exp/exp_sim.glsl"
+dest_files=["res://.godot/imported/exp_sim.glsl-83ef3b7b264347b1d9af80cfdd0a47c5.res"]
+
+[params]
+

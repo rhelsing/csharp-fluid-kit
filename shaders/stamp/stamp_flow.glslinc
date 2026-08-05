@@ -1,0 +1,73 @@
+// stamp_flow.glslinc — Phase 2 "circuit sources" stamp for the GpuStampSolver.
+//
+// Same implicit damped-wave medium as stamp_wave, now with the two ideal MNA sources
+// placed ON the grid (the "modified" part of Modified Nodal Analysis, at grid scale):
+//   • FAUCET = an ideal CURRENT source — a persistent Gaussian injected straight into
+//              b (rhs). It pours water in without fixing the level.
+//   • DRAIN  = an ideal VOLTAGE source — a Dirichlet PIN: inside the drain disk the row
+//              is REPLACED by  x = drn_v  (diag 1, no neighbour coupling, rhs = the
+//              pinned level). The pinned cells hold that level every sweep, so their
+//              neighbours relax toward it → water leaves at a fixed head.
+// Pour in one corner, pin a drain in another → the relaxation settles to the steady
+// flow field (a tilted gradient from faucet to drain). This is exactly the resistor
+// network of scene 20 at grid scale: current in at a node, one node held to ground.
+//
+// Reused verbatim from stamp_wave: BOTH h_curr (set 0) and h_prev (set 1) are
+// referenced. A stamp that reads NEITHER gets those two bindings stripped by the GLSL
+// compiler → the host's fixed set-0/set-1 uniform creation fails. Keep the leapfrog
+// companion (which reads both) and the medium stays a live, unconditionally-stable
+// damped wave that settles to the steady Poisson flow.
+//
+// Solvers: Jacobi / RBGS relax this stamp generically. CG's SpMV and the multigrid
+// kernels inline the wave operator (not the stamp), so they are NOT used here.
+//
+// Contract every stamp must honour: the push constant `pc` begins with `vec2 size`.
+
+layout(r32f, set = 0, binding = 0) uniform image2D h_curr;   // state: h(t)
+layout(r32f, set = 1, binding = 0) uniform image2D h_prev;   // state: h(t-dt)
+
+layout(push_constant, std430) uniform Params {
+    vec2  size;     // grid px  (REQUIRED first field)
+    float beta;     // dt^2 * c^2   -> neighbour conductance
+    float a;        // gamma*dt/2   -> damping
+    float leak;     // restoring conductance to rest (0)
+    float src_x;    // faucet centre px  (current source)
+    float src_y;
+    float src_r;    // faucet radius px
+    float src_w;    // faucet current   (0 = off)
+    float drn_x;    // drain centre px   (voltage source / Dirichlet pin)
+    float drn_y;
+    float drn_r;    // drain radius px   (<= 0 = no drain)
+    float drn_v;    // drain pinned level (the "voltage")
+} pc;               // std430: 13 contiguous 4-byte scalars; host pads the push to 64B.
+
+bool st_in_drain(ivec2 c) {
+    if (pc.drn_r <= 0.0) { return false; }
+    vec2 d = vec2(c) - vec2(pc.drn_x, pc.drn_y);
+    return dot(d, d) <= pc.drn_r * pc.drn_r;
+}
+
+float st_conductance(ivec2 c, ivec2 n) {
+    if (st_in_drain(c)) { return 0.0; }   // pinned row: no neighbour coupling
+    return pc.beta;
+}
+
+float st_diag(ivec2 c) {
+    if (st_in_drain(c)) { return 1.0; }   // Dirichlet: x = rhs
+    return 1.0 + pc.a + 4.0 * pc.beta + pc.leak;
+}
+
+float st_rhs(ivec2 c) {
+    if (st_in_drain(c)) { return pc.drn_v; }   // voltage source: pin to the drain level
+
+    float hc = imageLoad(h_curr, c).r;
+    float hp = imageLoad(h_prev, c).r;
+    float base = 2.0 * hc - hp + pc.a * hp;    // leapfrog companion (dynamics)
+
+    float src = 0.0;                           // faucet: persistent Gaussian current -> b
+    if (pc.src_w != 0.0) {
+        vec2 d = vec2(c) - vec2(pc.src_x, pc.src_y);
+        src = pc.src_w * exp(-dot(d, d) / (pc.src_r * pc.src_r));
+    }
+    return base + src;
+}

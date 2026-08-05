@@ -1,0 +1,20 @@
+#version 450
+// fs_divergence — div = ∂vx/∂x + ∂vy/∂y (central differences), the RHS of the pressure
+// Poisson solve. clamp = Neumann walls.
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+layout(rg32f, set = 0, binding = 0) uniform image2D vel;
+layout(r32f,  set = 1, binding = 0) uniform image2D div;
+
+layout(push_constant, std430) uniform P { vec2 size; vec2 pad; } p;
+
+void main() {
+    ivec2 c = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 mx = ivec2(p.size) - ivec2(1);
+    if (c.x > mx.x || c.y > mx.y) { return; }
+
+    float vxR = imageLoad(vel, clamp(c + ivec2(1, 0), ivec2(0), mx)).r;
+    float vxL = imageLoad(vel, clamp(c + ivec2(-1, 0), ivec2(0), mx)).r;
+    float vyU = imageLoad(vel, clamp(c + ivec2(0, 1), ivec2(0), mx)).g;
+    float vyD = imageLoad(vel, clamp(c + ivec2(0, -1), ivec2(0), mx)).g;
+    imageStore(div, c, vec4(0.5 * ((vxR - vxL) + (vyU - vyD)), 0.0, 0.0, 0.0));
+}

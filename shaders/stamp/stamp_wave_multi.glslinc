@@ -1,0 +1,94 @@
+// stamp_wave_multi.glslinc — the implicit damped-wave stamp with FOUR pokes per tick
+// (scene 50's boat wake needs bow + stern + mouse + auto forcing in one tick; the
+// single-drop stamp_wave.glslinc stays untouched for the scenes that share it).
+// Physics identical to stamp_wave.glslinc — see that file for the full derivation
+// (diag / conductance / rhs contract, the leak-to-ground DC fix, the θ-blend cn).
+//
+// Push layout (std430, 112B = 28 floats, 16B-aligned so the vec4 array packs clean):
+//   vec2 size; float beta; float a;               (16B)
+//   float leak; float cn; float sponge_w; float sponge_a;   (16B)
+//   vec2 tex_off; vec2 _pad2;                     (16B)
+//   vec4 drops[4];                                (64B)  xy = centre (world-window cells), z = radius px, w = strength
+//
+// SPONGE (absorbing edges, plan §2.5): a quadratic damping ramp over the outer
+// sponge_w cells so waves propagate out and VANISH at the window border instead of
+// reflecting off the invisible wall — "stop caring" = absorption, not reflection.
+//
+// Contract every stamp must honour: the push constant `pc` begins with `vec2 size`.
+
+layout(r32f, set = 0, binding = 0) uniform image2D h_curr;   // state: h(t)
+layout(r32f, set = 1, binding = 0) uniform image2D h_prev;   // state: h(t-dt)
+
+layout(push_constant, std430) uniform Params {
+    vec2  size;      // grid px  (REQUIRED first field)
+    float beta;      // dt^2 * c^2   -> neighbour conductance
+    float a;         // gamma*dt/2   -> damping
+    float leak;      // restoring conductance to rest (0) -> kills the DC drift
+    float cn;        // scheme blend: 0 = backward-Euler (dissipative) · 1 = Crank-Nicolson (rings)
+    float sponge_w;  // absorbing ramp width (px) at the window border
+    float sponge_a;  // extra damping at the very edge (ramps quadratically from 0)
+    vec2  tex_off;   // toroidal scroll offset (px): texel = world-window cell + tex_off (mod N)
+    vec2  _pad2;
+    vec4  drops[4];  // xy = centre in WORLD-window cells, z = radius px, w = strength (0 = no poke)
+} pc;
+
+// Texel -> world-window cell (0..N-1 across the window). The field is world-anchored;
+// scrolling bumps tex_off instead of moving data (clipmap / toroidal addressing), so
+// sponge distances and drop positions are computed in WORLD-window space while the
+// stencil runs in texel space (with wrap — see solve_rbgs_wrap.glslinc).
+ivec2 st_world(ivec2 c) {
+    ivec2 N = ivec2(pc.size);
+    return (c - ivec2(pc.tex_off) + N) % N;
+}
+
+// Quadratic sponge profile: 0 interior -> 1 at the WINDOW border (world space).
+float st_sponge(ivec2 c) {
+    vec2 mxf = pc.size - vec2(1.0);
+    vec2 wc = vec2(st_world(c));
+    vec2 de = min(wc, mxf - wc);
+    float t = clamp(1.0 - min(de.x, de.y) / max(pc.sponge_w, 1.0), 0.0, 1.0);
+    return t * t;
+}
+
+// The sponge ramps BOTH losses: damping alone (a velocity loss) lets a statically-
+// forced mound stand forever — dh/dt = 0 sees no damping — so the leak share
+// (a displacement loss to the rest datum) is what actually flattens it.
+float st_damp(ivec2 c) {
+    return pc.a + pc.sponge_a * st_sponge(c);
+}
+
+float st_leak(ivec2 c) {
+    return pc.leak + pc.sponge_a * st_sponge(c);
+}
+
+float st_conductance(ivec2 c, ivec2 n) {
+    return (1.0 - 0.5 * pc.cn) * pc.beta;
+}
+
+float st_diag(ivec2 c) {
+    return 1.0 + st_damp(c) + (1.0 - 0.5 * pc.cn) * (4.0 * pc.beta + st_leak(c));
+}
+
+float st_rhs(ivec2 c) {
+    float hc = imageLoad(h_curr, c).r;
+    float hp = imageLoad(h_prev, c).r;
+
+    // cμ share of the stiffness on the past level (Crank-Nicolson) — see stamp_wave.glslinc.
+    // Neighbours wrap (toroidal): the texture edge is an interior world line once scrolled.
+    ivec2 N = ivec2(pc.size);
+    float hpN = imageLoad(h_prev, (c + ivec2(1, 0) + N) % N).r
+              + imageLoad(h_prev, (c + ivec2(-1, 0) + N) % N).r
+              + imageLoad(h_prev, (c + ivec2(0, 1) + N) % N).r
+              + imageLoad(h_prev, (c + ivec2(0, -1) + N) % N).r;
+    float dhp = pc.beta * hpN - (4.0 * pc.beta + st_leak(c)) * hp;
+
+    float force = 0.0;
+    vec2 wc = vec2(st_world(c));
+    for (int i = 0; i < 4; i++) {
+        if (pc.drops[i].w != 0.0) {
+            vec2 d = wc - pc.drops[i].xy;
+            force += pc.drops[i].w * exp(-dot(d, d) / (pc.drops[i].z * pc.drops[i].z));
+        }
+    }
+    return 2.0 * hc - hp + st_damp(c) * hp + (0.5 * pc.cn) * dhp + force;
+}

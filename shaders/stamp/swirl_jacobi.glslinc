@@ -1,0 +1,30 @@
+#version 450
+
+// swirl_jacobi.glslinc — foam v3b: one Jacobi sweep of the pressure Poisson system
+// ∇²p = div (toroidal neighbours). The host runs K sweeps ping-ponged, warm-started
+// from last tick's pressure so convergence carries over.
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(r16f, set = 0, binding = 0) uniform image2D pr_in;
+layout(r16f, set = 1, binding = 0) uniform image2D pr_out;
+layout(r16f, set = 2, binding = 0) uniform image2D div_in;
+
+layout(push_constant, std430) uniform Params {
+    vec2 size;
+    vec2 _pad;
+} pc;
+
+void main() {
+    ivec2 c = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 N = ivec2(pc.size);
+    if (c.x >= N.x || c.y >= N.y) {
+        return;
+    }
+    float pR = imageLoad(pr_in, ((c + ivec2(1, 0)) % N + N) % N).r;
+    float pL = imageLoad(pr_in, ((c + ivec2(-1, 0)) % N + N) % N).r;
+    float pU = imageLoad(pr_in, ((c + ivec2(0, 1)) % N + N) % N).r;
+    float pD = imageLoad(pr_in, ((c + ivec2(0, -1)) % N + N) % N).r;
+    float d = imageLoad(div_in, c).r;
+    imageStore(pr_out, c, vec4((pR + pL + pU + pD - d) * 0.25, 0.0, 0.0, 0.0));
+}

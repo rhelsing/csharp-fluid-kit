@@ -1,0 +1,37 @@
+#version 450
+// mg_residual — r = rhs − A_L u = rhs − ( diag·u − beta_L·Σ u(n) ) at level L.
+// u = set 2, r_out = set 3, rhs = set 4. Same push constant as mg_smooth.
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(r32f, set = 2, binding = 0) uniform image2D u_in;
+layout(r32f, set = 3, binding = 0) uniform image2D r_out;
+layout(r32f, set = 4, binding = 0) uniform image2D rhs;
+
+layout(push_constant, std430) uniform P {
+    vec2  size;
+    float beta;
+    float a;
+    float leak;
+    float cn;      // Crank-Nicolson blend (0 = backward-Euler); scales the implicit stiffness
+    float _p1;
+    float _p2;
+} pc;
+
+void main() {
+    ivec2 c = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 mx = ivec2(pc.size) - ivec2(1);
+    if (c.x > mx.x || c.y > mx.y) {
+        return;
+    }
+    const ivec2 offs[4] = ivec2[4](ivec2(1, 0), ivec2(-1, 0), ivec2(0, 1), ivec2(0, -1));
+    float aMu = 1.0 - 0.5 * pc.cn;                          // implicit stiffness weight
+    float diag = 1.0 + pc.a + aMu * (pc.leak + 4.0 * pc.beta);
+    float u = imageLoad(u_in, c).r;
+    float au = diag * u;
+    for (int k = 0; k < 4; k++) {
+        ivec2 n = clamp(c + offs[k], ivec2(0), mx);
+        au -= aMu * pc.beta * imageLoad(u_in, n).r;
+    }
+    imageStore(r_out, c, vec4(imageLoad(rhs, c).r - au, 0.0, 0.0, 0.0));
+}

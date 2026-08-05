@@ -1,0 +1,32 @@
+// solve_rbgs_wrap.glslinc — solve_rbgs.glslinc with TOROIDAL neighbour addressing
+// (mod N wrap instead of clamp) for the scene-50 camera-following sim window.
+//
+// Why: once the field scrolls (clipmap-style, world-anchored data + a sliding texture
+// offset), the TEXTURE edge lands at an arbitrary INTERIOR world line — a clamped
+// stencil would put an invisible Neumann wall through the middle of the ocean. Wrap
+// restores medium continuity there; the true world-window seam (where wrap would be
+// wrong) always sits inside the absorbing sponge, where the field is ~0 and nothing
+// propagates anyway. See docs/mna-next-steps.md §2.5.
+//
+// Identical to solve_rbgs.glslinc in every other respect (see it for the RBGS notes).
+
+void main() {
+    ivec2 c = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 N = ivec2(pc.size);
+    if (c.x >= N.x || c.y >= N.y) {
+        return;
+    }
+
+    if (((c.x + c.y) & 1) != PARITY) {
+        imageStore(iter_out, c, imageLoad(iter_in, c));   // other colour: copy through
+        return;
+    }
+
+    const ivec2 offs[4] = ivec2[4](ivec2(1, 0), ivec2(-1, 0), ivec2(0, 1), ivec2(0, -1));
+    float acc = st_rhs(c);
+    for (int k = 0; k < 4; k++) {
+        ivec2 n = (c + offs[k] + N) % N;
+        acc += st_conductance(c, n) * imageLoad(iter_in, n).r;
+    }
+    imageStore(iter_out, c, vec4(acc / st_diag(c), 0.0, 0.0, 0.0));
+}

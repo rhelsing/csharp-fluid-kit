@@ -1,0 +1,52 @@
+#version 450
+// f3_ocean_couple — scene 17's water→mist coupling (docs/mna-next-steps.md §2b).
+// Runs BEFORE the FluidSim3D step each tick:
+//   · ∂h/∂t of the MNA wave field (h_curr − h_prev, both bound) becomes an UPDRAFT
+//     plus a mist (dye) source in the bottom slab → mist rises where the water
+//     heaves and tears open along the wake. This is the coupling that makes the
+//     fog feel alive instead of scrolled.
+//   · a uniform Galilean velocity DELTA (−Δ box velocity) is added to the whole
+//     field so the sim box can ride the boat while the mist stays world-anchored
+//     (a uniform flow is dynamics-free — Galilean invariance — it only advects).
+//   · a faint ambient dye seed keeps a thin resting mist bed on quiet water.
+layout(local_size_x = 4, local_size_y = 4, local_size_z = 4) in;
+layout(rgba32f, set = 0, binding = 0) uniform image3D vel;    // in-place
+layout(r32f,    set = 1, binding = 0) uniform image3D dye;    // in-place
+layout(r32f,    set = 2, binding = 0) uniform image2D h_curr; // MNA wave field h(t)
+layout(r32f,    set = 3, binding = 0) uniform image2D h_prev; // h(t-dt)
+
+layout(push_constant, std430) uniform P {
+    vec4  size;      // fluid grid (xyz) + bottom-slab height in cells (w)
+    float updraft;   // ∂h/∂t → vy gain
+    float mist;      // |∂h/∂t| → dye gain
+    float thresh;    // |∂h/∂t| dead-zone (ambient ripples make no mist)
+    float ambient;   // resting mist seed per tick (bottom slab)
+    vec2  gal;       // uniform velocity delta this tick (cells/tick, xz)
+    vec2  mna0;      // fluid cell (0,*,0) → MNA texel coords
+    vec2  mna_scale; // MNA texels per fluid cell
+    vec2  _pad;
+} p;
+
+void main() {
+    ivec3 c = ivec3(gl_GlobalInvocationID.xyz);
+    ivec3 mx = ivec3(p.size.xyz) - ivec3(1);
+    if (c.x > mx.x || c.y > mx.y || c.z > mx.z) { return; }
+
+    vec3 v = imageLoad(vel, c).xyz;
+    v.xz += p.gal;
+
+    if (float(c.y) < p.size.w) {
+        vec2 mt = p.mna0 + vec2(c.xz) * p.mna_scale;
+        ivec2 mi = ivec2(round(mt));
+        ivec2 msz = imageSize(h_curr);
+        if (mi.x >= 0 && mi.y >= 0 && mi.x < msz.x && mi.y < msz.y) {
+            float dht = imageLoad(h_curr, mi).r - imageLoad(h_prev, mi).r;
+            float slab = 1.0 - float(c.y) / max(p.size.w, 1.0);   // strongest at the surface
+            v.y += p.updraft * dht * slab;
+            float burst = max(abs(dht) - p.thresh, 0.0);
+            float d = imageLoad(dye, c).r + (p.mist * burst + p.ambient) * slab;
+            imageStore(dye, c, vec4(d, 0.0, 0.0, 0.0));
+        }
+    }
+    imageStore(vel, c, vec4(v, 0.0));
+}

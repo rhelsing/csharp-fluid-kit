@@ -1,0 +1,141 @@
+#version 450
+
+// foam_update_v2.glslinc — scene 50 foam v2+v3a (docs/scene50-foam.md).
+//
+// v2 — the 3-bin LIFETIME CASCADE (coarse bubble-size spectrum; big bubbles die
+// fast into small ones that linger):
+//     R = whitecap  — fast decay, fed by the curvature source
+//     G = lace      — slow decay, fed by a share of the whitecap's decayed mass
+//     B = subsurface milk — fed by decaying lace, tints the water column
+// v3a — SWELL DRIFT: semi-Lagrangian backtrace by the analytic Gerstner orbital
+// velocity of the two dominant bands (evaluated per cell at its WORLD position via
+// the toroidal origin/tex_off map — no extra sim). Backtrace = per cell, trace
+// backward along the velocity and SAMPLE (never scatter): unconditionally stable,
+// and its slight blur flatters transported foam.
+//
+// ADDITIVE LAYER: v1 (foam_update.glslinc) untouched and may run alongside.
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(rgba16f, set = 0, binding = 0) uniform image2D foam_in;
+layout(rgba16f, set = 1, binding = 0) uniform image2D foam_out;
+layout(r32f, set = 2, binding = 0) uniform image2D h_curr;
+layout(rg16f, set = 3, binding = 0) uniform image2D swirl_vel;   // v3b: the 128² Stam fluid
+
+layout(push_constant, std430) uniform Params {   // exactly 32 floats = 128B (Vulkan guaranteed max)
+    vec2  size;
+    float decay_w;    // whitecap retention/tick (~0.94 → ~0.3 s)
+    float decay_l;    // lace retention/tick     (~0.996 → ~4 s)
+    float decay_s;    // subsurface retention/tick
+    float xfer_wl;    // share of decayed whitecap that becomes lace
+    float xfer_ls;    // share of decayed lace that becomes subsurface milk
+    float gain;       // curvature -> whitecap source scale
+    float thresh;     // v2's OWN curvature dead-zone (split from v1's)
+    float wave_time;  // shared Gerstner clock
+    float drift;      // v3a: swell-drift strength (0 = static, v2-only behaviour)
+    float cell;       // window metres per texel
+    float origin_x;   // window min corner (world XZ)
+    float origin_y;
+    float tex_off_x;  // toroidal scroll offset (texels)
+    float tex_off_y;
+    float sw_scale;   // v3b: how strongly the swirl carries foam (0 = off)
+    float sw_cell;    // swirl metres per texel
+    float sw_origin_x;
+    float sw_origin_y;
+    float sw_tex_off_x;
+    float sw_tex_off_y;
+    float b0_dx;      // band 0: unit direction, wavenumber k, phase speed s, steepness
+    float b0_dy;
+    float b0_k;
+    float b0_s;
+    float b0_st;
+    float b1_dx;      // band 1: same
+    float b1_dy;
+    float b1_k;
+    float b1_s;
+    float b1_st;
+} pc;
+
+// Bilinear toroidal sample of foam_in at a fractional texel position.
+vec4 f2_sample(ivec2 N, vec2 p) {
+    vec2 pf = p - 0.5;
+    ivec2 i0 = ivec2(floor(pf));
+    vec2 fr = pf - vec2(i0);
+    ivec2 i1 = i0 + ivec2(1);
+    i0 = ((i0 % N) + N) % N;
+    i1 = ((i1 % N) + N) % N;
+    vec4 a = imageLoad(foam_in, ivec2(i0.x, i0.y));
+    vec4 b = imageLoad(foam_in, ivec2(i1.x, i0.y));
+    vec4 c = imageLoad(foam_in, ivec2(i0.x, i1.y));
+    vec4 d = imageLoad(foam_in, ivec2(i1.x, i1.y));
+    return mix(mix(a, b, fr.x), mix(c, d, fr.x), fr.y);
+}
+
+// Bilinear toroidal sample of the swirl velocity (its own, coarser grid).
+vec2 f2_swirl(vec2 world) {
+    ivec2 Ns = imageSize(swirl_vel);
+    vec2 t = (world - vec2(pc.sw_origin_x, pc.sw_origin_y)) / pc.sw_cell
+           + vec2(pc.sw_tex_off_x, pc.sw_tex_off_y);
+    vec2 pf = t - 0.5;
+    ivec2 i0 = ivec2(floor(pf));
+    vec2 fr = pf - vec2(i0);
+    ivec2 i1 = i0 + ivec2(1);
+    i0 = ((i0 % Ns) + Ns) % Ns;
+    i1 = ((i1 % Ns) + Ns) % Ns;
+    vec2 a = imageLoad(swirl_vel, ivec2(i0.x, i0.y)).rg;
+    vec2 b = imageLoad(swirl_vel, ivec2(i1.x, i0.y)).rg;
+    vec2 c = imageLoad(swirl_vel, ivec2(i0.x, i1.y)).rg;
+    vec2 d = imageLoad(swirl_vel, ivec2(i1.x, i1.y)).rg;
+    return mix(mix(a, b, fr.x), mix(c, d, fr.x), fr.y);
+}
+
+// Horizontal Gerstner orbital velocity at world point p: for each band,
+// v = d · (steepness · phase_speed · sin(k·(d·p) − k·s·t)).
+vec2 f2_orbital(vec2 p) {
+    vec2 d0 = vec2(pc.b0_dx, pc.b0_dy);
+    float f0 = pc.b0_k * dot(d0, p) - pc.b0_k * pc.b0_s * pc.wave_time;
+    vec2 v = d0 * (pc.b0_st * pc.b0_s * sin(f0));
+    vec2 d1 = vec2(pc.b1_dx, pc.b1_dy);
+    float f1 = pc.b1_k * dot(d1, p) - pc.b1_k * pc.b1_s * pc.wave_time;
+    v += d1 * (pc.b1_st * pc.b1_s * sin(f1));
+    return v;
+}
+
+void main() {
+    ivec2 c = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 N = ivec2(pc.size);
+    if (c.x >= N.x || c.y >= N.y) {
+        return;
+    }
+
+    float h = imageLoad(h_curr, c).r;
+    float lap = imageLoad(h_curr, (c + ivec2(1, 0) + N) % N).r
+              + imageLoad(h_curr, (c + ivec2(-1, 0) + N) % N).r
+              + imageLoad(h_curr, (c + ivec2(0, 1) + N) % N).r
+              + imageLoad(h_curr, (c + ivec2(0, -1) + N) % N).r
+              - 4.0 * h;
+    float src = pc.gain * max(abs(lap) - pc.thresh, 0.0);
+
+    // v3: read our previous state from where the flow just carried it FROM —
+    // swell orbital drift (v3a) + the incompressible swirl (v3b) combined.
+    vec4 f;
+    if (pc.drift > 0.0 || pc.sw_scale > 0.0) {
+        ivec2 wc = ((c - ivec2(pc.tex_off_x, pc.tex_off_y)) % N + N) % N;
+        vec2 world = vec2(pc.origin_x, pc.origin_y) + (vec2(wc) + 0.5) * pc.cell;
+        vec2 vel = f2_orbital(world) * pc.drift;            // m/s
+        if (pc.sw_scale > 0.0) {
+            vel += f2_swirl(world) * pc.sw_scale;
+        }
+        vec2 back = vec2(c) + 0.5 - vel * (1.0 / (pc.cell * 60.0));
+        f = f2_sample(N, back);
+    } else {
+        f = imageLoad(foam_in, c);
+    }
+
+    float wDied = f.r * (1.0 - pc.decay_w);
+    float lDied = f.g * (1.0 - pc.decay_l);
+    float w = f.r * pc.decay_w + src;
+    float l = f.g * pc.decay_l + wDied * pc.xfer_wl;
+    float s = f.b * pc.decay_s + lDied * pc.xfer_ls;
+    imageStore(foam_out, c, vec4(clamp(w, 0.0, 2.0), clamp(l, 0.0, 2.0), clamp(s, 0.0, 2.0), 0.0));
+}

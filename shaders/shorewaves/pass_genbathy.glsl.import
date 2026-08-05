@@ -1,0 +1,14 @@
+[remap]
+
+importer="glsl"
+type="RDShaderFile"
+uid="uid://du35f6pgghxjf"
+path="res://.godot/imported/pass_genbathy.glsl-f1244b2f330b73927b2e32ab002dded1.res"
+
+[deps]
+
+source_file="res://shaders/shorewaves/pass_genbathy.glsl"
+dest_files=["res://.godot/imported/pass_genbathy.glsl-f1244b2f330b73927b2e32ab002dded1.res"]
+
+[params]
+

@@ -1,0 +1,29 @@
+#version 450
+// cg_calc — the CG scalar arithmetic, done on the GPU (1 thread) so α/β never leave
+// the device. Scalar buffer slots:
+//   0 RSOLD  1 PAP  2 ALPHA  3 RSNEW  4 BETA  5 NEG_ALPHA  6 ONE(=1)  7 ZERO(=0)
+// op 0: alpha = rsold/pAp ; neg_alpha = -alpha
+// op 1: beta  = rsnew/rsold ; rsold = rsnew   (rotate for next iteration)
+
+layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, set = 5, binding = 0) buffer Scalars { float sc[]; };
+
+layout(push_constant, std430) uniform P {
+    uint op;
+    uint _p1;
+    uint _p2;
+    uint _p3;
+} pc;
+
+void main() {
+    if (pc.op == 0u) {
+        float pap = max(sc[1], 1e-30);
+        sc[2] = sc[0] / pap;   // alpha
+        sc[5] = -sc[2];        // -alpha
+    } else {
+        float rso = max(sc[0], 1e-30);
+        sc[4] = sc[3] / rso;   // beta
+        sc[0] = sc[3];         // rsold <- rsnew
+    }
+}

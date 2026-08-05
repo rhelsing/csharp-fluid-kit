@@ -1,0 +1,14 @@
+[remap]
+
+importer="glsl"
+type="RDShaderFile"
+uid="uid://cfsmtpft7gw8s"
+path="res://.godot/imported/pass_debug.glsl-e05f9e7034eb5dcb8d3eba6276e43593.res"
+
+[deps]
+
+source_file="res://shaders/shorewaves/pass_debug.glsl"
+dest_files=["res://.godot/imported/pass_debug.glsl-e05f9e7034eb5dcb8d3eba6276e43593.res"]
+
+[params]
+

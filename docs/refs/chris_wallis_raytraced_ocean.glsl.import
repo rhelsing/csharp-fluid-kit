@@ -1,0 +1,14 @@
+[remap]
+
+importer="glsl"
+type="RDShaderFile"
+uid="uid://d0a8tjxkjggl6"
+path="res://.godot/imported/chris_wallis_raytraced_ocean.glsl-3c71f122f83f10927f7197338100109f.res"
+
+[deps]
+
+source_file="res://docs/refs/chris_wallis_raytraced_ocean.glsl"
+dest_files=["res://.godot/imported/chris_wallis_raytraced_ocean.glsl-3c71f122f83f10927f7197338100109f.res"]
+
+[params]
+

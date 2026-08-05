@@ -1,0 +1,69 @@
+#version 450
+// dct_1d — one separable 1D cosine transform along x or y.
+//
+// WHY DCT AND NOT DST. solver-ledger.md §7c said "spectral DST/DCT". The boundary
+// condition decides it, and ours is not a choice: every solve body addresses neighbours
+// with clamp(c + off, 0, mx), so at the wall x(-1) = x(0) — zero flux, i.e. NEUMANN.
+// The eigenvectors of the Neumann Laplacian on a cell-centred grid are the DCT-II basis
+// cos(pi*(i+1/2)*p/N). DST diagonalizes the DIRICHLET Laplacian (x = 0 at the wall) and
+// would silently solve a differently-walled tank. So: DCT-II forward, DCT-III inverse.
+//
+// Eigenvalue of the 1D second difference in this basis:  -4*sin^2(pi*p/(2N)).
+// (Used by dct_scale, not here.)
+//
+// Pair, unnormalized-forward / 1-over-N-inverse:
+//   DCT-II   X_p = sum_i  x_i * cos(pi*(i+1/2)*p/N)
+//   DCT-III  x_i = ( X_0 + 2*sum_{p>=1} X_p * cos(pi*(i+1/2)*p/N) ) / N
+//
+// COST: this is the direct O(N) -per-output form, so O(N^2) per axis pass. That is
+// deliberate for v1 — it is ~30 lines and provably correct, and the point of the spectral
+// solver in the plan is the EXACTNESS datapoint (residual at float epsilon in one step),
+// not throughput. The O(N log N) replacement is a port, not a research problem: the
+// working butterfly chain is ../water-kit/kit/waves/shaders/fft_butterfly_{h,v}.glsl
+// with its host in kit/waves/wave_simulation.gd (solver-ledger.md §7e), and a DCT-II is
+// a real FFT plus a symmetric extension and a twiddle.
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(r32f, set = 2, binding = 0) uniform image2D src;
+layout(r32f, set = 3, binding = 0) uniform image2D dst;
+
+layout(push_constant, std430) uniform P {
+    vec2 size;
+    uint axis;      // 0 = along x, 1 = along y
+    uint inverse;   // 0 = DCT-II (forward), 1 = DCT-III (inverse)
+} pc;
+
+const float DCT_PI = 3.141592653589793;
+
+void main() {
+    ivec2 c = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 mx = ivec2(pc.size) - ivec2(1);
+    if (c.x > mx.x || c.y > mx.y) {
+        return;
+    }
+
+    bool alongX = (pc.axis == 0u);
+    int n = alongX ? int(pc.size.x) : int(pc.size.y);
+    int idx = alongX ? c.x : c.y;     // forward: output mode p. inverse: output sample i.
+
+    float acc;
+    if (pc.inverse == 0u) {
+        float w = DCT_PI * float(idx) / float(n);
+        acc = 0.0;
+        for (int i = 0; i < n; i++) {
+            ivec2 s = alongX ? ivec2(i, c.y) : ivec2(c.x, i);
+            acc += imageLoad(src, s).r * cos(w * (float(i) + 0.5));
+        }
+    } else {
+        float t = DCT_PI * (float(idx) + 0.5) / float(n);
+        acc = imageLoad(src, alongX ? ivec2(0, c.y) : ivec2(c.x, 0)).r;   // the p = 0 term, unweighted
+        for (int p = 1; p < n; p++) {
+            ivec2 s = alongX ? ivec2(p, c.y) : ivec2(c.x, p);
+            acc += 2.0 * imageLoad(src, s).r * cos(t * float(p));
+        }
+        acc /= float(n);
+    }
+
+    imageStore(dst, c, vec4(acc, 0.0, 0.0, 0.0));
+}

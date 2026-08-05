@@ -1,0 +1,32 @@
+// solve_rbgs.glslinc — one Red-Black Gauss-Seidel HALF-sweep of the stamped system.
+//
+// Ping-pong (iter_in -> iter_out) with a checkerboard mask: cells whose (x+y) parity
+// == PARITY get the relaxation update; the OTHER colour is copied through unchanged.
+// Run red (PARITY 0) then black (PARITY 1): the black pass reads iter_out, where the
+// red cells were JUST updated → it uses fresh values → Gauss-Seidel, ~2x faster than
+// Jacobi. PARITY is injected by the host as a compile-time constant (two pipelines),
+// so no push-constant change and no in-place read/write hazard.
+//
+// Generic over any stamp (st_diag / st_conductance / st_rhs); header supplies
+// iter_in (set 2) / iter_out (set 3). clamp() on neighbours = Neumann walls.
+
+void main() {
+    ivec2 c = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 mx = ivec2(pc.size) - ivec2(1);
+    if (c.x > mx.x || c.y > mx.y) {
+        return;
+    }
+
+    if (((c.x + c.y) & 1) != PARITY) {
+        imageStore(iter_out, c, imageLoad(iter_in, c));   // other colour: copy through
+        return;
+    }
+
+    const ivec2 offs[4] = ivec2[4](ivec2(1, 0), ivec2(-1, 0), ivec2(0, 1), ivec2(0, -1));
+    float acc = st_rhs(c);
+    for (int k = 0; k < 4; k++) {
+        ivec2 n = clamp(c + offs[k], ivec2(0), mx);
+        acc += st_conductance(c, n) * imageLoad(iter_in, n).r;
+    }
+    imageStore(iter_out, c, vec4(acc / st_diag(c), 0.0, 0.0, 0.0));
+}

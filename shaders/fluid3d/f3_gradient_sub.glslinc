@@ -1,0 +1,23 @@
+#version 450
+// f3_gradient_sub — v -= 0.5·∇p (make the 3D velocity divergence-free). No-slip walls.
+layout(local_size_x = 4, local_size_y = 4, local_size_z = 4) in;
+layout(rgba32f, set = 0, binding = 0) uniform image3D vel;   // in-place
+layout(r32f,    set = 1, binding = 0) uniform image3D pres;
+
+layout(push_constant, std430) uniform P { vec4 size; vec4 pad; } pc;
+
+void main() {
+    ivec3 c = ivec3(gl_GlobalInvocationID.xyz);
+    ivec3 mx = ivec3(pc.size.xyz) - ivec3(1);
+    if (c.x > mx.x || c.y > mx.y || c.z > mx.z) { return; }
+    float xR = imageLoad(pres, clamp(c + ivec3(1, 0, 0), ivec3(0), mx)).r;
+    float xL = imageLoad(pres, clamp(c + ivec3(-1, 0, 0), ivec3(0), mx)).r;
+    float yU = imageLoad(pres, clamp(c + ivec3(0, 1, 0), ivec3(0), mx)).r;
+    float yD = imageLoad(pres, clamp(c + ivec3(0, -1, 0), ivec3(0), mx)).r;
+    float zF = imageLoad(pres, clamp(c + ivec3(0, 0, 1), ivec3(0), mx)).r;
+    float zB = imageLoad(pres, clamp(c + ivec3(0, 0, -1), ivec3(0), mx)).r;
+    vec3 v = imageLoad(vel, c).xyz;
+    v -= 0.5 * vec3(xR - xL, yU - yD, zF - zB);
+    if (c.x == 0 || c.y == 0 || c.z == 0 || c.x == mx.x || c.y == mx.y || c.z == mx.z) { v = vec3(0.0); }
+    imageStore(vel, c, vec4(v, 0.0));
+}

@@ -1,0 +1,167 @@
+// stamp_wave_tank.glslinc — scene 25's wave tank as a stamp, for GpuStampSolver.
+//
+// Fork of stamp_wave_multi.glslinc (scene 50/17). Same contract, same θ-blend, same
+// damping/leak/sponge treatment — so Jacobi / RBGS / CG / multigrid all drive it unchanged.
+//
+// The ONE addition: conductance is PER FACE, taken from the bed.
+//     beta_face = beta_scale * mean(depth(c), depth(n))
+// st_conductance() has always taken the neighbour cell `n` and ignored it; this is the stamp
+// that uses it. Depth IS the pipe, so shoaling, refraction and the deep end keeping its own
+// speed all fall out of the network instead of being a coefficient hack on top of it.
+//
+// Push layout (std430, 112B = 28 floats, vec4s land 16B-aligned):
+//   vec2 size; float beta_scale; float a;                          (16B)
+//   float leak; float cn; float sponge_w; float sponge_a;          (16B)
+//   float floor_base; float slope; float water_level; float segs;  (16B)
+//   vec4 paddle;  x=face x_old, y=x_new, z=reach, w=gain (0 = off) (16B)
+//   vec4 macro;   amp, lobes, phase_old, phase_new                 (16B)
+//   vec4 micro;   amp, lobes, phase_old, phase_new                 (16B)
+//   vec4 drop;    xy = centre px, z = radius px, w = strength      (16B)
+//
+// Contract: the push constant `pc` must begin with `vec2 size`.
+
+layout(r32f, set = 0, binding = 0) uniform image2D h_curr;   // state: h(t)
+layout(r32f, set = 1, binding = 0) uniform image2D h_prev;   // state: h(t-dt)
+
+layout(push_constant, std430) uniform Params {
+    vec2  size;
+    float beta_scale;   // dt^2 * g / dx^2 — multiplied by depth to get each pipe
+    float a;            // gamma*dt/2 — velocity loss
+
+    float leak;         // DC mode 0/1/2/4: spring conductance to the rest datum.
+                        // DC mode 3: carries the volume-balance correction instead — the two are
+                        // mutually exclusive, so they share the slot (128B push limit).
+    float cn;           // 0 = backward-Euler (dissipative) · 1 = Crank-Nicolson (rings)
+    float sponge_w;     // absorbing ramp width (px)
+    float sponge_a;     // extra loss at the very edge
+
+    float floor_base;   // bed ramp: y = floor_base + slope*(x+1)
+    float slope;
+    float water_level;
+    float min_depth;    // shore clamp — sets the DEPTH RATIO, hence how hard the wave shoals
+
+    vec4  paddle;       // x = face x_old, y = x_new, z = reach, w = gain (0 = off)
+    vec4  macro;        // amp, lobes, phase_old, phase_new
+    vec4  micro;        // amp, lobes, phase_old, phase_new
+    vec4  drop;         // xy = centre px, z = radius px, w = strength
+    vec4  extra;        // x = micro segments (0 = continuous),
+                        // y = sponge edge mask (low 4 bits) | DC mode << 4,
+                        // z = bathymetry coupling (0 = uniform depth like scene 23), w = ref depth
+} pc;
+
+const float ST_PI = 3.141592653589793;
+
+int st_dc_mode() { return int(pc.extra.y + 0.5) >> 4; }
+int st_edge_mask() { return int(pc.extra.y + 0.5) & 15; }
+
+// ---- bed ----
+float st_x(ivec2 c) { return (float(c.x) + 0.5) / pc.size.x * 2.0 - 1.0; }
+float st_z(ivec2 c) { return (float(c.y) + 0.5) / pc.size.y * 2.0 - 1.0; }
+
+float st_depth(ivec2 c) {
+    float d = max(pc.min_depth, pc.water_level - (pc.floor_base + pc.slope * (st_x(c) + 1.0)));
+    return mix(pc.extra.w, d, clamp(pc.extra.z, 0.0, 1.0));
+}
+
+// PER-FACE conductance: the pipe joining two cells carries their mean depth.
+float st_beta_face(ivec2 c, ivec2 n) {
+    return pc.beta_scale * 0.5 * (st_depth(c) + st_depth(n));
+}
+
+// ---- losses ----
+// Quadratic sponge: 0 interior -> 1 at the border. Ramps BOTH losses, because damping alone
+// is a velocity loss and a statically-forced mound has dh/dt = 0 — only the leak flattens it.
+// PER EDGE. A sponge on the paddle wall absorbs the stroke as fast as the paddle injects it —
+// the wave dies in front of the paddle and never leaves. Mask bits: 1 = -x (paddle wall),
+// 2 = +x (beach), 4 = -z, 8 = +z.
+float st_sponge(ivec2 c) {
+    vec2 mxf = pc.size - vec2(1.0);
+    int m = st_edge_mask();
+    float d = 1.0e9;
+    if ((m & 1) != 0) { d = min(d, float(c.x)); }
+    if ((m & 2) != 0) { d = min(d, mxf.x - float(c.x)); }
+    if ((m & 4) != 0) { d = min(d, float(c.y)); }
+    if ((m & 8) != 0) { d = min(d, mxf.y - float(c.y)); }
+    float t = clamp(1.0 - d / max(pc.sponge_w, 1.0), 0.0, 1.0);
+    return t * t;
+}
+
+float st_damp(ivec2 c) { return pc.a + pc.sponge_a * st_sponge(c); }
+float st_leak(ivec2 c) {
+    float k = (st_dc_mode() == 3) ? 0.0 : pc.leak;   // mode 3 reuses the slot for DC balance
+    return k + pc.sponge_a * st_sponge(c);
+}
+
+// ---- the stamp ----
+float st_conductance(ivec2 c, ivec2 n) {
+    return (1.0 - 0.5 * pc.cn) * st_beta_face(c, n);
+}
+
+float st_diag(ivec2 c) {
+    ivec2 mx = ivec2(pc.size) - ivec2(1);
+    const ivec2 offs[4] = ivec2[4](ivec2(1, 0), ivec2(-1, 0), ivec2(0, 1), ivec2(0, -1));
+    float sum = 0.0;
+    for (int k = 0; k < 4; k++) {
+        sum += st_beta_face(c, clamp(c + offs[k], ivec2(0), mx));
+    }
+    return 1.0 + st_damp(c) + (1.0 - 0.5 * pc.cn) * (sum + st_leak(c));
+}
+
+float st_rhs(ivec2 c) {
+    ivec2 mx = ivec2(pc.size) - ivec2(1);
+    float hc = imageLoad(h_curr, c).r;
+    float hp = imageLoad(h_prev, c).r;
+
+    // cn share of the stiffness evaluated on the PAST level (Crank-Nicolson)  [FORCE_MARKER]
+    const ivec2 offs[4] = ivec2[4](ivec2(1, 0), ivec2(-1, 0), ivec2(0, 1), ivec2(0, -1));
+    float dhp = 0.0;
+    float sum = 0.0;
+    for (int k = 0; k < 4; k++) {
+        ivec2 n = clamp(c + offs[k], ivec2(0), mx);
+        float bf = st_beta_face(c, n);
+        dhp += bf * imageLoad(h_prev, n).r;
+        sum += bf;
+    }
+    dhp -= (sum + st_leak(c)) * hp;
+
+    // ---- sources ----
+    float force = 0.0;
+
+    if (pc.drop.w != 0.0) {
+        vec2 d = vec2(c) - pc.drop.xy;
+        force += pc.drop.w * exp(-dot(d, d) / (pc.drop.z * pc.drop.z));
+    }
+
+    if (pc.paddle.w != 0.0) {
+        float x = st_x(c);
+        float z = st_z(c);
+        float zq = z;
+        if (pc.extra.x >= 1.0) {
+            zq = (floor((z * 0.5 + 0.5) * pc.extra.x) + 0.5) / pc.extra.x * 2.0 - 1.0;
+        }
+        float face_old = pc.paddle.x
+            + pc.macro.x * sin(pc.macro.y * ST_PI * z  + pc.macro.z)
+            + pc.micro.x * sin(pc.micro.y * ST_PI * zq + pc.micro.z);
+        float face_new = pc.paddle.y
+            + pc.macro.x * sin(pc.macro.y * ST_PI * z  + pc.macro.w)
+            + pc.micro.x * sin(pc.micro.y * ST_PI * zq + pc.micro.w);
+        float reach = max(1.0e-4, pc.paddle.z);
+        float sd = x - face_new;
+        float dist = abs(sd);
+        if (dist < reach) {
+            float w;
+            if (st_dc_mode() == 5) {
+                // dipole: d/dx of the raised cosine, odd about the face -> zero net volume
+                w = sin(ST_PI * dist / reach) * sign(sd);
+            } else {
+                w = 0.5 + 0.5 * cos(ST_PI * dist / reach);
+            }
+            force += (face_new - face_old) * pc.paddle.w * w;
+        }
+    }
+
+    // force enters as a displacement ON h_curr (scene 23 parity), not as a standalone rhs term
+    if (st_dc_mode() == 3) { force -= pc.leak; }   // volume balance (slot reused)
+
+    return 2.0 * (hc + force) - hp + st_damp(c) * hp + (0.5 * pc.cn) * dhp;
+}

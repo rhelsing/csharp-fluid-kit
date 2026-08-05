@@ -1,0 +1,112 @@
+// solve_schwarz.glslinc — block-dense additive Schwarz. One workgroup owns one tile of
+// the grid, assembles that tile's DENSE submatrix in shared memory, factors it with LU,
+// and solves it EXACTLY. Neighbours outside the tile are moved to the right-hand side;
+// the outer sweep (the host's ping-pong) iterates on that tile-to-tile coupling.
+//
+// Exact inside, relaxed between — which is the whole reason to build it. Jacobi and RBGS
+// relax one cell at a time, so information crosses one cell per sweep; here it crosses a
+// whole tile per sweep. That is what should show up as a much steeper residual drop per
+// pass (solver-ledger.md §7b).
+//
+// THE LU IS A PORT, NOT A DESIGN. It is mna::solve() from
+//   ../neptunely_standalone/js/audio/cmajor/lib/mna-solver.cmajor  (line 285)
+// transliterated: float64 -> float, .at(i) -> [i], float64[1024] LU -> shared float LU[].
+// The sign convention is that file's stamp convention too, which is why it lines up with
+// ours exactly (solver-ledger.md §1a):
+//     A[a,a] += G ; A[a,b] -= G   <=>   A[c][c] = st_diag(c) ; A[c][n] = -st_conductance(c,n)
+//
+// TWO DELIBERATE DEVIATIONS FROM THE PORT:
+//  1. No partial pivoting. The cmajor version needs it because a circuit matrix can be
+//     anything; ours is symmetric, positive-definite and diagonally dominant (st_diag is
+//     1 + damping + the sum of incident conductances, i.e. strictly greater than the
+//     off-diagonal sum). The pivot search is also the most divergent part of the kernel.
+//     If the residual ever misbehaves, putting it back is the first thing to try.
+//  2. Cooperative rather than single-threaded. The cmajor solve() is scalar; here each
+//     thread owns one row, so the elimination's inner row-update loop runs 32-wide.
+//     Back substitution stays sequential on thread 0 (it is inherently serial and only
+//     TILE_N^2/2 ops).
+//
+// V1 SCOPE: tiles do NOT overlap. Non-overlapping additive Schwarz is block Jacobi. Real
+// Schwarz overlap (a one-cell halo, or a red/black tile colouring for block Gauss-Seidel)
+// is the upgrade and needs either coherent in-place writes or a halo exchange — neither of
+// which belongs in the first version.
+//
+// Host supplies: "#version 450" + local_size_x = TILE_N + TILE_W/TILE_H/TILE_N defines +
+// iter_in (set 2) / iter_out (set 3) + the stamp (h_curr set 0, h_prev set 1, `pc`).
+
+shared float LU[TILE_N * TILE_N];
+shared float rhs[TILE_N];
+shared float xs[TILE_N];
+
+void main() {
+    int li = int(gl_LocalInvocationIndex);
+    ivec2 mx = ivec2(pc.size) - ivec2(1);
+
+    ivec2 org = ivec2(int(gl_WorkGroupID.x) * TILE_W, int(gl_WorkGroupID.y) * TILE_H);
+    ivec2 lc = ivec2(li % TILE_W, li / TILE_W);
+    ivec2 c = org + lc;
+    bool inside = (c.x <= mx.x && c.y <= mx.y);
+
+    // ---- assemble this thread's row of the tile's dense matrix ----
+    for (int j = 0; j < TILE_N; j++) {
+        LU[li * TILE_N + j] = 0.0;
+    }
+
+    float b = 0.0;
+    if (inside) {
+        LU[li * TILE_N + li] = st_diag(c);
+        b = st_rhs(c);
+
+        const ivec2 offs[4] = ivec2[4](ivec2(1, 0), ivec2(-1, 0), ivec2(0, 1), ivec2(0, -1));
+        for (int k = 0; k < 4; k++) {
+            ivec2 lo = lc + offs[k];
+            ivec2 n = clamp(c + offs[k], ivec2(0), mx);          // clamp = Neumann, as everywhere else
+            float g = st_conductance(c, n);
+            bool interior = lo.x >= 0 && lo.x < TILE_W && lo.y >= 0 && lo.y < TILE_H
+                            && (org + lo).x <= mx.x && (org + lo).y <= mx.y;
+            if (interior) {
+                LU[li * TILE_N + (lo.y * TILE_W + lo.x)] = -g;   // stays in the block
+            } else {
+                b += g * imageLoad(iter_in, n).r;                 // Schwarz coupling -> rhs
+            }
+        }
+    } else {
+        LU[li * TILE_N + li] = 1.0;   // padding row (tile hangs off the grid edge) -> x = 0
+    }
+    rhs[li] = b;
+
+    // ---- LU factorization, ports mna-solver.cmajor:305-347 ----
+    for (int col = 0; col < TILE_N; col++) {
+        barrier();   // row `col` and rhs[col] were finalized in the previous iteration
+        float piv = LU[col * TILE_N + col];
+        if (abs(piv) < 1.0e-30) {
+            piv = 1.0e-30;   // cmajor `continue`s on a singular pivot; a floor is equivalent here
+        }
+        if (li > col) {
+            float f = LU[li * TILE_N + col] / piv;
+            LU[li * TILE_N + col] = f;                            // store L in place
+            for (int j = col + 1; j < TILE_N; j++) {
+                LU[li * TILE_N + j] -= f * LU[col * TILE_N + j];
+            }
+            rhs[li] -= f * rhs[col];                              // forward substitution, fused
+        }
+    }
+    barrier();
+
+    // ---- back substitution, ports mna-solver.cmajor:354-360 ----
+    if (li == 0) {
+        for (int row = TILE_N - 1; row >= 0; row--) {
+            float sum = rhs[row];
+            for (int j = row + 1; j < TILE_N; j++) {
+                sum -= LU[row * TILE_N + j] * xs[j];
+            }
+            float d = LU[row * TILE_N + row];
+            xs[row] = (abs(d) < 1.0e-30) ? 0.0 : sum / d;
+        }
+    }
+    barrier();
+
+    if (inside) {
+        imageStore(iter_out, c, vec4(xs[li], 0.0, 0.0, 0.0));
+    }
+}

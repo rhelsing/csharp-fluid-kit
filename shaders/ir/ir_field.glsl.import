@@ -1,0 +1,14 @@
+[remap]
+
+importer="glsl"
+type="RDShaderFile"
+uid="uid://c6vq4axavneg4"
+path="res://.godot/imported/ir_field.glsl-dc867129a09503f8f2c42fdb3c23aed6.res"
+
+[deps]
+
+source_file="res://shaders/ir/ir_field.glsl"
+dest_files=["res://.godot/imported/ir_field.glsl-dc867129a09503f8f2c42fdb3c23aed6.res"]
+
+[params]
+

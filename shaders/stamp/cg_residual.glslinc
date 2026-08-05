@@ -1,0 +1,20 @@
+// cg_residual.glslinc — r = b − A x for the stamped operator, where
+//     A x (c) = st_diag(c)·x(c) − Σ st_conductance(c,n)·x(n)   and   b = st_rhs.
+// Used once at CG init (x = current field). Uses the stamp (48-byte push constant),
+// reads x from iter_in (set 2), writes r to iter_out (set 3).
+
+void main() {
+    ivec2 c = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 mx = ivec2(pc.size) - ivec2(1);
+    if (c.x > mx.x || c.y > mx.y) {
+        return;
+    }
+    const ivec2 offs[4] = ivec2[4](ivec2(1, 0), ivec2(-1, 0), ivec2(0, 1), ivec2(0, -1));
+    float x = imageLoad(iter_in, c).r;
+    float ax = st_diag(c) * x;
+    for (int k = 0; k < 4; k++) {
+        ivec2 n = clamp(c + offs[k], ivec2(0), mx);
+        ax -= st_conductance(c, n) * imageLoad(iter_in, n).r;
+    }
+    imageStore(iter_out, c, vec4(st_rhs(c) - ax, 0.0, 0.0, 0.0));
+}

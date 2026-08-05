@@ -1,0 +1,36 @@
+// mgd_smooth.glslinc — one Jacobi relaxation of A_L u = rhs at level L, STAMP-GENERIC.
+//
+// Fork of mg_smooth.glslinc for MgDeepSolver (solver-ledger.md §7a). mg_smooth is left
+// alone — it still backs MgvSolver, which stays in the dropdown as the uniform-beta
+// control. The whole difference is these two lines:
+//
+//     mg_smooth :  diag = 1 + a + aMu*(leak + 4*pc.beta)   <- ONE scalar beta, everywhere
+//     mgd_smooth:  diag = st_diag(c)                        <- the stamp's operator
+//
+// so a bed ramp / per-face depth / sponge / DC mode all reach the smoother instead of
+// being flattened to a constant. That is the entire point of the fork: at extra.z > 0
+// mg_smooth is inverting a DIFFERENT matrix from the one Jacobi/RBGS/CG invert.
+//
+// Level scaling is NOT in this file. The host hands each level the stamp's own push
+// constant with `size` and `beta_scale` (and `sponge_w`) rewritten, and st_depth()
+// re-derives per-face conductance from that size on its own — so no Galerkin coarsening.
+//
+// Host must compile as: "#version 450" + local_size + THIS header block + stamp + body.
+// The stamp declares h_curr (set 0) / h_prev (set 1) and `pc`; neither is read here
+// (st_diag and st_conductance are pure functions of pc), but both must still be bound.
+
+void main() {
+    ivec2 c = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 mx = ivec2(pc.size) - ivec2(1);
+    if (c.x > mx.x || c.y > mx.y) {
+        return;
+    }
+
+    const ivec2 offs[4] = ivec2[4](ivec2(1, 0), ivec2(-1, 0), ivec2(0, 1), ivec2(0, -1));
+    float acc = imageLoad(rhs_img, c).r;
+    for (int k = 0; k < 4; k++) {
+        ivec2 n = clamp(c + offs[k], ivec2(0), mx);
+        acc += st_conductance(c, n) * imageLoad(u_in, n).r;
+    }
+    imageStore(u_out, c, vec4(acc / st_diag(c), 0.0, 0.0, 0.0));
+}

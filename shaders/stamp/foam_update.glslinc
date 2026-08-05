@@ -1,0 +1,85 @@
+#version 450
+
+// foam_update.glsl — the reactive foam pass (docs/mna-next-steps.md §2a foam).
+// Runs right after the MNA solve each tick. Three INDEPENDENT, individually-zeroable
+// stages (all-zero extras = the original curvature-only behaviour, bit-compatible):
+//     drift   (adv_gain)  semi-Lagrangian back-trace along the wave-propagation
+//                         direction −∂h/∂t·∇h/|∇h|² → foam rides the waves
+//     source  (gain)      gain · max(|∇²h| − thresh, 0)   (folding ≈ whitecap test)
+//     deposit (dep_amt)   gaussian foam stamped at the hull (speedboat trail)
+// then  foam = advected·decay + source + deposit,  clamped.
+// The buffer is toroidal like the height field (wrap neighbours / wrap sampling).
+// Host copies foam_out -> foam_in after the dispatch so foam_in is current state.
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(r32f, set = 0, binding = 0) uniform image2D foam_in;
+layout(r32f, set = 1, binding = 0) uniform image2D foam_out;
+layout(r32f, set = 2, binding = 0) uniform image2D h_curr;
+layout(r32f, set = 3, binding = 0) uniform image2D h_prev;
+
+layout(push_constant, std430) uniform Params {
+    vec2  size;     // grid px
+    float decay;    // per-tick foam retention
+    float gain;     // curvature -> foam source scale
+    float thresh;   // curvature dead-zone (ambient ripples make no foam)
+    float dep_x;    // trail deposit centre (grid px)
+    float dep_y;
+    float dep_r;    // trail deposit radius (px)
+    float dep_amt;  // trail deposit strength (0 = no deposit)
+    float adv_gain; // wave-drift advection gain (0 = no drift)
+    float _q0;
+    float _q1;
+} pc;
+
+float foam_wrap(ivec2 p, ivec2 N) {
+    return imageLoad(foam_in, (p % N + N) % N).r;
+}
+
+// bilinear wrap sample of foam_in at a fractional position
+float foam_bilinear(vec2 p, ivec2 N) {
+    vec2 f = fract(p);
+    ivec2 i = ivec2(floor(p));
+    float f00 = foam_wrap(i, N);
+    float f10 = foam_wrap(i + ivec2(1, 0), N);
+    float f01 = foam_wrap(i + ivec2(0, 1), N);
+    float f11 = foam_wrap(i + ivec2(1, 1), N);
+    return mix(mix(f00, f10, f.x), mix(f01, f11, f.x), f.y);
+}
+
+void main() {
+    ivec2 c = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 N = ivec2(pc.size);
+    if (c.x >= N.x || c.y >= N.y) {
+        return;
+    }
+
+    float h = imageLoad(h_curr, c).r;
+    float hl = imageLoad(h_curr, (c + ivec2(-1, 0) + N) % N).r;
+    float hr = imageLoad(h_curr, (c + ivec2(1, 0) + N) % N).r;
+    float hd = imageLoad(h_curr, (c + ivec2(0, -1) + N) % N).r;
+    float hu = imageLoad(h_curr, (c + ivec2(0, 1) + N) % N).r;
+    float lap = hl + hr + hd + hu - 4.0 * h;
+
+    // drift: back-trace along the wave propagation direction. For a traveling wave,
+    // −∂h/∂t·∇h/|∇h|² points the way the wave moves → foam rides the wavefronts.
+    vec2 srcPos = vec2(c);
+    if (pc.adv_gain != 0.0) {
+        float dht = h - imageLoad(h_prev, c).r;
+        vec2 g = 0.5 * vec2(hr - hl, hu - hd);
+        vec2 vel = -pc.adv_gain * dht * g / (dot(g, g) + 1e-6);
+        float vl = length(vel);
+        if (vl > 3.0) { vel *= 3.0 / vl; }   // clamp: ≤3 cells/tick keeps it stable
+        srcPos -= vel;
+    }
+    float f = foam_bilinear(srcPos, N) * pc.decay;
+
+    f += pc.gain * max(abs(lap) - pc.thresh, 0.0);
+
+    if (pc.dep_amt != 0.0) {
+        vec2 d = vec2(c) - vec2(pc.dep_x, pc.dep_y);
+        f += pc.dep_amt * exp(-dot(d, d) / (pc.dep_r * pc.dep_r));
+    }
+
+    imageStore(foam_out, c, vec4(clamp(f, 0.0, 1.5), 0.0, 0.0, 0.0));
+}

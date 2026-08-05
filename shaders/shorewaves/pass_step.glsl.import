@@ -1,0 +1,14 @@
+[remap]
+
+importer="glsl"
+type="RDShaderFile"
+uid="uid://q0u8t2c3cdm4"
+path="res://.godot/imported/pass_step.glsl-4b5fc0d574fbe5c2d36ba12155190b8b.res"
+
+[deps]
+
+source_file="res://shaders/shorewaves/pass_step.glsl"
+dest_files=["res://.godot/imported/pass_step.glsl-4b5fc0d574fbe5c2d36ba12155190b8b.res"]
+
+[params]
+

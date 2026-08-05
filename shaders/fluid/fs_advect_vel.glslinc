@@ -1,0 +1,34 @@
+#version 450
+// fs_advect_vel — semi-Lagrangian self-advection of the velocity field (backtrace the
+// cell centre along -v and bilinearly sample). Unconditionally stable for any dt.
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+layout(rg32f, set = 0, binding = 0) uniform image2D vel_in;
+layout(rg32f, set = 1, binding = 0) uniform image2D vel_out;
+
+layout(push_constant, std430) uniform P {
+    vec2  size;
+    float dt;
+    float dissip;   // velocity dissipation (~1)
+} p;
+
+vec2 samp(ivec2 mx, vec2 pos) {
+    pos = clamp(pos, vec2(0.0), vec2(mx));
+    ivec2 i = ivec2(floor(pos));
+    vec2 f = pos - vec2(i);
+    ivec2 i1 = min(i + ivec2(1), mx);
+    vec2 v00 = imageLoad(vel_in, i).rg;
+    vec2 v10 = imageLoad(vel_in, ivec2(i1.x, i.y)).rg;
+    vec2 v01 = imageLoad(vel_in, ivec2(i.x, i1.y)).rg;
+    vec2 v11 = imageLoad(vel_in, i1).rg;
+    return mix(mix(v00, v10, f.x), mix(v01, v11, f.x), f.y);
+}
+
+void main() {
+    ivec2 c = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 mx = ivec2(p.size) - ivec2(1);
+    if (c.x > mx.x || c.y > mx.y) { return; }
+
+    vec2 v = imageLoad(vel_in, c).rg;
+    vec2 pos = vec2(c) - p.dt * v;
+    imageStore(vel_out, c, vec4(samp(mx, pos) * p.dissip, 0.0, 0.0));
+}

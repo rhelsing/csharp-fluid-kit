@@ -1,0 +1,37 @@
+#version 450
+// fs_add_source — inject velocity + dye at a source disk, and apply buoyancy to the
+// whole field (dye drifts along +y). In-place (no neighbour reads).
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+layout(rg32f, set = 0, binding = 0) uniform image2D vel;   // in-place (vx,vy)
+layout(r32f,  set = 1, binding = 0) uniform image2D dye;   // in-place
+
+layout(push_constant, std430) uniform P {
+    vec2  size;
+    float dt;
+    float buoy;      // buoyancy: v.y += dt*buoy*dye
+    float src_x;
+    float src_y;
+    float src_r;
+    float inj_vx;    // injected velocity in the source disk
+    float inj_vy;
+    float dye_amt;   // injected dye in the source disk
+} p;
+
+void main() {
+    ivec2 c = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 mx = ivec2(p.size) - ivec2(1);
+    if (c.x > mx.x || c.y > mx.y) { return; }
+
+    vec2 v = imageLoad(vel, c).rg;
+    float d = imageLoad(dye, c).r;
+
+    v.y += p.dt * p.buoy * d;                          // buoyancy everywhere
+
+    vec2 rel = vec2(c) - vec2(p.src_x, p.src_y);       // gaussian injection in the disk
+    float g = exp(-dot(rel, rel) / (p.src_r * p.src_r));
+    v += vec2(p.inj_vx, p.inj_vy) * g;
+    d += p.dye_amt * g;
+
+    imageStore(vel, c, vec4(v, 0.0, 0.0));
+    imageStore(dye, c, vec4(d, 0.0, 0.0, 0.0));
+}

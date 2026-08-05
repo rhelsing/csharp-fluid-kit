@@ -1,0 +1,72 @@
+// stamp_heat.glslinc — Phase 3a: implicit heat / diffusion stamp for the GpuStampSolver.
+//
+// The cheap "same solver, new circuit" generality proof. Backward-Euler on the heat
+// equation  ∂h/∂t = α·∇²h  gives, per cell, the stamped system  A x = b:
+//     (1 + 4κ + leak)·h_next − κ·Σ h_next(n) = h_curr + source
+// with κ = α·dt the diffusivity-per-step. Unconditionally stable (backward Euler) —
+// like the wave stamp, crank the step and it never blows up; unlike the wave stamp the
+// approach to steady state is MONOTONE diffusion, not a ripple. (Its steady state is the
+// same screened-Poisson solve as stamp_flow: the time term only picks the transient.)
+//
+// Sources, as in stamp_flow: a persistent HOT current source (added to rhs) and a
+// Dirichlet PIN (a fixed-temperature spot — hot or cold). leak = conductance to the
+// ambient datum (0), so an isolated hot blob relaxes to ambient instead of growing.
+//
+// h_prev / set 1: backward-Euler heat needs only ONE history (h_curr), but the host's
+// GpuStampSolver binds a fixed set-0/set-1 layout — a stamp that never reads h_prev gets
+// that binding stripped and uniform creation fails. So rhs carries a real `inertia`
+// term, inertia·(h_curr − h_prev): a genuine "thermal memory" knob (0 = pure heat) AND,
+// because `inertia` is a push-constant (not a compile-time zero), the h_prev read can't
+// be stripped even when it's dialled to 0. One line earns its keep twice.
+//
+// Solvers: Jacobi / RBGS (they consume the stamp generically).
+// Contract: push constant `pc` begins with `vec2 size`.
+
+layout(r32f, set = 0, binding = 0) uniform image2D h_curr;   // temperature T(t)
+layout(r32f, set = 1, binding = 0) uniform image2D h_prev;   // T(t-dt) (for the inertia term)
+
+layout(push_constant, std430) uniform Params {
+    vec2  size;      // grid px  (REQUIRED first field)
+    float kappa;     // α·dt  -> neighbour conductance (diffusivity per step)
+    float inertia;   // thermal-memory coeff (0 = pure backward-Euler heat)
+    float leak;      // conductance to ambient (0) — bounds an isolated hot blob
+    float src_x;     // hot source centre px (persistent current source)
+    float src_y;
+    float src_r;     // hot source radius px
+    float src_w;     // hot source power (0 = off)
+    float pin_x;     // Dirichlet pin centre px (fixed-temperature spot)
+    float pin_y;
+    float pin_r;     // pin radius px (<= 0 = no pin)
+    float pin_v;     // pinned temperature (the "voltage")
+} pc;                // std430: 13 contiguous 4-byte scalars; host pads the push to 64B.
+
+bool st_in_pin(ivec2 c) {
+    if (pc.pin_r <= 0.0) { return false; }
+    vec2 d = vec2(c) - vec2(pc.pin_x, pc.pin_y);
+    return dot(d, d) <= pc.pin_r * pc.pin_r;
+}
+
+float st_conductance(ivec2 c, ivec2 n) {
+    if (st_in_pin(c)) { return 0.0; }   // pinned row: no neighbour coupling
+    return pc.kappa;
+}
+
+float st_diag(ivec2 c) {
+    if (st_in_pin(c)) { return 1.0; }   // Dirichlet: x = rhs
+    return 1.0 + 4.0 * pc.kappa + pc.leak;
+}
+
+float st_rhs(ivec2 c) {
+    if (st_in_pin(c)) { return pc.pin_v; }   // fixed-temperature spot
+
+    float hc = imageLoad(h_curr, c).r;
+    float hp = imageLoad(h_prev, c).r;
+    float base = hc + pc.inertia * (hc - hp);   // backward-Euler heat (+ optional memory)
+
+    float src = 0.0;                            // persistent hot source -> b
+    if (pc.src_w != 0.0) {
+        vec2 d = vec2(c) - vec2(pc.src_x, pc.src_y);
+        src = pc.src_w * exp(-dot(d, d) / (pc.src_r * pc.src_r));
+    }
+    return base + src;
+}

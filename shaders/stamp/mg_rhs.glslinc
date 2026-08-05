@@ -1,0 +1,19 @@
+// mg_rhs — the fine-grid right-hand side b0, GENERIC over the stamp.
+//
+// Was: st_rhs inlined against the old 48-byte wave layout, which is why multigrid threw
+// `requires (48) bytes ... supplied: (128)` against a richer stamp. Now it just calls
+// st_rhs(c), so it inherits whatever sources/terms the stamp defines.
+//
+// The stamp declares h_curr (set 0), h_prev (set 1) and the push constant; this body adds
+// only the output image. Host must compile it as: "#version 450" + local_size + stamp + this.
+
+layout(r32f, set = 3, binding = 0) uniform image2D b0;
+
+void main() {
+    ivec2 c = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 mx = ivec2(pc.size) - ivec2(1);
+    if (c.x > mx.x || c.y > mx.y) {
+        return;
+    }
+    imageStore(b0, c, vec4(st_rhs(c), 0.0, 0.0, 0.0));
+}

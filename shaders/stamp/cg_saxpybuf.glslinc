@@ -1,0 +1,28 @@
+#version 450
+// cg_saxpybuf — fused vector update y = sc[cy_slot]·y + sc[cx_slot]·x, with the two
+// coefficients read from the GPU SCALAR BUFFER (not a push constant), so no CPU
+// round-trip. x = set 2, y = set 3 (in place). Slot 6 holds 1.0 and slot 7 holds 0.0
+// for the "constant" coefficients (copy / axpy).
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(r32f, set = 2, binding = 0) uniform image2D x_img;
+layout(r32f, set = 3, binding = 0) uniform image2D y_img;
+layout(std430, set = 5, binding = 0) buffer Scalars { float sc[]; };
+
+layout(push_constant, std430) uniform P {
+    vec2 size;
+    uint cy_slot;
+    uint cx_slot;
+} pc;
+
+void main() {
+    ivec2 c = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 mx = ivec2(pc.size) - ivec2(1);
+    if (c.x > mx.x || c.y > mx.y) {
+        return;
+    }
+    float y = imageLoad(y_img, c).r;
+    float x = imageLoad(x_img, c).r;
+    imageStore(y_img, c, vec4(sc[pc.cy_slot] * y + sc[pc.cx_slot] * x, 0.0, 0.0, 0.0));
+}

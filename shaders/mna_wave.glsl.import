@@ -1,0 +1,14 @@
+[remap]
+
+importer="glsl"
+type="RDShaderFile"
+uid="uid://bgbs0najcdd6l"
+path="res://.godot/imported/mna_wave.glsl-7e39abdd2deee4227b9b1fbbf811c1bd.res"
+
+[deps]
+
+source_file="res://shaders/mna_wave.glsl"
+dest_files=["res://.godot/imported/mna_wave.glsl-7e39abdd2deee4227b9b1fbbf811c1bd.res"]
+
+[params]
+

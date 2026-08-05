@@ -1,0 +1,27 @@
+// cg_spmv — matrix-free A·p, GENERIC over the stamp.
+//
+// Was: an inlined wave operator with its own hardcoded 48-byte push constant, which is why CG
+// only ever worked with the original `stamp_wave` layout and threw
+// `requires (48) bytes ... supplied: (128)` against any richer stamp.
+// Now it calls st_diag / st_conductance like every other solve body, so it inherits whatever
+// operator the stamp defines — variable coefficients included.
+//
+// Reads p (iter_in, set 2), writes Ap (iter_out, set 3). Header supplies those; the stamp
+// supplies h_curr/h_prev (sets 0/1) which the host must bind even though SpMV does not read
+// state — the operator does not depend on it, but the declarations must be satisfied.
+
+void main() {
+    ivec2 c = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 mx = ivec2(pc.size) - ivec2(1);
+    if (c.x > mx.x || c.y > mx.y) {
+        return;
+    }
+    const ivec2 offs[4] = ivec2[4](ivec2(1, 0), ivec2(-1, 0), ivec2(0, 1), ivec2(0, -1));
+    float p = imageLoad(iter_in, c).r;
+    float ap = st_diag(c) * p;
+    for (int k = 0; k < 4; k++) {
+        ivec2 n = clamp(c + offs[k], ivec2(0), mx);
+        ap -= st_conductance(c, n) * imageLoad(iter_in, n).r;
+    }
+    imageStore(iter_out, c, vec4(ap, 0.0, 0.0, 0.0));
+}

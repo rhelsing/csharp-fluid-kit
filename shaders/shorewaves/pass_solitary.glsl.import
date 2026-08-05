@@ -1,0 +1,14 @@
+[remap]
+
+importer="glsl"
+type="RDShaderFile"
+uid="uid://rflochgnhqor"
+path="res://.godot/imported/pass_solitary.glsl-d265bc648b561d6cf074722cfbedb8a4.res"
+
+[deps]
+
+source_file="res://shaders/shorewaves/pass_solitary.glsl"
+dest_files=["res://.godot/imported/pass_solitary.glsl-d265bc648b561d6cf074722cfbedb8a4.res"]
+
+[params]
+

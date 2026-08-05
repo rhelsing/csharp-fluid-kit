@@ -1,0 +1,14 @@
+[remap]
+
+importer="glsl"
+type="RDShaderFile"
+uid="uid://bjx15aar5oxwo"
+path="res://.godot/imported/mna_pack_normal.glsl-4dfd9084ab56cf2c9c17cd0798ced322.res"
+
+[deps]
+
+source_file="res://shaders/mna_pack_normal.glsl"
+dest_files=["res://.godot/imported/mna_pack_normal.glsl-4dfd9084ab56cf2c9c17cd0798ced322.res"]
+
+[params]
+

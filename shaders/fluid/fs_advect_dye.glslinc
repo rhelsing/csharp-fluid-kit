@@ -1,0 +1,35 @@
+#version 450
+// fs_advect_dye — semi-Lagrangian advection of the dye/density field by the (now
+// divergence-free) velocity. Same backtrace as the velocity advection.
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+layout(r32f,  set = 0, binding = 0) uniform image2D dye_in;
+layout(rg32f, set = 1, binding = 0) uniform image2D vel;
+layout(r32f,  set = 2, binding = 0) uniform image2D dye_out;
+
+layout(push_constant, std430) uniform P {
+    vec2  size;
+    float dt;
+    float dissip;   // dye dissipation (< 1 fades the smoke)
+} p;
+
+float samp(ivec2 mx, vec2 pos) {
+    pos = clamp(pos, vec2(0.0), vec2(mx));
+    ivec2 i = ivec2(floor(pos));
+    vec2 f = pos - vec2(i);
+    ivec2 i1 = min(i + ivec2(1), mx);
+    float d00 = imageLoad(dye_in, i).r;
+    float d10 = imageLoad(dye_in, ivec2(i1.x, i.y)).r;
+    float d01 = imageLoad(dye_in, ivec2(i.x, i1.y)).r;
+    float d11 = imageLoad(dye_in, i1).r;
+    return mix(mix(d00, d10, f.x), mix(d01, d11, f.x), f.y);
+}
+
+void main() {
+    ivec2 c = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 mx = ivec2(p.size) - ivec2(1);
+    if (c.x > mx.x || c.y > mx.y) { return; }
+
+    vec2 v = imageLoad(vel, c).rg;
+    vec2 pos = vec2(c) - p.dt * v;
+    imageStore(dye_out, c, vec4(samp(mx, pos) * p.dissip, 0.0, 0.0, 0.0));
+}

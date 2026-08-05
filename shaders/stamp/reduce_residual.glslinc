@@ -1,0 +1,43 @@
+// reduce_residual.glslinc — the GPU-reduction primitive (plan §1: "the only
+// non-trivial parallel primitive"). Computes the per-cell residual of the stamped
+// system for the current iterate x (bound as iter_in):
+//     r(c) = st_rhs(c) + Σ st_conductance(c,n)·x(n) − st_diag(c)·x(c)
+// squares it, and workgroup-reduces Σr² (shared-memory tree) into ONE partial per
+// workgroup (partials SSBO @ set 4). The C# host sums the partials → RMS residual.
+// Same reduction backbone CG's dot-products will use.
+
+layout(std430, set = 4, binding = 0) buffer Partials { float partial[]; };
+
+shared float sdata[64];   // local_size 8*8 = 64
+
+void main() {
+    ivec2 c = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 mx = ivec2(pc.size) - ivec2(1);
+
+    float r2 = 0.0;
+    if (c.x <= mx.x && c.y <= mx.y) {
+        const ivec2 offs[4] = ivec2[4](ivec2(1, 0), ivec2(-1, 0), ivec2(0, 1), ivec2(0, -1));
+        float x = imageLoad(iter_in, c).r;
+        float off = 0.0;
+        for (int k = 0; k < 4; k++) {
+            ivec2 n = clamp(c + offs[k], ivec2(0), mx);
+            off += st_conductance(c, n) * imageLoad(iter_in, n).r;
+        }
+        float r = st_rhs(c) + off - st_diag(c) * x;
+        r2 = r * r;
+    }
+
+    uint li = gl_LocalInvocationIndex;
+    sdata[li] = r2;
+    barrier();
+    for (uint s = 32u; s > 0u; s >>= 1u) {
+        if (li < s) {
+            sdata[li] += sdata[li + s];
+        }
+        barrier();
+    }
+    if (li == 0u) {
+        uint wg = gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x;
+        partial[wg] = sdata[0];
+    }
+}

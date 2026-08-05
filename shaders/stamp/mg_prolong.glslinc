@@ -1,0 +1,33 @@
+#version 450
+// mg_prolong — interpolate a coarse correction up to the fine grid and ADD it to the
+// fine iterate (u_fine += bilinear(u_coarse)). Dispatched over the FINE grid.
+// u_coarse = set 2, u_fine (in place) = set 3.
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(r32f, set = 2, binding = 0) uniform image2D u_coarse;
+layout(r32f, set = 3, binding = 0) uniform image2D u_fine;
+
+layout(push_constant, std430) uniform P {
+    vec2 fine_size;
+    vec2 coarse_size;
+} pc;
+
+void main() {
+    ivec2 f = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 fmx = ivec2(pc.fine_size) - ivec2(1);
+    if (f.x > fmx.x || f.y > fmx.y) {
+        return;
+    }
+    ivec2 cmx = ivec2(pc.coarse_size) - ivec2(1);
+    vec2 cc = (vec2(f) + 0.5) * 0.5 - 0.5;          // fine → coarse coordinate
+    ivec2 c0 = ivec2(floor(cc));
+    vec2 t = cc - vec2(c0);
+    ivec2 a = clamp(c0, ivec2(0), cmx);
+    ivec2 b = clamp(c0 + ivec2(1, 0), ivec2(0), cmx);
+    ivec2 d = clamp(c0 + ivec2(0, 1), ivec2(0), cmx);
+    ivec2 e = clamp(c0 + ivec2(1, 1), ivec2(0), cmx);
+    float v = mix(mix(imageLoad(u_coarse, a).r, imageLoad(u_coarse, b).r, t.x),
+                  mix(imageLoad(u_coarse, d).r, imageLoad(u_coarse, e).r, t.x), t.y);
+    imageStore(u_fine, f, vec4(imageLoad(u_fine, f).r + v, 0.0, 0.0, 0.0));
+}

@@ -1,0 +1,103 @@
+// solve_adi.glslinc — one ALTERNATING-DIRECTION IMPLICIT half-sweep of the stamped system.
+//
+// Jacobi and RBGS are SMOOTHERS: they annihilate high-frequency error and leave the smooth
+// modes almost untouched (λ → 4β/(1+4β) → 1 as θ → 0). That is why ripples propagate while
+// long waves stall and decay — the smooth component of the solve never converges, and since
+// the iterate is seeded from h_curr, whatever does not converge simply does not move.
+//
+// ADI fixes that along one axis at a time. Each LINE is solved EXACTLY as a tridiagonal
+// system (Thomas), so information crosses the entire 1024-cell row in a single pass instead
+// of one cell per sweep. Run AXIS 0 (x-lines) then AXIS 1 (z-lines) and both directions get
+// a direct solve per iteration. The cross-axis neighbours are taken from the current iterate,
+// which is what makes it a relaxation rather than a full 2D direct solve.
+//
+// Anisotropy note: our conductance varies in x (the bed slopes) and is flat in z. Line
+// smoothing ALONG the strong direction is the standard remedy for exactly that, which is why
+// ADI suits this stamp better than point relaxation does.
+//
+//   AXIS is injected by the host as a compile-time constant (two pipelines).
+//   One INVOCATION per line; Thomas needs O(N) scratch, so c'/d' live in scratch images.
+//
+// Generic over any stamp (st_diag / st_conductance / st_rhs); header supplies iter_in (set 2)
+// and iter_out (set 3). Neighbours clamp = Neumann walls, matching the other solve bodies.
+
+layout(r32f, set = 4, binding = 0) coherent uniform image2D scratch_cp;   // Thomas c'
+layout(r32f, set = 5, binding = 0) coherent uniform image2D scratch_dp;   // Thomas d'
+
+// cell on this line at index i (AXIS 0 -> vary x, AXIS 1 -> vary z)
+ivec2 adi_cell(int line, int i) {
+#if AXIS == 0
+    return ivec2(i, line);
+#else
+    return ivec2(line, i);
+#endif
+}
+
+void main() {
+    ivec2 mx = ivec2(pc.size) - ivec2(1);
+#if AXIS == 0
+    int line = int(gl_GlobalInvocationID.x);   // one thread per ROW
+    int n = int(pc.size.x);
+    int lineMax = mx.y;
+    const ivec2 along = ivec2(1, 0);
+    const ivec2 cross_ = ivec2(0, 1);
+#else
+    int line = int(gl_GlobalInvocationID.x);   // one thread per COLUMN
+    int n = int(pc.size.y);
+    int lineMax = mx.x;
+    const ivec2 along = ivec2(0, 1);
+    const ivec2 cross_ = ivec2(1, 0);
+#endif
+    if (line > lineMax) {
+        return;
+    }
+
+    // ---- forward elimination ------------------------------------------------
+    // Row i:  -aw*x[i-1] + d*x[i] - ae*x[i+1] = rhs_i + (cross-axis neighbours, explicit)
+    float cp_prev = 0.0;
+    float dp_prev = 0.0;
+    for (int i = 0; i < n; i++) {
+        ivec2 c = adi_cell(line, i);
+
+        ivec2 nW = clamp(c - along, ivec2(0), mx);
+        ivec2 nE = clamp(c + along, ivec2(0), mx);
+        ivec2 nA = clamp(c - cross_, ivec2(0), mx);
+        ivec2 nB = clamp(c + cross_, ivec2(0), mx);
+
+        float aw = (i == 0) ? 0.0 : st_conductance(c, nW);
+        float ae = (i == n - 1) ? 0.0 : st_conductance(c, nE);
+        float d = st_diag(c);
+
+        // cross-axis terms stay explicit (current iterate) — this is the "alternating" part.
+        // A clamped edge neighbour is the cell itself, which reproduces the Neumann wall.
+        float b = st_rhs(c)
+            + st_conductance(c, nA) * imageLoad(iter_in, nA).r
+            + st_conductance(c, nB) * imageLoad(iter_in, nB).r;
+
+        // at a clamped end the missing neighbour folds back into the diagonal
+        if (i == 0)     { d -= st_conductance(c, nW); }
+        if (i == n - 1) { d -= st_conductance(c, nE); }
+
+        float m = d - aw * cp_prev;
+        m = (abs(m) < 1.0e-12) ? 1.0e-12 : m;
+        cp_prev = ae / m;
+        dp_prev = (b + aw * dp_prev) / m;
+
+        imageStore(scratch_cp, c, vec4(cp_prev, 0.0, 0.0, 0.0));
+        imageStore(scratch_dp, c, vec4(dp_prev, 0.0, 0.0, 0.0));
+    }
+
+    // make the forward sweep's scratch writes visible to our own reads below
+    memoryBarrierImage();
+
+    // ---- back substitution --------------------------------------------------
+    float x = dp_prev;
+    imageStore(iter_out, adi_cell(line, n - 1), vec4(x, 0.0, 0.0, 0.0));
+    for (int i = n - 2; i >= 0; i--) {
+        ivec2 c = adi_cell(line, i);
+        float cp = imageLoad(scratch_cp, c).r;
+        float dp = imageLoad(scratch_dp, c).r;
+        x = dp + cp * x;
+        imageStore(iter_out, c, vec4(x, 0.0, 0.0, 0.0));
+    }
+}

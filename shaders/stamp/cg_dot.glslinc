@@ -1,0 +1,36 @@
+// cg_dot.glslinc — GPU dot product Σ a·b over two textures (a = iter_in @ set 2,
+// b = iter_out @ set 3), workgroup shared-memory tree-reduced to one partial per
+// workgroup (partials SSBO @ set 4). The host sums the partials → the scalar CG
+// needs (r·r and p·Ap). NO stamp — its own tiny push constant (size only).
+
+layout(push_constant, std430) uniform DotP {
+    vec2 size;
+    float _p0;
+    float _p1;
+} dp;
+
+layout(std430, set = 4, binding = 0) buffer Partials { float partial[]; };
+
+shared float sdata[64];
+
+void main() {
+    ivec2 c = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 mx = ivec2(dp.size) - ivec2(1);
+    float v = 0.0;
+    if (c.x <= mx.x && c.y <= mx.y) {
+        v = imageLoad(iter_in, c).r * imageLoad(iter_out, c).r;
+    }
+    uint li = gl_LocalInvocationIndex;
+    sdata[li] = v;
+    barrier();
+    for (uint s = 32u; s > 0u; s >>= 1u) {
+        if (li < s) {
+            sdata[li] += sdata[li + s];
+        }
+        barrier();
+    }
+    if (li == 0u) {
+        uint wg = gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x;
+        partial[wg] = sdata[0];
+    }
+}

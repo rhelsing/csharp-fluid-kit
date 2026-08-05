@@ -1,0 +1,25 @@
+#version 450
+// fs_pressure_jacobi — ONE Jacobi relaxation of ∇²p = div:
+//     p(c) = (p_L + p_R + p_D + p_U − div(c)) / 4
+// This is the SAME matrix-free relaxation the stamp solvers use (Poisson is the stamp
+// with diag 4, conductance 1, rhs −div); here it's the pressure-projection solve inside
+// the fluid pipeline. Ping-ponged p_in → p_out, warm-started from last frame.
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+layout(r32f, set = 0, binding = 0) uniform image2D p_in;
+layout(r32f, set = 1, binding = 0) uniform image2D div;
+layout(r32f, set = 2, binding = 0) uniform image2D p_out;
+
+layout(push_constant, std430) uniform P { vec2 size; vec2 pad; } pc;
+
+void main() {
+    ivec2 c = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 mx = ivec2(pc.size) - ivec2(1);
+    if (c.x > mx.x || c.y > mx.y) { return; }
+
+    float pR = imageLoad(p_in, clamp(c + ivec2(1, 0), ivec2(0), mx)).r;
+    float pL = imageLoad(p_in, clamp(c + ivec2(-1, 0), ivec2(0), mx)).r;
+    float pU = imageLoad(p_in, clamp(c + ivec2(0, 1), ivec2(0), mx)).r;
+    float pD = imageLoad(p_in, clamp(c + ivec2(0, -1), ivec2(0), mx)).r;
+    float d = imageLoad(div, c).r;
+    imageStore(p_out, c, vec4((pL + pR + pU + pD - d) * 0.25, 0.0, 0.0, 0.0));
+}

@@ -1,0 +1,52 @@
+// stamp_blob_3d.glslinc — a 3D implicit damped-wave "slime blob" stamp for GpuStampSolver3D.
+//
+// The wave stamp in a VOLUME (7-point), with a persistent central source that holds a
+// stable blob: the source keeps the field high in the middle and it falls off radially
+// (screened by `leak`), so an isolevel surface of the field is a sphere-ish blob. Pokes
+// add 3D ripples → the surface wobbles like jelly. Backward-Euler ⇒ unconditionally
+// stable. Both h_curr (set 0) and h_prev (set 1) are read (leapfrog), so neither binding
+// is stripped.
+//
+// Contract: pc begins with vec4 size (xyz = grid dims).
+
+layout(r32f, set = 0, binding = 0) uniform image3D h_curr;   // field h(t)
+layout(r32f, set = 1, binding = 0) uniform image3D h_prev;   // h(t-dt)
+
+layout(push_constant, std430) uniform Params {
+    vec4  size;      // xyz = grid dims  (REQUIRED first field)
+    float beta;      // dt^2 * c^2  -> neighbour conductance
+    float a;         // gamma*dt/2  -> damping
+    float leak;      // restoring conductance to rest -> stable, bounded blob
+    float src_r;     // central source radius (px)
+    float src_w;     // central source strength (holds the blob)
+    float poke_x;    // transient poke centre px (3D)
+    float poke_y;
+    float poke_z;
+    float poke_r;    // poke radius px
+    float poke_w;    // poke strength (0 = none)
+} pc;                // std430: 14 contiguous scalars; host pads the push to 64B.
+
+float st_conductance(ivec3 c, ivec3 n) {
+    return pc.beta;
+}
+
+float st_diag(ivec3 c) {
+    return 1.0 + pc.a + 6.0 * pc.beta + pc.leak;
+}
+
+float st_rhs(ivec3 c) {
+    float hc = imageLoad(h_curr, c).r;
+    float hp = imageLoad(h_prev, c).r;
+    float base = 2.0 * hc - hp + pc.a * hp;            // leapfrog companion
+
+    vec3 ctr = pc.size.xyz * 0.5;                      // persistent central source
+    vec3 d = vec3(c) - ctr;
+    float src = pc.src_w * exp(-dot(d, d) / (pc.src_r * pc.src_r));
+
+    float poke = 0.0;
+    if (pc.poke_w != 0.0) {
+        vec3 dp = vec3(c) - vec3(pc.poke_x, pc.poke_y, pc.poke_z);
+        poke = pc.poke_w * exp(-dot(dp, dp) / (pc.poke_r * pc.poke_r));
+    }
+    return base + src + poke;
+}

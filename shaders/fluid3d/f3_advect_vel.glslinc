@@ -1,0 +1,33 @@
+#version 450
+// f3_advect_vel — semi-Lagrangian self-advection of the 3D velocity field (trilinear).
+layout(local_size_x = 4, local_size_y = 4, local_size_z = 4) in;
+layout(rgba32f, set = 0, binding = 0) uniform image3D vel_in;
+layout(rgba32f, set = 1, binding = 0) uniform image3D vel_out;
+
+layout(push_constant, std430) uniform P { vec4 size; float dt; float dissip; } p;
+
+vec3 samp(ivec3 mx, vec3 pos) {
+    pos = clamp(pos, vec3(0.0), vec3(mx));
+    ivec3 i = ivec3(floor(pos));
+    vec3 f = pos - vec3(i);
+    ivec3 j = min(i + ivec3(1), mx);
+    vec3 c000 = imageLoad(vel_in, ivec3(i.x, i.y, i.z)).xyz;
+    vec3 c100 = imageLoad(vel_in, ivec3(j.x, i.y, i.z)).xyz;
+    vec3 c010 = imageLoad(vel_in, ivec3(i.x, j.y, i.z)).xyz;
+    vec3 c110 = imageLoad(vel_in, ivec3(j.x, j.y, i.z)).xyz;
+    vec3 c001 = imageLoad(vel_in, ivec3(i.x, i.y, j.z)).xyz;
+    vec3 c101 = imageLoad(vel_in, ivec3(j.x, i.y, j.z)).xyz;
+    vec3 c011 = imageLoad(vel_in, ivec3(i.x, j.y, j.z)).xyz;
+    vec3 c111 = imageLoad(vel_in, ivec3(j.x, j.y, j.z)).xyz;
+    vec3 c00 = mix(c000, c100, f.x), c10 = mix(c010, c110, f.x);
+    vec3 c01 = mix(c001, c101, f.x), c11 = mix(c011, c111, f.x);
+    return mix(mix(c00, c10, f.y), mix(c01, c11, f.y), f.z);
+}
+
+void main() {
+    ivec3 c = ivec3(gl_GlobalInvocationID.xyz);
+    ivec3 mx = ivec3(p.size.xyz) - ivec3(1);
+    if (c.x > mx.x || c.y > mx.y || c.z > mx.z) { return; }
+    vec3 v = imageLoad(vel_in, c).xyz;
+    imageStore(vel_out, c, vec4(samp(mx, vec3(c) - p.dt * v) * p.dissip, 0.0));
+}
