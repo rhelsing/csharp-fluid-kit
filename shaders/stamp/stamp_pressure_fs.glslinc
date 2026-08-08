@@ -1,0 +1,72 @@
+// stamp_pressure_fs.glslinc — pressure Poisson with a FREE SURFACE boundary.
+//
+// stamp_pressure.glslinc solves the CLOSED-BOX problem: Neumann everywhere, including at the
+// air. That is why scene 26 drained. A closed box cannot have a top — the solver was told the
+// water is sealed in, so no pressure field exists that supports a column with a surface, and
+// gravity wins every frame no matter how many iterations you throw at it. Iteration count was
+// never the problem; the boundary condition was.
+//
+// THE FIX, and it is the definition of a free surface: pressure is ZERO at the air.
+//
+//     liquid neighbour  ->  couples normally          (off-diagonal = 1)
+//     AIR neighbour     ->  contributes to the diagonal but NOT the off-diagonal.
+//                           Its pressure is known to be 0, so it drops out of the sum
+//                           instead of being solved for. That IS Dirichlet p = 0.
+//     air cell itself   ->  diagonal 1, no coupling, rhs 0  ->  p = 0 exactly.
+//
+// Two things fall out of this for free, and both matter:
+//   * NON-SINGULAR. stamp_pressure's pure-Neumann operator has a constant nullspace, which is
+//     why H-W1 measured deep multigrid at 0.96x Jacobi — every coarse level was singular too,
+//     so the coarse-grid correction was ill-defined. One air cell touching liquid removes the
+//     nullspace and multigrid becomes well-posed.
+//   * FAR BETTER CONDITIONED. Dirichlet boundaries shrink the condition number sharply, so the
+//     same solver converges in far fewer iterations than the 0.44-after-24-sweeps we measured
+//     on the closed-box version.
+//
+// SLOTS. The contract gives a stamp two state images:
+//     set 0 = divergence          (the rhs)
+//     set 1 = LIQUID FRACTION     (1 = water, 0 = air) — the parent leaves this unread
+// Dimension-generic: ST_NB / ST_NEIGHBOUR, so the same file is the 2D and 3D operator.
+
+layout(r32f, set = 0, binding = 0) uniform image3D div_field;
+layout(r32f, set = 1, binding = 0) uniform image3D liquid;
+
+layout(push_constant, std430) uniform Params {
+    vec4  size;      // REQUIRED first member
+    float scale;     // rhs scale
+    float iso;       // liquid/air threshold
+    float _p0;
+    float _p1;
+    vec4  _p2;
+    vec4  _p3;
+} pc;
+
+bool st_is_liquid(ivec3 c) {
+    return imageLoad(liquid, c).r > pc.iso;
+}
+
+// Only liquid neighbours couple. An air neighbour's pressure is known (0), so it leaves the
+// system rather than joining it — which is exactly what makes the surface free.
+float st_conductance(ivec3 c, ivec3 n) {
+    if (!st_is_liquid(c)) {
+        return 0.0;
+    }
+    return st_is_liquid(n) ? 1.0 : 0.0;
+}
+
+// The diagonal counts ALL non-solid neighbours, liquid or air. Counting only the liquid ones
+// is the classic mistake — it silently turns the free surface back into a solid wall, because
+// then nothing distinguishes "open to air" from "nothing there".
+float st_diag(ivec3 c) {
+    if (!st_is_liquid(c)) {
+        return 1.0;                 // air cell: p = 0, decoupled
+    }
+    return float(ST_NB);
+}
+
+float st_rhs(ivec3 c) {
+    if (!st_is_liquid(c)) {
+        return 0.0;                 // air cell: p = 0
+    }
+    return -pc.scale * imageLoad(div_field, c).r;
+}

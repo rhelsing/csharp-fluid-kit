@@ -1,0 +1,52 @@
+#version 450
+
+// eddy_mask.glslinc — scene 51: VORTEX-CORE detection on the swirl fluid, the second
+// system unlocked by the winding-number primitive (docs/science-boi-lift.md). The
+// velocity direction atan2(v.y, v.x) is an angle field; around a genuine eddy core it
+// winds ±2π on a 2×2 plaquette. Speed-gated (angle is meaningless in still water).
+// Output is a gain-premultiplied whitecap source, texel-aligned with the swirl grid.
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(rg16f, set = 0, binding = 0) uniform image2D vel_in;
+layout(r16f, set = 1, binding = 0) uniform image2D mask_out;
+
+layout(push_constant, std430) uniform Params {
+    vec2  size;
+    float thresh;      // |winding| rad to count a core (~4)
+    float gain;        // whitecap source strength at each core (0 = off)
+    float min_speed;   // m/s below which the angle is noise
+    float _p0;
+    float _p1;
+    float _p2;
+} pc;
+
+float wrap_pi(float a) {
+    return a - 6.2831853 * floor((a + 3.14159265) / 6.2831853);
+}
+
+void main() {
+    ivec2 c = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 N = ivec2(pc.size);
+    if (c.x >= N.x || c.y >= N.y) {
+        return;
+    }
+
+    vec2 v00 = imageLoad(vel_in, c).rg;
+    vec2 v10 = imageLoad(vel_in, ((c + ivec2(1, 0)) % N + N) % N).rg;
+    vec2 v11 = imageLoad(vel_in, ((c + ivec2(1, 1)) % N + N) % N).rg;
+    vec2 v01 = imageLoad(vel_in, ((c + ivec2(0, 1)) % N + N) % N).rg;
+
+    float ms = pc.min_speed;
+    if (length(v00) < ms || length(v10) < ms || length(v11) < ms || length(v01) < ms) {
+        imageStore(mask_out, c, vec4(0.0));
+        return;
+    }
+
+    float t00 = atan(v00.y, v00.x);
+    float t10 = atan(v10.y, v10.x);
+    float t11 = atan(v11.y, v11.x);
+    float t01 = atan(v01.y, v01.x);
+    float w = wrap_pi(t10 - t00) + wrap_pi(t11 - t10) + wrap_pi(t01 - t11) + wrap_pi(t00 - t01);
+    imageStore(mask_out, c, vec4(abs(w) > pc.thresh ? pc.gain : 0.0, 0.0, 0.0, 0.0));
+}

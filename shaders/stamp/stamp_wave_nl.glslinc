@@ -1,0 +1,161 @@
+// stamp_wave_nl.glslinc — stamp_wave_tank with NONLINEAR depth (hypotheses.md H-W6).
+//
+// A FORK, not an edit. stamp_wave_tank drives scenes 25/50 and the whole solver bench; it stays
+// exactly as it is and remains the linear control. Same reasoning as MgvSolver vs MgDeepSolver
+// (solver-ledger.md §7a) — the comparison only exists if both are runnable.
+//
+// THE ONE CHANGE, and it is the reason waves in this project cannot break:
+//
+//     stamp_wave_tank:  depth = bed(x)                    <- STATIC. The wave never learns
+//                                                            how tall it is.
+//     stamp_wave_nl:    depth = bed(x) + nl * h_curr(c)   <- total water column
+//
+// Shallow-water speed is c = sqrt(g*h), so with total depth the CREST (in deeper water) outruns
+// the TROUGH. The front face steepens, goes vertical, and in the real world overturns. With
+// static depth every part of the wave travels at the same speed and the profile is preserved
+// forever — a linear wave cannot steepen, so it cannot break, at ANY resolution with ANY
+// solver. That is the physics, not a numerics limitation.
+//
+// H-W3 already measured the half of this that was working: c scales as sqrt(beta) to 2-8%. This
+// makes beta depend on the solution instead of only on the bed.
+//
+// WHY NO NEWTON LOOP (the pleasant surprise). st_diag now reads h_curr, so the operator is
+// state-dependent — nonlinear. But h_curr is CONSTANT for the whole of Step(): every sweep
+// re-evaluates st_diag against the same h_curr, and only h_next changes. That is a
+// frozen-coefficient (Picard) linearization, re-linearized once per timestep, and it costs
+// nothing extra. A true Newton solve would relinearize within the step; for a first
+// measurement of steepening, frozen-coefficient is the standard and sufficient choice.
+// It IS an approximation, and it is the one to revisit if steepening stalls near the vertical.
+//
+// SLOT REUSE. The push layout is byte-identical to stamp_wave_tank so every host, solver and
+// bench drives it unchanged. Nonlinearity strength rides in `extra.x`, which stamp_wave_tank
+// spends on "micro paddle segments" — mutually exclusive with this experiment, and the same
+// documented slot-sharing the parent already does for DC mode 3 vs leak.
+//   extra.x = 0  -> byte-identical behaviour to stamp_wave_tank (the control)
+//   extra.x = 1  -> full physical nonlinearity
+// Values between let you dial it, which is what makes the steepening RATE measurable rather
+// than just present/absent.
+
+layout(r32f, set = 0, binding = 0) uniform image2D h_curr;   // state: h(t)
+layout(r32f, set = 1, binding = 0) uniform image2D h_prev;   // state: h(t-dt)
+
+layout(push_constant, std430) uniform Params {
+    vec2  size;
+    float beta_scale;
+    float a;
+
+    float leak;
+    float cn;
+    float sponge_w;
+    float sponge_a;
+
+    float floor_base;
+    float slope;
+    float water_level;
+    float min_depth;
+
+    vec4  paddle;
+    vec4  macro;
+    vec4  micro;
+    vec4  drop;
+    vec4  extra;        // x = NONLINEARITY STRENGTH (was: micro segments)
+                        // y = sponge edge mask | DC mode << 4
+                        // z = bathymetry coupling, w = ref depth
+} pc;
+
+const float ST_PI = 3.141592653589793;
+
+int st_dc_mode() { return int(pc.extra.y + 0.5) >> 4; }
+int st_edge_mask() { return int(pc.extra.y + 0.5) & 15; }
+
+float st_x(ivec2 c) { return (float(c.x) + 0.5) / pc.size.x * 2.0 - 1.0; }
+float st_z(ivec2 c) { return (float(c.y) + 0.5) / pc.size.y * 2.0 - 1.0; }
+
+// ---- bed + surface: the whole difference from the parent stamp ----
+float st_depth(ivec2 c) {
+    float bed = max(pc.min_depth, pc.water_level - (pc.floor_base + pc.slope * (st_x(c) + 1.0)));
+    float d = mix(pc.extra.w, bed, clamp(pc.extra.z, 0.0, 1.0));
+    d += pc.extra.x * imageLoad(h_curr, c).r;      // <- total water column
+    return max(pc.min_depth, d);                    // clamp keeps beta positive as a trough deepens
+}
+
+float st_beta_face(ivec2 c, ivec2 n) {
+    return pc.beta_scale * 0.5 * (st_depth(c) + st_depth(n));
+}
+
+// ---- losses (identical to the parent) ----
+float st_sponge(ivec2 c) {
+    vec2 mxf = pc.size - vec2(1.0);
+    int m = st_edge_mask();
+    float d = 1.0e9;
+    if ((m & 1) != 0) { d = min(d, float(c.x)); }
+    if ((m & 2) != 0) { d = min(d, mxf.x - float(c.x)); }
+    if ((m & 4) != 0) { d = min(d, float(c.y)); }
+    if ((m & 8) != 0) { d = min(d, mxf.y - float(c.y)); }
+    float t = clamp(1.0 - d / max(pc.sponge_w, 1.0), 0.0, 1.0);
+    return t * t;
+}
+
+float st_damp(ivec2 c) { return pc.a + pc.sponge_a * st_sponge(c); }
+float st_leak(ivec2 c) {
+    float k = (st_dc_mode() == 3) ? 0.0 : pc.leak;
+    return k + pc.sponge_a * st_sponge(c);
+}
+
+// ---- the stamp ----
+float st_conductance(ivec2 c, ivec2 n) {
+    return (1.0 - 0.5 * pc.cn) * st_beta_face(c, n);
+}
+
+float st_diag(ivec2 c) {
+    float sum = 0.0;
+    for (int k = 0; k < ST_NB; k++) {
+        sum += st_beta_face(c, ST_NEIGHBOUR(c, k));
+    }
+    return 1.0 + st_damp(c) + (1.0 - 0.5 * pc.cn) * (sum + st_leak(c));
+}
+
+float st_rhs(ivec2 c) {
+    float hc = imageLoad(h_curr, c).r;
+    float hp = imageLoad(h_prev, c).r;
+
+    float dhp = 0.0;
+    float sum = 0.0;
+    for (int k = 0; k < ST_NB; k++) {
+        ST_IVEC n = ST_NEIGHBOUR(c, k);
+        float bf = st_beta_face(c, n);
+        dhp += bf * imageLoad(h_prev, n).r;
+        sum += bf;
+    }
+    dhp -= (sum + st_leak(c)) * hp;
+
+    float force = 0.0;
+
+    if (pc.drop.w != 0.0) {
+        vec2 d = vec2(c) - pc.drop.xy;
+        force += pc.drop.w * exp(-dot(d, d) / (pc.drop.z * pc.drop.z));
+    }
+
+    if (pc.paddle.w != 0.0) {
+        float x = st_x(c);
+        float z = st_z(c);
+        float face_old = pc.paddle.x + pc.macro.x * sin(pc.macro.y * ST_PI * z + pc.macro.z);
+        float face_new = pc.paddle.y + pc.macro.x * sin(pc.macro.y * ST_PI * z + pc.macro.w);
+        float reach = max(1.0e-4, pc.paddle.z);
+        float sd = x - face_new;
+        float dist = abs(sd);
+        if (dist < reach) {
+            float w;
+            if (st_dc_mode() == 5) {
+                w = sin(ST_PI * dist / reach) * sign(sd);
+            } else {
+                w = 0.5 + 0.5 * cos(ST_PI * dist / reach);
+            }
+            force += (face_new - face_old) * pc.paddle.w * w;
+        }
+    }
+
+    if (st_dc_mode() == 3) { force -= pc.leak; }
+
+    return 2.0 * (hc + force) - hp + st_damp(c) * hp + (0.5 * pc.cn) * dhp;
+}

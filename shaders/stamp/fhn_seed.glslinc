@@ -1,0 +1,35 @@
+#version 450
+
+// fhn_seed.glslinc — scene 49: reset the FHN medium. mode 0 = rest state everywhere
+// (u₀≈−1.2, v₀≈−0.62 for a=0.7, b=0.8). mode 1 = the classic CROSS-FIELD spiral seed:
+// an excited half-plane in u crossed with an elevated half-plane in v — the wavefront
+// dies in the refractory half, and the surviving free end curls into a spiral.
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(rg16f, set = 0, binding = 0) uniform image2D state_out;
+
+layout(push_constant, std430) uniform Params {
+    vec2  size;
+    float mode;
+    float _p0;
+} pc;
+
+void main() {
+    ivec2 c = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 N = ivec2(pc.size);
+    if (c.x >= N.x || c.y >= N.y) {
+        return;
+    }
+    float u = -1.2;
+    float v = -0.62;
+    if (pc.mode > 0.5) {
+        if (c.x < N.x / 2) {
+            u = 1.8;
+        }
+        if (c.y < N.y / 2) {
+            v = 0.8;
+        }
+    }
+    imageStore(state_out, c, vec4(u, v, 0.0, 0.0));
+}

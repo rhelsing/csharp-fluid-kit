@@ -30,12 +30,44 @@ public sealed class GpuStampSolver : IStampSolver
         "layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;\n" +
         "layout(r32f, set = 2, binding = 0) uniform image2D iter_in;\n";
 
+    // CG's two ELEMENTWISE kernels used to carry these declarations themselves, which is what
+    // pinned them to 2D. They are host-supplied now (as every solve body's always have been),
+    // so the same .glslinc compiles against nd_2d here and nd_3d in GpuStampSolver3D. The
+    // push-constant layout is byte-for-byte what it was — Pc16 is unchanged.
+    private const string SaxpyHeader =
+        "#version 450\n" +
+        "layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;\n" +
+        "layout(r32f, set = 2, binding = 0) uniform image2D x_img;\n" +
+        "layout(r32f, set = 3, binding = 0) uniform image2D y_img;\n" +
+        "layout(std430, set = 5, binding = 0) buffer Scalars { float sc[]; };\n" +
+        "layout(push_constant, std430) uniform P { vec2 size; uint cy_slot; uint cx_slot; } pc;\n";
+
+    private const string DotPartialHeader =
+        "#version 450\n" +
+        "layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;\n" +
+        "layout(r32f, set = 2, binding = 0) uniform image2D a_img;\n" +
+        "layout(r32f, set = 3, binding = 0) uniform image2D b_img;\n" +
+        "layout(std430, set = 4, binding = 0) buffer Partials { float partial[]; };\n" +
+        "layout(push_constant, std430) uniform P { vec2 size; uint slot; uint _pad; } pc;\n";
+
+    public const string Nd2DPath = "res://shaders/stamp/nd_2d.glslinc";
+    public const string Nd3DPath = "res://shaders/stamp/nd_3d.glslinc";
+
     private const string JacobiBodyPath = "res://shaders/stamp/solve_jacobi.glslinc";
     private const string RbgsBodyPath = "res://shaders/stamp/solve_rbgs.glslinc";
     private const string ReduceBodyPath = "res://shaders/stamp/reduce_residual.glslinc";
     private const string CgResPath = "res://shaders/stamp/cg_residual.glslinc";
     private const string CgSpmvPath = "res://shaders/stamp/cg_spmv.glslinc";
-    private const string CgDotPath = "res://shaders/stamp/cg_dotbuf.glslinc";
+    // Two-stage dot product. cg_dotbuf.glslinc (single workgroup, dispatched 1x1x1) is still
+    // used by MgvSolver/MgDeepSolver for their once-per-measure-tick residual, where its cost
+    // is irrelevant. On CG's hot path — 3 dots per iteration, 24 iterations per tick — it was
+    // the dominant cost. Left in place rather than changed so the multigrid control is untouched.
+    private const string CgDotPartialPath = "res://shaders/stamp/cg_dot_partial.glslinc";
+    private const string CgDotFinalPath = "res://shaders/stamp/cg_dot_final.glslinc";
+
+    // Stage-1 workgroups. 256 keeps stage 2 to one iteration per thread while giving stage 1
+    // 65,536 threads — at 1024^2 that is 16 cells per thread instead of 4,096.
+    private const uint DotWg = 256;
     private const string CgCalcPath = "res://shaders/stamp/cg_calc.glslinc";
     private const string CgSaxpyPath = "res://shaders/stamp/cg_saxpybuf.glslinc";
 
@@ -62,13 +94,15 @@ public sealed class GpuStampSolver : IStampSolver
     private bool _resReady;
 
     // Cg (GPU-resident scalars)
-    private Rid _cgRes, _cgSpmv, _cgDot, _cgCalc, _cgSaxpy;
+    private Rid _cgRes, _cgSpmv, _cgDot, _cgDotFinal, _cgCalc, _cgSaxpy;
+    private Rid _cgDotFinalPipe, _cgPartials;
+    private Rid _dotPart4, _finPart4, _finSc5;
     private Rid _spmvH0, _spmvH1;   // stamp state sets, bound so the declarations are satisfied
     private Rid _cgResPipe, _cgSpmvPipe, _cgDotPipe, _cgCalcPipe, _cgSaxpyPipe;
     private Rid _cgX, _cgR, _cgP, _cgAp, _cgScalars;
     private Rid _resH0, _resH1, _resX2, _resR3;
     private Rid _spmvP2, _spmvAp3;
-    private Rid _dotR2, _dotR3, _dotP2, _dotAp3, _dotSc5;
+    private Rid _dotR2, _dotR3, _dotP2, _dotAp3;
     private Rid _calcSc5;
     private Rid _saxHc2, _saxX3, _saxR2, _saxP3, _saxP2, _saxAp2, _saxR3, _saxSc5;
 
@@ -82,7 +116,7 @@ public sealed class GpuStampSolver : IStampSolver
     // solveBodyPath (optional) swaps the relaxation body for this instance only —
     // e.g. scene 50's toroidal-wrap RBGS (solve_rbgs_wrap.glslinc). null = the
     // standard clamped bodies; every existing caller is unaffected.
-    public GpuStampSolver(RenderingDevice rd, Vector2I grid, string stampPath, Mode mode = Mode.Jacobi, string? solveBodyPath = null)
+    public GpuStampSolver(RenderingDevice rd, Vector2I grid, string stampPath, Mode mode = Mode.Jacobi, string? solveBodyPath = null, string? ndPath = null)
     {
         _rd = rd;
         _grid = grid;
@@ -91,7 +125,12 @@ public sealed class GpuStampSolver : IStampSolver
         _gy = (uint)((grid.Y - 1) / 8 + 1);
         _numWg = _gx * _gy;
 
-        string stampText = ReadRes(stampPath);
+        // TOPOLOGY FIRST, then the operator. The nd block defines ST_NB / ST_IVEC / ST_OFFS /
+        // ST_NEIGHBOUR as macros, and BOTH the stamp (st_diag, st_rhs) and the solve bodies
+        // now use them — so it has to precede the stamp. Swapping nd_2d for nd_3d is the
+        // entire dimension change (solver-ledger.md §7d).
+        string ndText = ReadRes(ndPath ?? Nd2DPath);
+        string stampText = ndText + "\n" + ReadRes(stampPath);
 
         if (mode == Mode.Jacobi)
         {
@@ -113,13 +152,17 @@ public sealed class GpuStampSolver : IStampSolver
             _cgRes = Compile("#version 450\n" + HeaderBody + stampText + "\n" + ReadRes(CgResPath), "cg-res");
             // stamp-generic now: compiled WITH the stamp so it uses st_diag/st_conductance
             _cgSpmv = Compile("#version 450\n" + HeaderBody + stampText + "\n" + ReadRes(CgSpmvPath), "cg-spmv");
-            _cgDot = Compile(ReadRes(CgDotPath), "cg-dot");       // standalone (own #version + bindings)
+            // header + nd + body — the nd block only for its ST_ macros; these two kernels are
+            // elementwise and never touch the stamp.
+            _cgDot = Compile(DotPartialHeader + ndText + "\n" + ReadRes(CgDotPartialPath), "cg-dot-partial");
+            _cgSaxpy = Compile(SaxpyHeader + ndText + "\n" + ReadRes(CgSaxpyPath), "cg-saxpy");
+            _cgDotFinal = Compile(ReadRes(CgDotFinalPath), "cg-dot-final");   // buffers only — dimension-free
             _cgCalc = Compile(ReadRes(CgCalcPath), "cg-calc");
-            _cgSaxpy = Compile(ReadRes(CgSaxpyPath), "cg-saxpy");
-            if (!_cgRes.IsValid || !_cgSpmv.IsValid || !_cgDot.IsValid || !_cgCalc.IsValid || !_cgSaxpy.IsValid) { return; }
+            if (!_cgRes.IsValid || !_cgSpmv.IsValid || !_cgDot.IsValid || !_cgDotFinal.IsValid || !_cgCalc.IsValid || !_cgSaxpy.IsValid) { return; }
             _cgResPipe = _rd.ComputePipelineCreate(_cgRes);
             _cgSpmvPipe = _rd.ComputePipelineCreate(_cgSpmv);
             _cgDotPipe = _rd.ComputePipelineCreate(_cgDot);
+            _cgDotFinalPipe = _rd.ComputePipelineCreate(_cgDotFinal);
             _cgCalcPipe = _rd.ComputePipelineCreate(_cgCalc);
             _cgSaxpyPipe = _rd.ComputePipelineCreate(_cgSaxpy);
         }
@@ -166,11 +209,15 @@ public sealed class GpuStampSolver : IStampSolver
             _spmvH0 = MakeImageSet(_hCurr, 0, _cgSpmv);    // stamp declares these; must be bound
             _spmvH1 = MakeImageSet(_hPrev, 1, _cgSpmv);
 
+            _cgPartials = _rd.StorageBufferCreate(DotWg * 4u);
+
             _dotR2 = MakeImageSet(_cgR, 2, _cgDot);
             _dotR3 = MakeImageSet(_cgR, 3, _cgDot);
             _dotP2 = MakeImageSet(_cgP, 2, _cgDot);
             _dotAp3 = MakeImageSet(_cgAp, 3, _cgDot);
-            _dotSc5 = MakeSsboSet(_cgScalars, 5, _cgDot);
+            _dotPart4 = MakeSsboSet(_cgPartials, 4, _cgDot);
+            _finPart4 = MakeSsboSet(_cgPartials, 4, _cgDotFinal);
+            _finSc5 = MakeSsboSet(_cgScalars, 5, _cgDotFinal);
 
             _calcSc5 = MakeSsboSet(_cgScalars, 5, _cgCalc);
 
@@ -372,14 +419,31 @@ public sealed class GpuStampSolver : IStampSolver
         _rd.ComputeListDispatch(cl, _gx, _gy, 1);
     }
 
+    // Two dispatches with a barrier between, both inside the caller's compute list — so CG is
+    // still one barrier-chained list with no readback. Was a single (1,1,1) dispatch.
     private void DotBuf(long cl, Rid a2, Rid b3, uint slot)
     {
         _rd.ComputeListBindComputePipeline(cl, _cgDotPipe);
         _rd.ComputeListBindUniformSet(cl, a2, 2);
         _rd.ComputeListBindUniformSet(cl, b3, 3);
-        _rd.ComputeListBindUniformSet(cl, _dotSc5, 5);
+        _rd.ComputeListBindUniformSet(cl, _dotPart4, 4);
         _rd.ComputeListSetPushConstant(cl, Pc16(slot, 0), 16);
+        _rd.ComputeListDispatch(cl, DotWg, 1, 1);
+        _rd.ComputeListAddBarrier(cl);
+
+        _rd.ComputeListBindComputePipeline(cl, _cgDotFinalPipe);
+        _rd.ComputeListBindUniformSet(cl, _finPart4, 4);
+        _rd.ComputeListBindUniformSet(cl, _finSc5, 5);
+        _rd.ComputeListSetPushConstant(cl, PcDotFinal(DotWg, slot), 16);
         _rd.ComputeListDispatch(cl, 1, 1, 1);
+    }
+
+    private static byte[] PcDotFinal(uint count, uint slot)
+    {
+        var b = new byte[16];
+        Buffer.BlockCopy(BitConverter.GetBytes(count), 0, b, 0, 4);
+        Buffer.BlockCopy(BitConverter.GetBytes(slot), 0, b, 4, 4);
+        return b;
     }
 
     private void Calc(long cl, uint op)
@@ -436,13 +500,13 @@ public sealed class GpuStampSolver : IStampSolver
             _setHCurr, _setHPrev, _set2Curr, _set2A, _set2B, _set3A, _set3B,
             _resHCurr, _resHPrev, _res2A, _res2B, _setSsbo,
             _resH0, _resH1, _resX2, _resR3, _spmvP2, _spmvAp3,
-            _dotR2, _dotR3, _dotP2, _dotAp3, _dotSc5, _calcSc5,
+            _dotR2, _dotR3, _dotP2, _dotAp3, _dotPart4, _finPart4, _finSc5, _calcSc5,
             _saxHc2, _saxX3, _saxR2, _saxP3, _saxP2, _saxAp2, _saxR3, _saxSc5,
         })
         {
             if (r.IsValid) { _rd.FreeRid(r); }
         }
-        foreach (var buf in new[] { _ssbo, _cgScalars })
+        foreach (var buf in new[] { _ssbo, _cgScalars, _cgPartials })
         {
             if (buf.IsValid) { _rd.FreeRid(buf); }
         }
@@ -450,7 +514,7 @@ public sealed class GpuStampSolver : IStampSolver
         {
             if (t.IsValid) { _rd.FreeRid(t); }
         }
-        foreach (var sh in new[] { _shader, _shaderRed, _shaderBlack, _resShader, _cgRes, _cgSpmv, _cgDot, _cgCalc, _cgSaxpy })
+        foreach (var sh in new[] { _shader, _shaderRed, _shaderBlack, _resShader, _cgRes, _cgSpmv, _cgDot, _cgDotFinal, _cgCalc, _cgSaxpy })
         {
             if (sh.IsValid) { _rd.FreeRid(sh); }
         }

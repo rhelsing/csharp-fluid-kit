@@ -46,7 +46,25 @@ public partial class StampFluid3D : Node3D
         BuildUi();
     }
 
-    private void InitSim() => _fluid = new FluidSim3D(RenderingServer.GetRenderingDevice(), Grid);
+    private void InitSim()
+    {
+        _fluid = new FluidSim3D(RenderingServer.GetRenderingDevice(), Grid);
+        _fluid.EnableMultigrid();   // built up front so the toggle is free at runtime
+        ReadCmdline();
+    }
+
+    // `mg=1` after the shoot harness's args forces the multigrid pressure path on, so an A/B
+    // screenshot is a command-line flag instead of an edit to the committed default. Flipping
+    // that default by hand to take a comparison shot is how it ended up committed as `true`.
+    private bool _useMg;
+
+    private void ReadCmdline()
+    {
+        foreach (string a in OS.GetCmdlineUserArgs())
+        {
+            if (a == "mg=1") { _useMg = true; }
+        }
+    }
 
     private void BuildEnvironment()
     {
@@ -137,7 +155,8 @@ public partial class StampFluid3D : Node3D
         RenderingServer.CallOnRenderThread(Callable.From(() =>
         {
             if (_fluid == null) { return; }
-            _fluid.Step(addB, advVB, simB, advDB, iters);
+            _fluid.UseMultigrid = _useMg;
+            _fluid.Step(addB, advVB, simB, advDB, iters, measureResidual: _tick % 30 == 0);
             _vel = _fluid.ReadVelocity();
         }));
         _tick++;
@@ -171,7 +190,13 @@ public partial class StampFluid3D : Node3D
         _tick++;
         if (_readout != null && _tick % 12 == 0)
         {
-            _readout.Text = $"3D fluid · {NParticles} particles · {_iters} pressure iters · {Grid.X}³ · {Engine.GetFramesPerSecond():0}fps";
+            var f = _fluid;
+            string solver = _useMg
+                ? $"MgDeep3D ({(f?.MultigridLevels ?? 0)} lvl)"
+                : "Jacobi";
+            string res = f is { UseMultigrid: true } ? $" · res {f.LastResidual:0.000e+00}" : "";
+            _readout.Text = $"3D fluid · {Grid.X}³ · pressure: {solver} · {_iters} iters{res}\n"
+                + $"{NParticles} particles · {Engine.GetFramesPerSecond():0} fps";
         }
     }
 
@@ -209,6 +234,9 @@ public partial class StampFluid3D : Node3D
             + "MultiMesh billboard particles, coloured by speed → swirling 3D vortices from a buoyant "
             + "plume. Same solver as scene 07, one dimension up.");
         _readout = ui.AddReadout("3D fluid —");
+        // The whole point of scene 09 today: the pressure projection is the only real linear
+        // solve in the fluid, and this flips which solver does it. Jacobi is the original.
+        ui.AddToggle("Pressure: MgDeep3D (off = Jacobi)", false, v => _useMg = v);
         ui.AddSlider("Buoyancy", 0.0f, 8.0f, _buoy, v => _buoy = v);
         ui.AddSlider("Dye amount", 0.0f, 1.0f, _dyeAmt, v => _dyeAmt = v);
         ui.AddSlider("Source radius", 3.0f, 14.0f, _srcRadius, v => _srcRadius = v);

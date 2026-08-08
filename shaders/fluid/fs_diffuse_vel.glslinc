@@ -1,0 +1,29 @@
+#version 450
+// fs_diffuse_vel — one Jacobi sweep of IMPLICIT velocity diffusion (viscosity):
+//     (I − ν·dt·∇²) v = v₀   →   v' = (v₀ + a·Σ v_nb) / (1 + 4a),  a = ν·dt
+// Ping-ponged K times by the host with v₀ held fixed. Implicit → unconditionally
+// stable, so cream-thick viscosities don't explode. ν = 0 skips the pass entirely.
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+layout(rg32f, set = 0, binding = 0) uniform image2D vel0;    // pre-diffusion (fixed)
+layout(rg32f, set = 1, binding = 0) uniform image2D vel_in;  // iterate k
+layout(rg32f, set = 2, binding = 0) uniform image2D vel_out; // iterate k+1
+
+layout(push_constant, std430) uniform P {
+    vec2  size;
+    float a;      // ν·dt in cell units
+    float _pad;
+} p;
+
+void main() {
+    ivec2 c = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 mx = ivec2(p.size) - ivec2(1);
+    if (c.x > mx.x || c.y > mx.y) { return; }
+
+    vec2 vl = imageLoad(vel_in, clamp(c + ivec2(-1, 0), ivec2(0), mx)).rg;
+    vec2 vr = imageLoad(vel_in, clamp(c + ivec2(1, 0), ivec2(0), mx)).rg;
+    vec2 vd = imageLoad(vel_in, clamp(c + ivec2(0, -1), ivec2(0), mx)).rg;
+    vec2 vu = imageLoad(vel_in, clamp(c + ivec2(0, 1), ivec2(0), mx)).rg;
+    vec2 v0 = imageLoad(vel0, c).rg;
+    vec2 v = (v0 + p.a * (vl + vr + vd + vu)) / (1.0 + 4.0 * p.a);
+    imageStore(vel_out, c, vec4(v, 0.0, 0.0));
+}

@@ -1,0 +1,36 @@
+#version 450
+// w3_divergence — div of the velocity field, MASKED.
+// Central differences like f3_divergence, but a face onto solid uses the cell's own value
+// (zero normal gradient) so the bed does not manufacture divergence, and non-fluid cells
+// report zero so the solve leaves them alone.
+layout(local_size_x = 4, local_size_y = 4, local_size_z = 4) in;
+layout(rgba32f, set = 0, binding = 0) uniform image3D vel;
+layout(r32f,    set = 1, binding = 0) uniform image3D div;
+layout(r32f,    set = 2, binding = 0) uniform image3D mask;
+
+layout(push_constant, std430) uniform P { vec4 size; vec4 pad; } pc;
+
+vec3 sample_v(ivec3 c, ivec3 o, ivec3 mx, vec3 self) {
+    ivec3 n = clamp(c + o, ivec3(0), mx);
+    if (imageLoad(mask, n).r < -0.5) { return self; }   // solid -> mirror self, no flux
+    return imageLoad(vel, n).xyz;
+}
+
+void main() {
+    ivec3 c = ivec3(gl_GlobalInvocationID.xyz);
+    ivec3 mx = ivec3(pc.size.xyz) - ivec3(1);
+    if (c.x > mx.x || c.y > mx.y || c.z > mx.z) { return; }
+
+    if (imageLoad(mask, c).r < 0.5) {
+        imageStore(div, c, vec4(0.0));
+        return;
+    }
+    vec3 self = imageLoad(vel, c).xyz;
+    float xR = sample_v(c, ivec3( 1, 0, 0), mx, self).x;
+    float xL = sample_v(c, ivec3(-1, 0, 0), mx, self).x;
+    float yU = sample_v(c, ivec3( 0, 1, 0), mx, self).y;
+    float yD = sample_v(c, ivec3( 0,-1, 0), mx, self).y;
+    float zF = sample_v(c, ivec3( 0, 0, 1), mx, self).z;
+    float zB = sample_v(c, ivec3( 0, 0,-1), mx, self).z;
+    imageStore(div, c, vec4(0.5 * ((xR - xL) + (yU - yD) + (zF - zB)), 0.0, 0.0, 0.0));
+}

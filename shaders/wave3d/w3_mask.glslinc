@@ -1,0 +1,24 @@
+#version 450
+// w3_mask — classify every cell FLUID / AIR / SOLID for this frame's projection.
+// Derived, not stored: solid comes from the static bed height, fluid from the advected
+// level set phi. Keeping it a derived field means the surface can move arbitrarily without
+// anyone maintaining a second representation of it.
+layout(local_size_x = 4, local_size_y = 4, local_size_z = 4) in;
+layout(r32f, set = 0, binding = 0) uniform image3D phi;    // >0 = water
+layout(r32f, set = 1, binding = 0) uniform image3D bed;    // bed height in CELLS, per (x,z) column
+layout(r32f, set = 2, binding = 0) uniform image3D mask;
+
+layout(push_constant, std430) uniform P { vec4 size; vec4 pad; } pc;
+
+void main() {
+    ivec3 c = ivec3(gl_GlobalInvocationID.xyz);
+    ivec3 mx = ivec3(pc.size.xyz) - ivec3(1);
+    if (c.x > mx.x || c.y > mx.y || c.z > mx.z) { return; }
+
+    float bedY = imageLoad(bed, ivec3(c.x, 0, c.z)).r;
+    float m;
+    if (float(c.y) < bedY)                      { m = -1.0; }   // SOLID
+    else if (imageLoad(phi, c).r > 0.5)         { m =  1.0; }   // FLUID
+    else                                        { m =  0.0; }   // AIR
+    imageStore(mask, c, vec4(m, 0.0, 0.0, 0.0));
+}

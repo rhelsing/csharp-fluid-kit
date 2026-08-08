@@ -62,7 +62,9 @@ public sealed class SchwarzSolver : IStampSolver
         _rgy = (uint)((grid.Y - 1) / 8 + 1);
         _numWg = _rgx * _rgy;
 
-        string stamp = ReadRes(stampPath);
+        // Topology block ahead of the stamp (solver-ledger.md §7d). Note the tile GEOMETRY in
+        // solve_schwarz is still 2D-specific — see the comment there.
+        string stamp = ReadRes(GpuStampSolver.Nd2DPath) + "\n" + ReadRes(stampPath);
 
         // One thread per cell in the tile; the LU indexes rows by gl_LocalInvocationIndex.
         string header =

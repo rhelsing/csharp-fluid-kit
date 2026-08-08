@@ -1,0 +1,63 @@
+#version 450
+
+// f3_pressure_free — f3_pressure_jacobi with a FREE SURFACE. A FORK; the original stays the
+// smoke solver and every scene using it is untouched.
+//
+// THE DIFFERENCE, and it is the whole reason a liquid can have a top:
+//
+//   f3_pressure_jacobi — Neumann everywhere. The box is sealed on all six sides AND, implicitly,
+//                        at the air. Correct for smoke, which fills the box. Fatal for liquid:
+//                        no pressure field exists that supports a column with a surface, so
+//                        gravity wins every frame regardless of iteration count.
+//
+//   this               — Dirichlet p = 0 at AIR cells. An air neighbour still counts toward the
+//                        diagonal (it is a real face the gradient acts across) but contributes
+//                        NOTHING to the sum, because its pressure is known to be zero.
+//
+// Counting only the LIQUID neighbours in the degree is the classic mistake — it silently turns
+// the free surface back into a solid wall, because then nothing distinguishes "open to air"
+// from "nothing there".
+//
+// Also removes the constant nullspace that pure-Neumann Poisson has, so this is better
+// conditioned than the sealed version as well as being correct.
+
+layout(local_size_x = 4, local_size_y = 4, local_size_z = 4) in;
+layout(r32f, set = 0, binding = 0) uniform image3D p_in;
+layout(r32f, set = 1, binding = 0) uniform image3D div;
+layout(r32f, set = 2, binding = 0) uniform image3D p_out;
+layout(r32f, set = 3, binding = 0) uniform image3D rho;    // density: 0 = air
+
+layout(push_constant, std430) uniform P { vec4 size; vec4 misc; } p;
+// misc.x is FREE-SLIP (the shared sim push already spends it there — do not reuse), so the air
+// threshold rides in misc.y.
+
+void main() {
+    ivec3 c = ivec3(gl_GlobalInvocationID.xyz);
+    ivec3 mx = ivec3(p.size.xyz) - ivec3(1);
+    if (c.x > mx.x || c.y > mx.y || c.z > mx.z) { return; }
+
+    if (imageLoad(rho, c).r <= p.misc.y) {
+        imageStore(p_out, c, vec4(0.0));      // air: p = 0, not an unknown
+        return;
+    }
+
+    const ivec3 offs[6] = ivec3[6](
+        ivec3( 1, 0, 0), ivec3(-1, 0, 0),
+        ivec3( 0, 1, 0), ivec3( 0,-1, 0),
+        ivec3( 0, 0, 1), ivec3( 0, 0,-1));
+
+    float sum = 0.0;
+    float deg = 0.0;
+    for (int k = 0; k < 6; k++) {
+        ivec3 n = c + offs[k];
+        if (n.x < 0 || n.y < 0 || n.z < 0 || n.x > mx.x || n.y > mx.y || n.z > mx.z) {
+            continue;                          // solid wall: Neumann, counts for neither
+        }
+        deg += 1.0;
+        if (imageLoad(rho, n).r > p.misc.y) {
+            sum += imageLoad(p_in, n).r;       // fluid couples
+        }                                       // air: p = 0, drops out
+    }
+
+    imageStore(p_out, c, vec4((sum - imageLoad(div, c).r) / max(deg, 1.0), 0.0, 0.0, 0.0));
+}

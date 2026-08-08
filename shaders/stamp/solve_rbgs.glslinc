@@ -10,22 +10,24 @@
 // Generic over any stamp (st_diag / st_conductance / st_rhs); header supplies
 // iter_in (set 2) / iter_out (set 3). clamp() on neighbours = Neumann walls.
 
+// Dimension comes from nd_2d/nd_3d (solver-ledger.md §7d). ST_PARITY sums every axis, so
+// the checkerboard stays a true bipartite split of the ST_NB-neighbour graph in 3D too —
+// a 2D-style (x+y) parity would NOT two-colour a 6-neighbour lattice correctly.
+
 void main() {
-    ivec2 c = ivec2(gl_GlobalInvocationID.xy);
-    ivec2 mx = ivec2(pc.size) - ivec2(1);
-    if (c.x > mx.x || c.y > mx.y) {
+    ST_IVEC c = ST_CELL();
+    if (ST_OOB(c)) {
         return;
     }
 
-    if (((c.x + c.y) & 1) != PARITY) {
+    if (ST_PARITY(c) != PARITY) {
         imageStore(iter_out, c, imageLoad(iter_in, c));   // other colour: copy through
         return;
     }
 
-    const ivec2 offs[4] = ivec2[4](ivec2(1, 0), ivec2(-1, 0), ivec2(0, 1), ivec2(0, -1));
     float acc = st_rhs(c);
-    for (int k = 0; k < 4; k++) {
-        ivec2 n = clamp(c + offs[k], ivec2(0), mx);
+    for (int k = 0; k < ST_NB; k++) {
+        ST_IVEC n = ST_NEIGHBOUR(c, k);
         acc += st_conductance(c, n) * imageLoad(iter_in, n).r;
     }
     imageStore(iter_out, c, vec4(acc / st_diag(c), 0.0, 0.0, 0.0));

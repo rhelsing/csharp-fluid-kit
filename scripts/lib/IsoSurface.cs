@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Threading.Tasks;
 using Godot;
 
 namespace GodotCsharpExperiments.Lib;
@@ -23,37 +24,76 @@ public static class IsoSurface
         {0,1,2,6}, {0,2,3,6}, {0,3,7,6}, {0,7,4,6}, {0,4,5,6}, {0,5,1,6},
     };
 
+    // Parallel over Z-SLABS. The cube loop is embarrassingly parallel — each cube reads the
+    // field (never writes it) and emits triangles independently, so the only shared state was
+    // the output lists and the cv/cp scratch. Giving every slab its own list + scratch removes
+    // all of it; no locks, no atomics.
+    //
+    // Slab boundaries are safe: a cube at z owns corners z and z+1, so slabs overlap by one
+    // PLANE of reads and zero cubes. Triangle order does not matter (normals come from the
+    // field gradient, not winding — see the header), so the merge is a plain concatenation.
     public static (Vector3[] verts, Vector3[] normals) Build(float[] f, Vector3I dim, float iso)
     {
         int W = dim.X, H = dim.Y, D = dim.Z;
-        var verts = new List<Vector3>(4096);
-        var norms = new List<Vector3>(4096);
+        // System.Environment, not Godot.Environment — both are in scope here.
+        int slabs = Math.Clamp(System.Environment.ProcessorCount, 1, Math.Max(1, D - 1));
+        var partV = new List<Vector3>[slabs];
+        var partN = new List<Vector3>[slabs];
 
-        var cv = new float[8];
-        var cp = new Vector3[8];
-
-        for (int z = 0; z < D - 1; z++)
-        for (int y = 0; y < H - 1; y++)
-        for (int x = 0; x < W - 1; x++)
+        Parallel.For(0, slabs, s =>
         {
+            var verts = new List<Vector3>(4096);
+            var norms = new List<Vector3>(4096);
+            var cv = new float[8];      // per-thread: these were shared scratch
+            var cp = new Vector3[8];
+
+            int zBegin = (D - 1) * s / slabs;
+            int zEnd = (D - 1) * (s + 1) / slabs;
+
+            for (int z = zBegin; z < zEnd; z++)
+            for (int y = 0; y < H - 1; y++)
+            for (int x = 0; x < W - 1; x++)
+            {
             float lo = float.MaxValue, hi = float.MinValue;
             for (int i = 0; i < 8; i++)
             {
-                int cx = x + CornerOff[i, 0], cyy = y + CornerOff[i, 1], cz = z + CornerOff[i, 2];
-                float v = f[cx + W * (cyy + H * cz)];
+                float v = f[(x + CornerOff[i, 0]) + W * ((y + CornerOff[i, 1]) + H * (z + CornerOff[i, 2]))];
                 cv[i] = v;
-                cp[i] = new Vector3(cx, cyy, cz);
                 if (v < lo) { lo = v; }
                 if (v > hi) { hi = v; }
             }
             if (lo >= iso || hi < iso) { continue; }   // whole cube on one side → skip
 
+            // Corner POSITIONS are only needed once the cube is known to straddle. Filling
+            // them in the loop above cost 8 Vector3 stores for all ~104k cubes when only a
+            // few percent survive the test — pure waste on the overwhelming majority.
+            for (int i = 0; i < 8; i++)
+            {
+                cp[i] = new Vector3(x + CornerOff[i, 0], y + CornerOff[i, 1], z + CornerOff[i, 2]);
+            }
+
             for (int t = 0; t < 6; t++)
             {
                 MarchTet(cv, cp, Tets[t, 0], Tets[t, 1], Tets[t, 2], Tets[t, 3], iso, f, dim, verts, norms);
             }
+            }
+
+            partV[s] = verts;
+            partN[s] = norms;
+        });
+
+        int total = 0;
+        for (int s = 0; s < slabs; s++) { total += partV[s].Count; }
+        var outV = new Vector3[total];
+        var outN = new Vector3[total];
+        int at = 0;
+        for (int s = 0; s < slabs; s++)
+        {
+            partV[s].CopyTo(outV, at);
+            partN[s].CopyTo(outN, at);
+            at += partV[s].Count;
         }
-        return (verts.ToArray(), norms.ToArray());
+        return (outV, outN);
     }
 
     private static void MarchTet(float[] cv, Vector3[] cp, int a, int b, int c, int d,
@@ -118,30 +158,32 @@ public static class IsoSurface
         norms.Add(NormalAt(f, dim, p2));
     }
 
-    private static float Sample(float[] f, Vector3I dim, float x, float y, float z)
-    {
-        int W = dim.X, H = dim.Y, D = dim.Z;
-        x = Mathf.Clamp(x, 0, W - 1.001f);
-        y = Mathf.Clamp(y, 0, H - 1.001f);
-        z = Mathf.Clamp(z, 0, D - 1.001f);
-        int x0 = (int)x, y0 = (int)y, z0 = (int)z;
-        int x1 = x0 + 1, y1 = y0 + 1, z1 = z0 + 1;
-        float fx = x - x0, fy = y - y0, fz = z - z0;
-        float c000 = f[x0 + W * (y0 + H * z0)], c100 = f[x1 + W * (y0 + H * z0)];
-        float c010 = f[x0 + W * (y1 + H * z0)], c110 = f[x1 + W * (y1 + H * z0)];
-        float c001 = f[x0 + W * (y0 + H * z1)], c101 = f[x1 + W * (y0 + H * z1)];
-        float c011 = f[x0 + W * (y1 + H * z1)], c111 = f[x1 + W * (y1 + H * z1)];
-        float c00 = Mathf.Lerp(c000, c100, fx), c10 = Mathf.Lerp(c010, c110, fx);
-        float c01 = Mathf.Lerp(c001, c101, fx), c11 = Mathf.Lerp(c011, c111, fx);
-        return Mathf.Lerp(Mathf.Lerp(c00, c10, fy), Mathf.Lerp(c01, c11, fy), fz);
-    }
-
+    // Central-difference gradient on the GRID, by direct integer index.
+    //
+    // This used to trilinearly Sample() the field at p +/- 1 on each axis: 6 samples x 8 reads
+    // = 48 scattered reads per normal, x3 normals per triangle = 144 reads per triangle. At
+    // ~22k triangles that is 3.2M reads/frame, and it measured as 54 ms of a 58 ms frame
+    // (readout: "solve 0.02ms . readback 1.92ms . isosurface 54.47ms . mesh 1.75ms"). The
+    // marching itself was never the cost — the cube-skip early-out keeps it to surface cells.
+    //
+    // Direct indexing gives 6 reads instead of 48, with no per-sample clamp or lerp chain.
+    // What it gives up: the gradient is now evaluated at the nearest grid point rather than
+    // exactly at the vertex, so shading is very slightly flatter on a coarse field. On a
+    // smooth 48^3 blob that is not visible; if it ever is, the fix is a finer grid, not a
+    // costlier normal.
     private static Vector3 NormalAt(float[] f, Vector3I dim, Vector3 p)
     {
-        const float e = 1.0f;
-        float dx = Sample(f, dim, p.X + e, p.Y, p.Z) - Sample(f, dim, p.X - e, p.Y, p.Z);
-        float dy = Sample(f, dim, p.X, p.Y + e, p.Z) - Sample(f, dim, p.X, p.Y - e, p.Z);
-        float dz = Sample(f, dim, p.X, p.Y, p.Z + e) - Sample(f, dim, p.X, p.Y, p.Z - e);
+        int W = dim.X, H = dim.Y, D = dim.Z;
+        int x = Math.Clamp((int)MathF.Round(p.X), 1, W - 2);
+        int y = Math.Clamp((int)MathF.Round(p.Y), 1, H - 2);
+        int z = Math.Clamp((int)MathF.Round(p.Z), 1, D - 2);
+
+        int i = x + W * (y + H * z);
+        int sy = W, sz = W * H;
+        float dx = f[i + 1] - f[i - 1];
+        float dy = f[i + sy] - f[i - sy];
+        float dz = f[i + sz] - f[i - sz];
+
         var g = new Vector3(dx, dy, dz);
         // field is high inside, low outside → the outward normal is -gradient
         return g.LengthSquared() < 1e-10f ? Vector3.Up : (-g).Normalized();

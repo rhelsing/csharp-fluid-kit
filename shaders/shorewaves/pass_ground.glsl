@@ -1,9 +1,12 @@
 #[compute]
 #version 450
 
-// Per-frame ground memory: wetness (drying tau 45 s), stranded foam lace
-// (deposited when a cell dries, tau 10 s), wall/plunge impact intensity
-// (tau 0.3 s). Ping-pong RGBA16F. A channel = was-wet flag.
+// Per-frame ground memory: wetness (drying tau), stranded foam lace (deposited when a cell
+// dries), wall/plunge impact intensity (tau 0.3 s). Ping-pong RGBA16F. A channel = was-wet flag.
+//
+// The three memory timescales are PUSH-CONSTANT FIELDS, not literals — they are the difference
+// between a shore that reads alive and one that reads painted, and 45 s of drying is a look
+// decision, not physics. Defaults (45 / 10 / 0.12) reproduce the original exactly.
 
 layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
 
@@ -22,6 +25,10 @@ layout(push_constant) uniform Push {
 	float manning;
 	float time;
 	float k_foam;
+	float dry_tau;      // s — how long DAMP SAND takes to fade back to dry
+	float strand_tau;   // s — how long stranded foam lace survives
+	float rewet_tau;    // s — how fast returning water sweeps the lace away
+	float _pad0;
 } pc;
 
 
@@ -44,8 +51,8 @@ void main() {
 	bool wet_now = h > 3e-4;
 	float dtf = pc.dt_frame;
 
-	float wetness = wet_now ? 1.0 : prev.r * exp(-dtf / 45.0);
-	float stranded = prev.g * exp(-dtf / 10.0);
+	float wetness = wet_now ? 1.0 : prev.r * exp(-dtf / max(pc.dry_tau, 1e-3));
+	float stranded = prev.g * exp(-dtf / max(pc.strand_tau, 1e-3));
 	float cfoam = clamp(desing(h, q.w), 0.0, 1.0);
 	// A channel remembers the foam concentration while the cell was last wet;
 	// on the drying transition that memory becomes the stranded lace arc.
@@ -53,7 +60,7 @@ void main() {
 		stranded = max(stranded, clamp(prev.a * 1.2, 0.0, 1.0));
 	}
 	if (wet_now) {
-		stranded *= exp(-dtf / 0.12); // re-wetting sweeps arcs away fast
+		stranded *= exp(-dtf / max(pc.rewet_tau, 1e-3)); // re-wetting sweeps arcs away
 	}
 
 	// --- impact sources ---

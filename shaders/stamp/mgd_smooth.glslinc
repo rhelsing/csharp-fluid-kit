@@ -20,16 +20,14 @@
 // (st_diag and st_conductance are pure functions of pc), but both must still be bound.
 
 void main() {
-    ivec2 c = ivec2(gl_GlobalInvocationID.xy);
-    ivec2 mx = ivec2(pc.size) - ivec2(1);
-    if (c.x > mx.x || c.y > mx.y) {
+    ST_IVEC c = ST_CELL();
+    if (ST_OOB(c)) {
         return;
     }
 
-    const ivec2 offs[4] = ivec2[4](ivec2(1, 0), ivec2(-1, 0), ivec2(0, 1), ivec2(0, -1));
     float acc = imageLoad(rhs_img, c).r;
-    for (int k = 0; k < 4; k++) {
-        ivec2 n = clamp(c + offs[k], ivec2(0), mx);
+    for (int k = 0; k < ST_NB; k++) {
+        ST_IVEC n = ST_NEIGHBOUR(c, k);
         acc += st_conductance(c, n) * imageLoad(u_in, n).r;
     }
     imageStore(u_out, c, vec4(acc / st_diag(c), 0.0, 0.0, 0.0));

@@ -49,15 +49,42 @@ public sealed class MgvSolver : IStampSolver
 
         // mg_rhs is the only MGV kernel that takes the STAMP push constant, so it must be
         // compiled with the stamp; the rest use MgvSolver's own scalar SmoothPc.
-        string stampSrc = FileAccess.GetFileAsString(stampPath);
+        // Topology block ahead of the stamp (solver-ledger.md §7d). This is COMPILE PLUMBING
+        // only — mg_smooth/mg_residual are standalone (scalar beta, no stamp) and are still
+        // untouched, so this class remains the uniform-beta control it was.
+        string stampSrc = FileAccess.GetFileAsString(GpuStampSolver.Nd2DPath) + "\n"
+                        + FileAccess.GetFileAsString(stampPath);
         string rhsBody = FileAccess.GetFileAsString("res://shaders/stamp/mg_rhs.glslinc");
-        _shRhs = CompileSrc("#version 450\nlayout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;\n"
-            + stampSrc + "\n" + rhsBody, "mg-rhs");
+        // mg_rhs / mg_restrict / mg_prolong / cg_dotbuf are dimension-generic now
+        // (solver-ledger.md §7d) — these 2D headers are byte-for-byte what those files used
+        // to declare themselves, so this class is unchanged as the uniform-beta control.
+        const string wg8 = "#version 450\nlayout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;\n";
+        string nd = FileAccess.GetFileAsString(GpuStampSolver.Nd2DPath);
+        const string rhsSets = "layout(r32f, set = 3, binding = 0) uniform image2D b0;\n";
+        const string rsSets =
+            "layout(r32f, set = 2, binding = 0) uniform image2D r_fine;\n" +
+            "layout(r32f, set = 3, binding = 0) uniform image2D r_coarse;\n" +
+            "layout(push_constant, std430) uniform P { vec2 coarse_size; vec2 fine_size; } pc;\n";
+        const string prSets =
+            "layout(r32f, set = 2, binding = 0) uniform image2D u_coarse;\n" +
+            "layout(r32f, set = 3, binding = 0) uniform image2D u_fine;\n" +
+            "layout(push_constant, std430) uniform P { vec2 fine_size; vec2 coarse_size; } pc;\n";
+        const string dotHdr =
+            "#version 450\nlayout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;\n" +
+            "layout(r32f, set = 2, binding = 0) uniform image2D a_img;\n" +
+            "layout(r32f, set = 3, binding = 0) uniform image2D b_img;\n" +
+            "layout(std430, set = 5, binding = 0) buffer Scalars { float sc[]; };\n" +
+            "layout(push_constant, std430) uniform P { vec2 size; uint slot; uint _pad; } pc;\n";
+
+        _shRhs = CompileSrc(wg8 + rhsSets + stampSrc + "\n" + rhsBody, "mg-rhs");
         _shSmooth = Compile("res://shaders/stamp/mg_smooth.glslinc", "mg-smooth");
         _shResid = Compile("res://shaders/stamp/mg_residual.glslinc", "mg-resid");
-        _shRestrict = Compile("res://shaders/stamp/mg_restrict.glslinc", "mg-restrict");
-        _shProlong = Compile("res://shaders/stamp/mg_prolong.glslinc", "mg-prolong");
-        _shDot = Compile("res://shaders/stamp/cg_dotbuf.glslinc", "mg-dot");
+        _shRestrict = CompileSrc(wg8 + rsSets + nd + "\n"
+            + FileAccess.GetFileAsString("res://shaders/stamp/mg_restrict.glslinc"), "mg-restrict");
+        _shProlong = CompileSrc(wg8 + prSets + nd + "\n"
+            + FileAccess.GetFileAsString("res://shaders/stamp/mg_prolong.glslinc"), "mg-prolong");
+        _shDot = CompileSrc(dotHdr + nd + "\n"
+            + FileAccess.GetFileAsString("res://shaders/stamp/cg_dotbuf.glslinc"), "mg-dot");
         if (!_shRhs.IsValid || !_shSmooth.IsValid || !_shResid.IsValid || !_shRestrict.IsValid || !_shProlong.IsValid || !_shDot.IsValid) { return; }
         _pRhs = _rd.ComputePipelineCreate(_shRhs);
         _pSmooth = _rd.ComputePipelineCreate(_shSmooth);

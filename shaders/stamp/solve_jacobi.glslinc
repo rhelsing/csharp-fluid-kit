@@ -2,20 +2,23 @@
 //     x(c) = ( st_rhs(c) + Σ st_conductance(c,n)·x_in(n) ) / st_diag(c)
 //
 // Generic over ANY stamp that defines st_diag / st_conductance / st_rhs and a push
-// constant `pc` starting with `vec2 size`. The solver header supplies iter_in (set 2)
-// and iter_out (set 3). clamp() on neighbours = Neumann (reflective) walls.
+// constant `pc` starting with the extent. The solver header supplies iter_in (set 2)
+// and iter_out (set 3).
+//
+// AND generic over DIMENSION: the topology comes from nd_2d.glslinc / nd_3d.glslinc,
+// which the host concatenates ahead of the stamp (solver-ledger.md §7d). There is no
+// `ivec2` and no `offs[4]` below — swap the nd file and this same body solves the
+// 6-neighbour 3D problem. ST_NEIGHBOUR is clamped = Neumann (reflective) walls.
 
 void main() {
-    ivec2 c = ivec2(gl_GlobalInvocationID.xy);
-    ivec2 mx = ivec2(pc.size) - ivec2(1);
-    if (c.x > mx.x || c.y > mx.y) {
+    ST_IVEC c = ST_CELL();
+    if (ST_OOB(c)) {
         return;
     }
 
-    const ivec2 offs[4] = ivec2[4](ivec2(1, 0), ivec2(-1, 0), ivec2(0, 1), ivec2(0, -1));
     float acc = st_rhs(c);
-    for (int k = 0; k < 4; k++) {
-        ivec2 n = clamp(c + offs[k], ivec2(0), mx);
+    for (int k = 0; k < ST_NB; k++) {
+        ST_IVEC n = ST_NEIGHBOUR(c, k);
         acc += st_conductance(c, n) * imageLoad(iter_in, n).r;
     }
     imageStore(iter_out, c, vec4(acc / st_diag(c), 0.0, 0.0, 0.0));

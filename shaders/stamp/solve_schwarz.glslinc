@@ -40,52 +40,76 @@ shared float xs[TILE_N];
 
 void main() {
     int li = int(gl_LocalInvocationIndex);
-    ivec2 mx = ivec2(pc.size) - ivec2(1);
-
     ivec2 org = ivec2(int(gl_WorkGroupID.x) * TILE_W, int(gl_WorkGroupID.y) * TILE_H);
-    ivec2 lc = ivec2(li % TILE_W, li / TILE_W);
+
+    // ---- ACTIVE DIMENSION (ports mna-solver.cmajor's header idea) ----
+    // "Fixed oversized matrix approach: allocate MAX_DIM x MAX_DIM once, circuits stamp into
+    // the portion they need." The LDS block stays a fixed TILE_N x TILE_N (4 KB), but the tile
+    // clipped against the grid may be smaller, and EVERY loop below is bounded by that active
+    // size `n` rather than the allocated TILE_N — exactly as mna::solve() copies `n * MAX_DIM`
+    // entries, not MAX_DIM * MAX_DIM.
+    //
+    // Indexing by the ACTIVE width (aw) rather than TILE_W is what makes this work: it keeps
+    // the live unknowns as a compact prefix 0..n-1, the same way cmajor's node ids are compact.
+    // Index by TILE_W instead and an edge tile's valid rows are scattered, so no loop bound can
+    // exclude the dead ones.
+    //
+    // HONEST NOTE ON PAYOFF: 256/512/1024 are all divisible by TILE_W=8 and TILE_H=4, so at the
+    // grids we actually benchmark EVERY tile is full and this is a no-op. It buys correctness
+    // and work-saving only on ragged grids (non-power-of-two, or a 3D volume clipped by a
+    // 4x4x2 tile). It also deletes the identity-row padding hack, which is a real simplification.
+    int aw = min(TILE_W, int(pc.size.x) - org.x);
+    int ah = min(TILE_H, int(pc.size.y) - org.y);
+    int n = aw * ah;
+
+    ivec2 lc = ivec2(li % aw, li / aw);
     ivec2 c = org + lc;
-    bool inside = (c.x <= mx.x && c.y <= mx.y);
+    bool live = (li < n);
 
     // ---- assemble this thread's row of the tile's dense matrix ----
-    for (int j = 0; j < TILE_N; j++) {
-        LU[li * TILE_N + j] = 0.0;
-    }
+    if (live) {
+        for (int j = 0; j < n; j++) {
+            LU[li * TILE_N + j] = 0.0;
+        }
 
-    float b = 0.0;
-    if (inside) {
         LU[li * TILE_N + li] = st_diag(c);
-        b = st_rhs(c);
+        float b = st_rhs(c);
 
-        const ivec2 offs[4] = ivec2[4](ivec2(1, 0), ivec2(-1, 0), ivec2(0, 1), ivec2(0, -1));
-        for (int k = 0; k < 4; k++) {
-            ivec2 lo = lc + offs[k];
-            ivec2 n = clamp(c + offs[k], ivec2(0), mx);          // clamp = Neumann, as everywhere else
-            float g = st_conductance(c, n);
-            bool interior = lo.x >= 0 && lo.x < TILE_W && lo.y >= 0 && lo.y < TILE_H
-                            && (org + lo).x <= mx.x && (org + lo).y <= mx.y;
-            if (interior) {
-                LU[li * TILE_N + (lo.y * TILE_W + lo.x)] = -g;   // stays in the block
+        // Offsets come from nd_2d/nd_3d like every other body (solver-ledger.md §7d), but
+        // NOTE: the TILE GEOMETRY here is still 2D-specific — `lo.y * aw + lo.x` is the flat
+        // local index, which in 3D becomes lo.z*aw*ah + lo.y*aw + lo.x. That is the one solver
+        // where §7d is not just a swap, and it is a method problem as much as a code one:
+        // TILE_N must stay <= 32, so an 8x4 tile becomes 4x4x2, the surface-to-volume ratio
+        // gets much worse, more of the stencil leaks to the RHS, and Schwarz gets WEAKER
+        // exactly when you go 3D.
+        for (int k = 0; k < ST_NB; k++) {
+            ivec2 lo = lc + ST_OFFS[k];
+            ivec2 nb = ST_NEIGHBOUR(c, k);
+            float g = st_conductance(c, nb);
+            // aw/ah already clip to the grid, so this one test covers both "outside the tile"
+            // and "outside the field" — the old version needed two.
+            if (lo.x >= 0 && lo.x < aw && lo.y >= 0 && lo.y < ah) {
+                LU[li * TILE_N + (lo.y * aw + lo.x)] = -g;        // stays in the block
             } else {
-                b += g * imageLoad(iter_in, n).r;                 // Schwarz coupling -> rhs
+                b += g * imageLoad(iter_in, nb).r;                // Schwarz coupling -> rhs
             }
         }
-    } else {
-        LU[li * TILE_N + li] = 1.0;   // padding row (tile hangs off the grid edge) -> x = 0
+        rhs[li] = b;
     }
-    rhs[li] = b;
 
     // ---- LU factorization, ports mna-solver.cmajor:305-347 ----
-    for (int col = 0; col < TILE_N; col++) {
+    // `n` is uniform across the workgroup, so every thread executes the same number of
+    // barriers regardless of whether it owns a live row.
+    for (int col = 0; col < n; col++) {
         barrier();   // row `col` and rhs[col] were finalized in the previous iteration
         float piv = LU[col * TILE_N + col];
         if (abs(piv) < 1.0e-30) {
             piv = 1.0e-30;   // cmajor `continue`s on a singular pivot; a floor is equivalent here
         }
-        if (li > col) {
+        if (live && li > col) {
             float f = LU[li * TILE_N + col] / piv;
             LU[li * TILE_N + col] = f;                            // store L in place
-            for (int j = col + 1; j < TILE_N; j++) {
+            for (int j = col + 1; j < n; j++) {
                 LU[li * TILE_N + j] -= f * LU[col * TILE_N + j];
             }
             rhs[li] -= f * rhs[col];                              // forward substitution, fused
@@ -95,9 +119,9 @@ void main() {
 
     // ---- back substitution, ports mna-solver.cmajor:354-360 ----
     if (li == 0) {
-        for (int row = TILE_N - 1; row >= 0; row--) {
+        for (int row = n - 1; row >= 0; row--) {
             float sum = rhs[row];
-            for (int j = row + 1; j < TILE_N; j++) {
+            for (int j = row + 1; j < n; j++) {
                 sum -= LU[row * TILE_N + j] * xs[j];
             }
             float d = LU[row * TILE_N + row];
@@ -106,7 +130,7 @@ void main() {
     }
     barrier();
 
-    if (inside) {
+    if (live) {
         imageStore(iter_out, c, vec4(xs[li], 0.0, 0.0, 0.0));
     }
 }

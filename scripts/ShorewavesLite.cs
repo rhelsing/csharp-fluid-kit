@@ -12,7 +12,7 @@ namespace GodotCsharpExperiments;
 //   tools/godot-mono.sh --path . res://tools/shoot.tscn -- res://scenes/18_shorewaves_lite.tscn 8 1600x900
 public partial class ShorewavesLite : Node3D
 {
-    private const float Domain = ShallowWaterKp.Domain;   // 30.4 m
+    private const float Domain = ShallowWaterKp.DefaultDomain;   // 30.4 m
     private const float Half = Domain * 0.5f;
     private const string ShaderDir = "res://shaders/shorewaves/";
     private const string TexDir = "res://textures/shorewaves/";
@@ -42,7 +42,7 @@ public partial class ShorewavesLite : Node3D
     private float _fpsAccum;
     private bool _running = true;
     private bool _fireSolitary;
-    private int _maxSub = ShallowWaterKp.MaxSubsteps;
+    private int _maxSub = ShallowWaterKp.DefaultMaxSubsteps;
     private bool _pokeQueued;
     private Vector2 _pokeXZ;
     private float _pokeStrength = 0.3f;
@@ -126,7 +126,7 @@ public partial class ShorewavesLite : Node3D
         _waterMat.SetShaderParameter("tx_bottom", _texBottom);
         _waterMat.SetShaderParameter("tx_derived", _texDerived);
         _waterMat.SetShaderParameter("DOMAIN_SIZE", Domain);
-        _waterMat.SetShaderParameter("GRID_RES", (float)ShallowWaterKp.N);
+        _waterMat.SetShaderParameter("GRID_RES", (float)ShallowWaterKp.DefaultN);
         _waterMat.SetShaderParameter("caustics_tex", GD.Load<Texture2D>(TexDir + "caustics.png"));
 
         _waterMi = new MeshInstance3D
@@ -159,8 +159,8 @@ public partial class ShorewavesLite : Node3D
         if (!_running) { _accum = 0.0f; return; }
 
         _accum += Mathf.Min(delta, 0.1f);
-        int steps = Mathf.Clamp((int)(_accum / ShallowWaterKp.Dt), 0, _maxSub);
-        _accum -= steps * ShallowWaterKp.Dt;
+        int steps = Mathf.Clamp((int)(_accum / ShallowWaterKp.DefaultDt), 0, _maxSub);
+        _accum -= steps * ShallowWaterKp.DefaultDt;
         if (steps == 0) { return; }
 
         int finalParity = (_parity + steps) % 2;
@@ -181,7 +181,7 @@ public partial class ShorewavesLite : Node3D
 
         _parity = finalParity;
         _gparity = finalGparity;
-        _simTime += steps * ShallowWaterKp.Dt;
+        _simTime += steps * ShallowWaterKp.DefaultDt;
     }
 
     private void UpdateReadout(float delta)

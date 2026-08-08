@@ -6,14 +6,21 @@ This file is the **state**: what exists, what is broken, why, and what "done" me
 Written after a long session on scene 25 (`WaveTankMna`) in which most of the time went to
 rediscovering §4. Read §4 first. Seriously.
 
-**Current position:** **8 solvers in the dropdown.** §7a/b/c are built (`MgDeepSolver`,
-`SchwarzSolver`, `SpectralSolver`); **§7d — the nD contract + tiled storage — is the one left**,
-and it is deliberately last because it rewrites every solve body.
+**Current position:** **9 solvers in 2D, 4 in 3D.** §7a/b/c are built (`MgDeepSolver`,
+`SchwarzSolver`, `SpectralSolver`). §7d's **nD contract is done** — every solver kernel in the
+repo is dimension-generic and there is a real 3D benchmark column (§10); **tiled storage, the
+other half of §7d, is still open**. The instrument was rebuilt on a local RenderingDevice (§9),
+which is what finally made any of these numbers trustworthy.
 
-**Before touching Phase 2, read §8.** Building the three turned up four instrument defects, one
-of which (§8a: CG reports a *recursive* residual, everyone else a *recomputed* one) makes the
-existing residual column unusable for ranking. §1a is the other section that matters — it names
-the reference the GPU port drifted away from.
+**Before touching Phase 2, read §8 and §9a.** §8a (CG reports a *recursive* residual, everyone
+else a *recomputed* one) and §8c (everything bottoms out at the float32 floor ~5e-08) both still
+bind. §9a adds two more: the local device needs a double `Step`-Sync to read a residual at all,
+and **ms/step is ±35% noise while residual is bit-exact** — so rank on residual. §1a is the
+other section that matters — it names the reference the GPU port drifted away from.
+
+**The headline result so far (§10d):** in 3D, relaxation falls off a cliff between 64³ and 96³
+and deep multigrid does not. At 128³ MgDeep3D and Jacobi3D cost the same 3.07 ms and MgDeep's
+residual is 2178× better.
 
 ---
 
@@ -173,7 +180,7 @@ line, log₂N steps).
 textures they reference — Godot auto-frees dependent sets, so freeing textures first makes the
 later set-frees invalid (`Attempted to free invalid ID`).
 
-### 3e. The nD regression — `offs[4]` is hardcoded in every solve body
+### 3e. The nD regression — `offs[4]` is hardcoded in every solve body — ✅ FIXED (see §10)
 The stamp *functions* are dimension-agnostic; the **solve bodies are not**. Every one of these
 declares its own `const ivec2 offs[4] = ivec2[4](ivec2(1,0), ivec2(-1,0), ivec2(0,1), ivec2(0,-1))`:
 
@@ -478,6 +485,17 @@ already worked out); `mna-solver.cmajor` §1a (the contract being restored).
 correct 2D tank and a correct 3D blob with only `ST_NB` / `ST_OFFS` differing — plus scene 50
 still correct, since it is the thing most likely to break.
 
+> **✅ SHIPPED, with one prediction wrong.** The shader half landed exactly as written: one
+> `solve_jacobi.glslinc`, one `solve_rbgs.glslinc`, one of everything, `stamp3d/solve_jacobi_3d.glslinc`
+> deleted. **The host half did not, and should not have.** This section expected
+> `GpuStampSolver3D` to *fold back into* `GpuStampSolver`; what shipped keeps them as separate
+> hosts sharing one shader set — and `MgDeepSolver3D` follows the same pattern. The reason is
+> that a host owns image *types* (`image2D` vs `image3D`), *push-constant layouts* (`vec2 size`
+> vs `vec4 size`), and *dispatch shape*, none of which are expressible as one class without a
+> runtime branch in every method. **Dimension is a property of the shaders, not of the host.**
+> Merging the hosts would have bought one class and cost the byte-identical 2D path §10 is
+> verified against. See §10.
+
 ---
 
 ### 7e. FFT inventory in `../water-kit` — four implementations, which to use
@@ -590,3 +608,220 @@ the dropdown, run scene 25, and report a residual. `MgDeepSolver` builds the ful
 `SpectralSolver` warns correctly and unprompted when the constant-coefficient precondition is
 violated. **Not verified: scene 50** (still owed since §3a), and no Phase 2 profiling was run —
 the numbers above are convergence checks, deliberately not a benchmark table.
+
+---
+
+## 9. The instrument, rebuilt — `SolverBench` on a local device
+
+§3d called the instrument PARTIALLY BUILT and §8 warned its numbers were compromised. Both were
+understatements: **every figure the old method produced was invalid**, and all five defects had
+one cause — the benchmark ran inside the render loop of a live scene (scene 25, reading its
+on-screen ms/frame).
+
+| Defect | What it looked like |
+|---|---|
+| **Saturation** | ADI, Schwarz, CG and Spectral all reported *exactly* 7.5 fps / 133.3 ms at several grids. That is `MaxTicksPerFrame` clamping, not a measurement — every solver slower than the frame budget reported the same number. |
+| **Contention** | One Jacobi config measured 90, 188, 211 and 231 fps depending on what else was running, because each data point booted its own Godot. |
+| **Frame time ≠ solver time** | ms/tick was frame time ÷ ticks, and included render and UI. |
+| **Boot cost** | ~15–20 s per data point for ~100 ms of actual work. |
+| **Unnormalized residual** | `LastResidual` is ‖r‖₂ = √(Σr²), which grows as N for the same per-cell error, so comparing grids was invalid. |
+
+**`RenderingServer.CreateLocalRenderingDevice()` fixes all five at once.** It returns a device
+with explicit `Submit()`/`Sync()`, isolated from the frame loop. Every solver already takes `rd`
+as its first constructor argument, so they run on it unchanged — no solver was modified to be
+benchable. That buys a real per-step GPU cost with no timestamp API (Sync, start clock, enqueue
+K steps, Submit+Sync, stop, ÷K), no render, no UI, no tick cap, and one process for a whole sweep.
+
+Residual is reported as **RMS** (‖r‖ ÷ √cells) so grids are comparable; the L2 figure is kept
+beside it because every earlier measurement in this ledger is in those units.
+
+```bash
+tools/godot-mono.sh --path . res://tools/bench.tscn -- \
+    solvers=0,1,2,3,4,5,6,7,8 grids=256,512 sweeps=24 reps=40
+```
+
+### 9a. ⚠️ Two traps in the instrument itself
+
+**The local device needs `Step`-Sync-`Step`-Sync to read a residual.** Every solver calls
+`BufferGetData` *inside* `Step()`. That is correct on the global device, where the work is
+already in flight — but on a local device nothing executes until `Submit()`/`Sync()`, so the
+first measured step reads a buffer the GPU has not written yet: stale on a warm buffer, **exactly
+`0.00e+00` on a cold one**. That is what produced the spurious `Schwarz 512² residual 0.00e+00`
+in the first sweep. Stepping, syncing, then stepping again means the second readback observes the
+first step's completed result. Both `RunOne` and `RunOne3D` go through one shared `Measure()`
+precisely so this cannot be implemented once and forgotten in the other.
+
+**ms/step is noisy; residual is exact.** At `reps=40`, 2D Jacobi @256² measured 0.3874 / 0.6034 /
+0.4379 / 0.4614 ms across four identical invocations — **±35%** — while its residual came back
+`7.033419e-06` every single time. Consequence: **rank solvers on residual, treat a <1.5× ms gap
+as noise**, and raise `reps` before believing one. This also makes residual the correct
+*regression oracle* — a refactor that leaves it bit-identical is proven a no-op, which ms/step
+could never show. §10 leans on this heavily.
+
+### 9b. 2D baseline — 256², sweeps 24, reps 40
+
+| Solver | dispatches | ms/step | residual RMS |
+|---|---|---|---|
+| Jacobi | 24 | 0.44 | 2.747429e-08 |
+| Rbgs | 48 | 0.65 | 2.729618e-08 |
+| Cg | 24 | 1.50 | 4.540783e-08 |
+| Multigrid (uniform β) | 288 † | 0.43 | 2.025963e-08 |
+| MultigridDeep | 77 | 1.31 | 2.048871e-08 |
+| SpectralDCT | 6 | 0.62 | 3.209501e-07 |
+| SpectralDST | 6 | 0.57 | 7.980398e-04 ‡ |
+
+† still the §8d overcount — `MgvSolver.PassesPerStep` returns `iters·(Nu1+Nu2+NuCoarse)` for a
+solver that runs 2 V-cycles. Unfixed, because §7a marks `MgvSolver` do-not-edit.
+‡ DST is solving the wrong boundary problem for this stamp; it is in the table as a control.
+
+**RBGS does not beat Jacobi at 256² — they tie.** This contradicts the working figure some of
+this ledger was written against (RBGS 3.96e-08 vs Jacobi 2.15e-06, a 54× gap), and both are
+right: **that gap is at 512², not 256².** The bench's own `Pc` sets β = 0.30·(n/256)², so β goes
+0.30 → 1.20 and Jacobi's worst-mode factor 4β/(1+4β) goes 0.55 → 0.83 — the collapse §4 predicts,
+arriving exactly on schedule. Quoting a relaxation residual without its grid is meaningless.
+
+---
+
+## 10. The 3D column
+
+§7d made dimension a host argument for the *solve bodies*. This finishes the job: **every solver
+kernel in the repo is now dimension-generic, and there is a real 3D benchmark column.** The
+motivation is not tidiness — a shallow-water heightfield is single-valued in y and therefore
+*cannot curl*, so overturning and barrelling waves need a genuine volume.
+
+### 10a. What was still pinned to a plane, and why it was not obvious
+
+§7d fixed the seven solve bodies. Six more kernels were still 2D, and they hid because they do
+not look like solve bodies:
+
+| Kernel | Why it was pinned |
+|---|---|
+| `cg_saxpybuf`, `cg_dot_partial`, `cg_dotbuf` | Standalone files carrying their **own** `#version`, `image2D`, `local_size` and `vec2 size` push constant — so they never saw the nd macros at all. |
+| `mg_rhs` | Declared its own `image2D b0` and used raw `ivec2(gl_GlobalInvocationID.xy)`. |
+| `mg_restrict` | 2×2 gather, hardcoded four `imageLoad`s. |
+| `mg_prolong` | Bilinear, hardcoded four corners and two `mix`es. |
+
+The fix is the one §7d already established — **the host supplies the declarations, the body uses
+macros** — plus four new macros for the cases §7d did not cover:
+
+```glsl
+ST_TOTAL()        ST_FROM_LINEAR(t)     // elementwise kernels: no stencil, just cell count
+ST_VEC  ST_EXTENT(v)  ST_CORNERS  ST_BIT_OFFSET(k)   // grid transfer: the 2^d corner set
+```
+
+`ST_BIT_OFFSET(k)` selects axis *i* with bit *i* of *k*, which gives restriction its gather set
+and prolongation its interpolation stencil in any dimension.
+
+### 10b. ⚠️ Prolongation must FOLD, not weight-sum — or the oracle dies
+
+d-linear interpolation can be written two ways: a weighted sum of 2^d corner products, or a
+corner gather followed by an axis-by-axis `mix` fold. They are algebraically identical. **Only
+the fold is bit-identical to the 2D code it replaces**, because float addition is not
+associative, and `mix(mix(a,b,tx), mix(d,e,tx), ty)` has a specific association that a weighted
+sum does not reproduce. Folding axis 0 first pairs corners *k* and *k+1* (bit 0 = axis 0), which
+is exactly the inner `mix` over x.
+
+Writing it the natural way would have shifted the 2D multigrid residual in its last bits — not
+enough to look like a bug, plenty to destroy the only regression oracle available (§9a).
+Restriction had no such hazard: `0.25·(((a+b)+c)+d)` and an accumulate-then-÷4 loop agree
+exactly, since `0.0+a == a` and both 4s are exact powers of two.
+
+### 10c. The one genuinely dimension-dependent number — β per level
+
+`MgDeepSolver.LevelPc` scales β by `shrink*shrink` = **/4 per level**. Two readings disagree
+about 3D: β = dt²c²/dx² carries 1/dx² and dx doubles per level in *any* dimension (argues /4);
+the Laplacian coarsens by 2^d (argues /8). **A wrong value here does not fail — it converges to
+the wrong operator**, which is the worst failure mode in this ledger.
+
+So it is a field (`MgDeepSolver3D.BetaCoarsenExp`), not a literal, and the bench decided it:
+
+| MgDeep3D residual RMS | 48³ | 64³ |
+|---|---|---|
+| β /4 per level (exp 2) | 1.421561e-06 | 2.851423e-06 |
+| **β /8 per level (exp 3)** | **1.290337e-06** | **1.867396e-06** |
+
+**/8 wins, and the margin widens with depth** — 9% at 48³ (4 levels), 34% at 64³ (5 levels).
+That widening is the tell: it is the coarse grids getting the correction right. The 1/dx²
+argument is wrong because it reasons about a *coefficient* while the quantity that has to
+coarsen correctly is the *operator*.
+
+### 10d. Results — 3D, `stamp_blob_3d`, sweeps 24
+
+> **These rows compare only to each other.** `stamp_blob_3d` is a different operator from the 2D
+> `stamp_wave_tank` — central-source blob, no Crank-Nicolson term, no bathymetry, no sponge — so
+> a 3D residual read against a 2D one is meaningless however well the units line up. The bench
+> prints this warning at runtime whenever `grids3d=` is passed, because the units *do* line up
+> and someone will otherwise read across.
+
+**Residual RMS:**
+
+| | 48³ | 64³ | 96³ | 128³ |
+|---|---|---|---|---|
+| Jacobi3D | 2.163e-06 | 4.018e-06 | 8.753e-04 | 4.975e-03 |
+| Rbgs3D | 2.162e-06 | 2.179e-06 | 7.301e-06 | 5.315e-04 |
+| Cg3D | 1.153e-06 | 1.728e-06 | 2.306e-06 | 4.061e-06 |
+| **MgDeep3D** | **1.290e-06** | 1.867e-06 | **1.487e-06** | **2.284e-06** |
+
+**ms/step** (48³/64³ at reps 40; 96³/128³ at reps 20, so looser — see §9a):
+
+| | 48³ | 64³ | 96³ | 128³ |
+|---|---|---|---|---|
+| Jacobi3D | 0.60 | 0.70 | 1.49 | 3.07 |
+| Rbgs3D | 0.77 | 1.31 | 3.04 | 6.62 |
+| Cg3D | 1.88 | 2.40 | 4.97 | 10.21 |
+| **MgDeep3D** | 1.24 | 1.25 | **1.76** | **3.07** |
+
+**The cliff is between 64³ and 96³.** RBGS holds flat to 64³ — 2.162e-06 → 2.179e-06 — and then
+goes 7.301e-06 → 5.315e-04. Jacobi goes over one grid earlier. This is §4's β collapse again,
+one dimension up: β scales as n², and the 7-point stencil's worst-mode factor 6β/(1+6β) is
+*worse* than 2D's 4β/(1+4β) at the same β.
+
+**Multigrid's residual is flat across a 19× cell-count increase** (1.29e-06 → 2.28e-06), and its
+cost rose only 2.5× — because the 3D pyramid is 1 + 1/8 + 1/64 + … = **8/7** of its fine grid,
+against 4/3 in 2D. *Multigrid's overhead shrinks as dimension rises while its convergence
+advantage does not.*
+
+**The single cleanest number in the sweep: at 128³, MgDeep3D and Jacobi3D cost identically —
+3.068 ms both — and MgDeep's residual is 2178× better.** Against CG at 128³ it is 1.8× better
+residual at 30% of the cost.
+
+This also answers the RBGS-vs-multigrid question §8 left open, in 3D at least: **they tie below
+64³ and multigrid wins outright above it.** Below 64³ RBGS is the cheaper pick and MgDeep's
+pyramid is pure overhead; the crossover, not the ranking, is the finding.
+
+### 10e. What has no 3D form, and why — this is a closed question
+
+Decided on the numbers in §9b, not on effort:
+
+- **ADI** — second-worst in 2D (22 ms/step at 512²), one thread per line, and 3D needs *three*
+  sweeps instead of two. It needs PCR before it deserves another dimension.
+- **Schwarz** — the concrete reason: `TILE_N ≤ 32` forces an 8×4 tile to become 4×4×2. Boundary
+  faces go 24 → 64 for the same 32 cells, so surface-to-volume nearly triples and more of the
+  stencil leaks to the RHS. **The "exact inside" advantage shrinks precisely when you add the
+  dimension**, and it is already the slowest solver in 2D at 50 ms/step. Worst candidate on the board.
+- **Multigrid (uniform β)** — exists only as the deep-vs-shallow control in 2D. Duplicating a
+  deliberately-approximate solver in 3D buys nothing.
+- **Spectral DCT** — *maybe*, and only as ground truth. There is currently **no exact answer in
+  3D**: every residual is self-reported against each solver's own operator, which is the §8b trap.
+  An exact constant-coefficient solve would validate all four. But `dct_1d` is O(N)-per-output,
+  already fatal at 1024²-2D, and 3D is three passes over N³. Only after the `kit/waves` butterfly
+  port (§7c/§7e), or capped at ≤64³ purely as a reference.
+
+### 10f. What is verified, and what is not
+
+**Verified.** `dotnet build` clean. The 2D column is **bit-identical** before and after the whole
+kernel lift — Jacobi `7.033419e-06`, Rbgs `6.987822e-06`, Cg `1.162441e-05`, Multigrid
+`5.186465e-06`, every digit. That last row is the one that matters: **`MgvSolver` is the solver
+that exercises all four lifted transfer kernels** (`mg_rhs`, `mg_restrict`, `mg_prolong`,
+`cg_dotbuf`), so its being unchanged is the proof the lift was a no-op. Scene 08 still renders
+(114 fps, solve 0.03 ms) on the 3-arg constructor and 2-arg `Step` — `GpuStampSolver3D` kept both,
+plus `FieldRid`, so nothing downstream was touched.
+
+**Not verified.** Scene 50, still owed since §3a. And no 3D solver has been run in a *scene* —
+scene 08 uses Jacobi3D by default, so **`Rbgs3D`, `Cg3D` and all of `MgDeep3D` have only ever run
+inside the bench.** The first scene to drive one will be the first real test.
+
+**A trap left in place deliberately.** `Make3D`'s mode ids align with the 2D numbering, so `3` is
+CG and **`2` is unmapped** (2D's 2 is ADI, which has no 3D form). An unmapped id used to print
+`FAILED_INIT` with no distinguishing reason; it now prints `UNMAPPED_ID`. The alignment is worth
+more than the gap costs, but the gap is real.

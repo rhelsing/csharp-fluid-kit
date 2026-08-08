@@ -17,7 +17,7 @@ namespace GodotCsharpExperiments;
 //   tools/godot-mono.sh --path . res://tools/shoot.tscn -- res://scenes/17_shorewaves.tscn 8 1600x900
 public partial class Shorewaves : Node3D
 {
-    private const float Domain = ShallowWaterKp.Domain;   // 30.4 m
+    private const float Domain = ShallowWaterKp.DefaultDomain;   // 30.4 m
     private const float Half = Domain * 0.5f;
     private const string ShaderDir = "res://shaders/shorewaves/";
     private const string TexDir = "res://textures/shorewaves/";
@@ -140,7 +140,7 @@ public partial class Shorewaves : Node3D
         _fullMat.SetShaderParameter("lace_tex", GD.Load<Texture2D>(TexDir + "voronoi_lace.png"));
         _fullMat.SetShaderParameter("flow_noise_tex", GD.Load<Texture2D>(TexDir + "flow_noise.png"));
         _fullMat.SetShaderParameter("DOMAIN_SIZE", Domain);
-        _fullMat.SetShaderParameter("GRID_RES", (float)ShallowWaterKp.N);
+        _fullMat.SetShaderParameter("GRID_RES", (float)ShallowWaterKp.DefaultN);
 
         _waterMi = new MeshInstance3D
         {
@@ -170,8 +170,8 @@ public partial class Shorewaves : Node3D
         if (!_running) { _accum = 0.0f; return; }
 
         _accum += Mathf.Min(delta, 0.1f);
-        int steps = Mathf.Clamp((int)(_accum / ShallowWaterKp.Dt), 0, ShallowWaterKp.MaxSubsteps);
-        _accum -= steps * ShallowWaterKp.Dt;
+        int steps = Mathf.Clamp((int)(_accum / solver.Dt), 0, solver.MaxSubsteps);
+        _accum -= steps * solver.Dt;
         if (steps == 0) { return; }
 
         int finalParity = (_parity + steps) % 2;
@@ -189,7 +189,7 @@ public partial class Shorewaves : Node3D
 
         _parity = finalParity;
         _gparity = finalGparity;
-        _simTime += steps * ShallowWaterKp.Dt;
+        _simTime += steps * solver.Dt;
     }
 
     private void UpdateReadout(float delta)

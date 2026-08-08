@@ -240,6 +240,51 @@ public sealed class CxmTank
         return _nodes;
     }
 
+    // Extra taps beyond the source's four. MaxTaps sized for the UI's range.
+    public const int MaxTaps = 8;
+    private readonly float[] _taps = new float[MaxTaps];
+
+    /// <summary>
+    /// N tap values, 4..8. Taps 0-3 are the source's four raw nodes, bit-identical to
+    /// Process()'s return — asking for 4 changes nothing.
+    ///
+    /// IMPORTANT about taps 4+: the CXM patch collapses the tank to those four and its own
+    /// comment says "simplified - full Dattorro uses 7 taps per channel", so the paper's
+    /// published tap OFFSETS are not in the source material and are NOT invented here. The
+    /// extra taps are additional reads of the same four tank delay lines at spread fractional
+    /// positions, through the same cubic Hermite reader the modulated delays use. That is a
+    /// parameterized extension of the topology, not a reconstruction of Dattorro's table.
+    ///
+    /// Why it matters for water: in a reverb more taps only decorrelate the stereo image. Here
+    /// each tap is injected at a PLACE, so tap count is the spatial resolution of whatever the
+    /// tank contributes to the surface.
+    /// </summary>
+    public float[] Taps(int n)
+    {
+        n = Math.Clamp(n, 4, MaxTaps);
+        _taps[0] = _nodes[0];
+        _taps[1] = _nodes[1];
+        _taps[2] = _nodes[2];
+        _taps[3] = _nodes[3];
+
+        // Spread the extras along the two long tank delays, avoiding both ends (the head is
+        // what taps 0/2 already read, and the tail is the feedback the chains cross-couple).
+        for (int i = 4; i < n; ++i)
+        {
+            int extra = i - 4;
+            float frac = (extra + 1.0f) / (n - 3.0f);
+            if ((extra & 1) == 0)
+            {
+                _taps[i] = ReadCubic(_delA1, _wDelA1, MathF.Max(DDelA1 * frac, 1.0f));
+            }
+            else
+            {
+                _taps[i] = ReadCubic(_delB1, _wDelB1, MathF.Max(DDelB1 * frac, 1.0f));
+            }
+        }
+        return _taps;
+    }
+
     /// <summary>
     /// The source's stereo fold, for reference / audio-identical checks:
     ///   wetL = (delA1 + apA2 - delB1 + apB2) * 0.25

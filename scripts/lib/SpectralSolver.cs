@@ -76,10 +76,13 @@ public sealed class SpectralSolver : IStampSolver
         _gy = (uint)((grid.Y - 1) / 8 + 1);
         _numWg = _gx * _gy;
 
-        string stamp = ReadRes(stampPath);
+        // Topology block ahead of the stamp (solver-ledger.md §7d). The DCT/DST passes
+        // themselves are still explicitly 2-axis; a 3D transform is three passes, not two.
+        string stamp = ReadRes(GpuStampSolver.Nd2DPath) + "\n" + ReadRes(stampPath);
         const string wg = "#version 450\nlayout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;\n";
 
-        _shRhs = Compile(wg + stamp + "\n" + ReadRes("res://shaders/stamp/mg_rhs.glslinc"), "spectral-rhs");
+        _shRhs = Compile(wg + "layout(r32f, set = 3, binding = 0) uniform image2D b0;\n"
+            + stamp + "\n" + ReadRes("res://shaders/stamp/mg_rhs.glslinc"), "spectral-rhs");
         _shDct = Compile(ReadRes("res://shaders/stamp/dct_1d.glslinc"), "spectral-dct");     // standalone
         _shSc = Compile(ReadRes("res://shaders/stamp/dct_scale.glslinc"), "spectral-scale"); // standalone
         if (!_shRhs.IsValid || !_shDct.IsValid || !_shSc.IsValid) { return; }

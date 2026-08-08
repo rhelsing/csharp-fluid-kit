@@ -1,0 +1,59 @@
+#version 450
+
+// vortex_inject.glslinc — scene 51: AMBIENT VORTEX PRIMITIVES (science_boi
+// vortex_memory.rs lift, docs/science-boi-lift.md). An infinite world-anchored
+// lattice of regularized Kirchhoff point vortices — jittered ~spacing grid,
+// checkerboard-alternating circulation, analytic (no state, exists everywhere) —
+// nudged into the swirl fluid each tick. The projection + dissipation then make the
+// eddies interact, advect and decay like real micro-currents. Purely local
+// (read own texel, write own texel), so it runs in-place between advect and project.
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(rg16f, set = 0, binding = 0) uniform image2D vel;
+
+layout(push_constant, std430) uniform Params {
+    vec2  size;
+    float cell;        // swirl metres per texel
+    float spacing;     // vortex lattice spacing (m)
+    float origin_x;    // swirl window min corner (world)
+    float origin_y;
+    float tex_off_x;   // toroidal scroll offset (texels)
+    float tex_off_y;
+    float strength;    // circulation Γ (m²/s); steady eddy speed ≈ Γ·couple/(2πr·(1−dissip))
+    float radius;      // core regularization radius (m)
+    float dt;          // per-substep timestep (s)
+    float _p1;
+} pc;
+
+vec2 vi_hash(vec2 p) {
+    return fract(sin(vec2(dot(p, vec2(127.1, 311.7)), dot(p, vec2(269.5, 183.3)))) * 43758.5453);
+}
+
+void main() {
+    ivec2 c = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 N = ivec2(pc.size);
+    if (c.x >= N.x || c.y >= N.y) {
+        return;
+    }
+
+    ivec2 wc = ((c - ivec2(pc.tex_off_x, pc.tex_off_y)) % N + N) % N;
+    vec2 world = vec2(pc.origin_x, pc.origin_y) + (vec2(wc) + 0.5) * pc.cell;
+
+    vec2 g = world / pc.spacing;
+    vec2 base = floor(g);
+    vec2 add = vec2(0.0);
+    for (int i = 0; i < 2; i++) {
+        for (int j = 0; j < 2; j++) {
+            vec2 lc = base + vec2(float(i), float(j));
+            vec2 centre = (lc + 0.2 + 0.6 * vi_hash(lc)) * pc.spacing;
+            float sgn = mod(lc.x + lc.y, 2.0) < 1.0 ? 1.0 : -1.0;
+            vec2 d = world - centre;
+            float r2 = dot(d, d) + pc.radius * pc.radius;
+            add += sgn * pc.strength * vec2(-d.y, d.x) / (6.2831853 * r2);
+        }
+    }
+
+    vec2 v = imageLoad(vel, c).rg + add * pc.dt;
+    imageStore(vel, c, vec4(v, 0.0, 0.0));
+}

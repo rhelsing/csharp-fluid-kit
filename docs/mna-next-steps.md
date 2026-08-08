@@ -273,6 +273,101 @@ there (it's the same wave stamp) is the on-ramp to §1 (the synth). Do this firs
 
 ---
 
+## 8. THE 3D LAYER — what a heightfield categorically cannot do (next experiments)
+
+Everything in §2/§2.5 is a **heightfield**: one `h` per column, `h = macro + mna`. That
+layering is the right architecture and it is not what this section replaces. But a heightfield
+has four hard walls, and no amount of solver quality gets past any of them, because they are
+limits of the *representation*, not the numerics:
+
+1. **Overturning / breaking waves.** `h(x,z)` is a function — one value per column — so a
+   curling lip is literally unrepresentable. The wave can steepen and then it must either
+   clip or explode.
+2. **Undertow and vertical circulation.** The return flow beneath an incoming wave. A
+   heightfield has no "beneath".
+3. **Spray, tubes, water above water.** Same reason.
+4. **Flow around submerged geometry.** Today a hull produces a wake stamped on the surface;
+   it does not displace water it is actually sitting in.
+
+### 8a. The distinction that decides the whole build
+
+**A 3D stamp solver is not 3D water.** The stamp solves a *scalar* implicit operator; put it
+in a volume and you get a scalar field obeying a wave equation. That has no velocity, no
+incompressibility and no free surface. Real 3D water needs four things:
+
+| piece | have it? |
+|---|---|
+| velocity field (vector) | ✅ `FluidSim3D` |
+| **pressure projection** (`∇·u = 0`) | ✅ but hand-rolled — `f3_pressure_jacobi` |
+| advection | ✅ `f3_advect_vel` / `f3_advect_dye` |
+| **free surface** (level set / VOF / particles) | ⛔ nothing |
+
+So the stamp's role in 3D water is **item 2, the pressure solve** — and that is a Poisson
+problem, i.e. a stamp by definition (`st_diag` = neighbour count, `st_conductance` = face
+weight, `st_rhs` = divergence).
+
+### 8b. First experiment — make `f3_pressure_jacobi` a stamp
+
+The single highest-value 3D step, and it is not a new solver.
+
+`FluidSim3D` runs the full Stam loop but its pressure solve is a hand-rolled Jacobi that never
+joined the stamp contract. Converting it means every solver in `solver-ledger.md` becomes
+available to the fluid at once. That matters concretely: measured at 512², **Jacobi's residual
+is 55× worse than RBGS at comparable cost** (`2.15e-06` vs `3.96e-08`). The fluid is currently
+stuck on the worst option in the table.
+
+It also fixes a structural oddity — the repo has **two unrelated solver families**
+(`shaders/stamp/*` and `shaders/fluid3d/f3_*`) where one would do, and the stamp family
+currently has exactly one 3D consumer (scene 08's blob), i.e. it is ornamental in 3D.
+
+Prerequisite: `GpuStampSolver3D` needs the `IStampSolver` surface (residual pass, `ModeName`,
+`PassesPerStep`) and RBGS/CG modes. The **solve bodies already work in 3D** — after
+`solver-ledger.md` §7d they loop over `ST_NB`/`ST_NEIGHBOUR`, and `ST_PARITY` sums all three
+axes precisely so red-black two-colours a 6-neighbour lattice. What is missing is host
+plumbing, not shaders.
+
+### 8c. Then the free surface — the actual unlock
+
+Breaking, undertow and spray all need a surface representation that can be multivalued.
+Options, cheapest first:
+- **Level set (signed distance) + reinitialization.** Grid-native, couples to the existing
+  volume, standard. Mass loss is the known failure mode.
+- **VOF / volume fractions.** Conserves mass; the interface reconstruction is fiddly.
+- **Particles (FLIP/PIC) over the grid.** Best splash/spray behaviour, adds a whole particle
+  system and a transfer step.
+
+**Do not skip 8b to get here.** A free surface on top of a Jacobi pressure solve will be slow
+*and* leaky, and the two failure modes are hard to tell apart.
+
+### 8d. Coupling — where the tuning will actually land
+
+The 3D volume is local (near the boat, near the break); the heightfield remains the global
+surface. That is the same nesting problem as §2.5's cascade coupling, which is already flagged
+as "expect most of the tuning to land here" — now with an extra dimension and a genuine
+physical interface rather than a resolution seam.
+
+Budget: a 128³ volume is 2.1 M cells (~33 MB across 4 buffers) — fine. 256³ is 16.7 M cells
+(~268 MB) — borderline. This is where §7d's toroidal-window half earns its place: the volume
+should ride the camera/boat, not span the world.
+
+### 8e. Cheaper routes to "structure underneath" — worth pricing first
+
+If the goal is *undulation with depth structure* rather than *breaking*, 3D is not the only
+lever and is by far the most expensive:
+- **Multi-layer shallow water.** N stacked coupled layers → undertow and internal waves at
+  ~N× the 2D cost, not N³.
+- **Boussinesq / dispersive terms.** Vertical-structure corrections on a heightfield; still a
+  2D solve.
+
+Note the current stamp is **shallow-water** (`c = √(gh)`, non-dispersive — every wavelength
+travels at the same speed). That is *correct* physics for a tank with a sloping bed, and wrong
+for open ocean — which is exactly why §2a layers a dispersive Gerstner/FFT macro on top. The
+layering already routes around it; 3D is not needed to fix dispersion.
+
+**Ordering: 8b → 8e (price it) → 8c → 8d.**
+
+---
+
 ## 7. Fluid-in-fluid: dye, milk, sand (don't forget)
 
 Foam (§2a) and mist (§2b) are one kind of passenger riding a sim. The third family:

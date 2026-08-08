@@ -1,0 +1,51 @@
+// cg_dot_partial — stage 1 of a TWO-STAGE dot product: many workgroups, each reducing its
+// strided slice of the field to one partial.
+//
+// Replaces the single-workgroup cg_dotbuf on CG's hot path. That kernel declared
+// `local_size_x = 256` and was dispatched (1,1,1), so the ENTIRE field went through 256
+// threads: at 1024^2 that is 1,048,576 cells / 256 = 4,096 serial iterations per thread,
+// three times per CG iteration, 24 iterations per tick. It is why CG measured 12.5 fps at
+// 256^2 while Jacobi measured 90 — a sequential algorithm wearing a parallel dispatch.
+//
+// The pattern is not new to this codebase: reduce_residual.glslinc has always done
+// multi-workgroup partials. The difference is that reduce_residual finishes on the CPU,
+// which CG cannot do — its whole design is ONE barrier-chained compute list with no
+// per-iteration readback, so the final fold has to stay on the GPU (cg_dot_final).
+//
+// Grid-stride by gl_NumWorkGroups.x * 256 so any workgroup count is correct, and coalesced:
+// adjacent threads read adjacent cells.
+//
+// DIMENSION-GENERIC (solver-ledger.md §7d). This is an ELEMENTWISE kernel — no stencil, no
+// neighbours — so all it needs from the topology is the cell count and linear-index→cell,
+// which nd_2d/nd_3d supply as ST_TOTAL / ST_FROM_LINEAR. Its `#version`, local_size, images
+// and push constant now come from the host, as with every other body.
+//
+// Host must supply, before this body: #version, local_size_x = 256, the two r32f images
+// (a_img @ set 2, b_img @ set 3), the Partials SSBO @ set 4, and a push constant named `pc`
+// whose FIRST member is the extent (vec2 in 2D, vec4 in 3D).
+
+shared float sdata[256];
+
+void main() {
+    uint total = ST_TOTAL();
+    uint li = gl_LocalInvocationIndex;
+
+    uint stride = gl_NumWorkGroups.x * 256u;
+    float acc = 0.0;
+    for (uint t = gl_WorkGroupID.x * 256u + li; t < total; t += stride) {
+        ST_IVEC c = ST_FROM_LINEAR(t);
+        acc += imageLoad(a_img, c).r * imageLoad(b_img, c).r;
+    }
+
+    sdata[li] = acc;
+    barrier();
+    for (uint s = 128u; s > 0u; s >>= 1u) {
+        if (li < s) {
+            sdata[li] += sdata[li + s];
+        }
+        barrier();
+    }
+    if (li == 0u) {
+        partial[gl_WorkGroupID.x] = sdata[0];
+    }
+}

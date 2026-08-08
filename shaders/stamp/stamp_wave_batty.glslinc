@@ -1,0 +1,152 @@
+// stamp_wave_batty.glslinc — stamp_wave_multi.glslinc + BATTY VARIATIONAL CUT-CELL
+// SHORE BOUNDARIES (scene 52; Batty-Bertails-Bridson 2007's SPD weighted Laplacian).
+//
+// Every neighbour pipe's conductance is weighted by the OPEN FRACTION of the shared
+// cell face — β·frac. frac 1 = open water, 0 = rock (the wave reflects), in between =
+// an honest sub-grid shoreline cutting through the cell. The diagonal sums the same
+// fractions, so the operator stays an SPD weighted graph Laplacian. Sub-grid Neumann
+// walls EMERGE — no staircase, no popping as the toroidal window scrolls.
+//
+// SOLID CELLS ARE NOT PART OF THE SYSTEM: forcing is masked by the cell's open
+// fraction (a poke gaussian overlapping the island otherwise double-integrates
+// unbounded in a disconnected cell — found via the giant white mound in the first
+// A/B shot), and interior rock carries a strong leak anchoring its h to rest.
+//
+// Circle list is baked as constants — MUST match BoatBatty.BuildIslands
+// (foot = r·sqrt(1 − (centerY/(h/2))²) at y = 0).
+//
+// Push layout (std430, 128B = 32 floats): see Params. batty: 0 = off (exact scene-50
+// operator) · 1 = smooth sub-grid · 2 = binary staircase (the A/B).
+
+layout(r32f, set = 0, binding = 0) uniform image2D h_curr;   // state: h(t)
+layout(r32f, set = 1, binding = 0) uniform image2D h_prev;   // state: h(t-dt)
+
+layout(push_constant, std430) uniform Params {
+    vec2  size;
+    float beta;
+    float a;
+    float leak;
+    float cn;
+    float sponge_w;
+    float sponge_a;
+    vec2  tex_off;
+    vec2  world_origin;   // window min corner (world metres)
+    float cell_size;      // metres per cell
+    float batty;          // 0 off · 1 smooth · 2 binary
+    float batty_soft;     // transition width (cells)
+    float _p3;
+    vec4  drops[4];
+} pc;
+
+// Island waterline circles (world x, z, foot radius) — keep in sync with BuildIslands.
+const int BATTY_N = 7;
+const vec3 BATTY_ISL[7] = vec3[](
+    vec3(70.0, -95.0, 28.24),
+    vec3(-90.0, -120.0, 22.49),
+    vec3(60.0, 140.0, 36.08),
+    vec3(-140.0, 50.0, 18.86),
+    vec3(150.0, 90.0, 26.08),
+    vec3(-55.0, 120.0, 18.52),
+    vec3(-12.0, -22.0, 8.57));   // the skerry near spawn (camera-left)
+
+ivec2 st_world(ivec2 c) {
+    ivec2 N = ivec2(pc.size);
+    return (c - ivec2(pc.tex_off) + N) % N;
+}
+
+float st_sponge(ivec2 c) {
+    vec2 mxf = pc.size - vec2(1.0);
+    vec2 wc = vec2(st_world(c));
+    vec2 de = min(wc, mxf - wc);
+    float t = clamp(1.0 - min(de.x, de.y) / max(pc.sponge_w, 1.0), 0.0, 1.0);
+    return t * t;
+}
+
+// signed distance to the nearest island waterline (world metres; negative = inside rock)
+float batty_sdf(vec2 w) {
+    float d = 1e9;
+    for (int i = 0; i < BATTY_N; i++) {
+        d = min(d, length(w - BATTY_ISL[i].xy) - BATTY_ISL[i].z);
+    }
+    return d;
+}
+
+// cell-centre open fraction (0 = rock, 1 = water)
+float batty_open(ivec2 c) {
+    if (pc.batty < 0.5) { return 1.0; }
+    vec2 w = pc.world_origin + (vec2(st_world(c)) + 0.5) * pc.cell_size;
+    float sdf = batty_sdf(w);
+    if (pc.batty > 1.5) { return sdf > 0.0 ? 1.0 : 0.0; }
+    return clamp(0.5 + sdf / max(pc.batty_soft * pc.cell_size, 1e-4), 0.0, 1.0);
+}
+
+// open fraction of the face between texels c and n (both toroidal storage indices)
+float batty_frac(ivec2 c, ivec2 n) {
+    if (pc.batty < 0.5) { return 1.0; }
+    ivec2 d = n - c;
+    // undo the toroidal wrap: |Δ| > 1 on an axis means the neighbour crossed the seam
+    if (d.x > 1) { d.x = -1; } else if (d.x < -1) { d.x = 1; }
+    if (d.y > 1) { d.y = -1; } else if (d.y < -1) { d.y = 1; }
+    vec2 wcell = vec2(st_world(c)) + 0.5 + 0.5 * vec2(d);      // face midpoint, window cells
+    vec2 w = pc.world_origin + wcell * pc.cell_size;           // world metres
+    float sdf = batty_sdf(w);
+    if (pc.batty > 1.5) { return sdf > 0.0 ? 1.0 : 0.0; }      // binary staircase (the A/B)
+    return clamp(0.5 + sdf / max(pc.batty_soft * pc.cell_size, 1e-4), 0.0, 1.0);
+}
+
+// Σ of the four face fractions — replaces the bare "4" in the diagonal (keeps SPD).
+float batty_fsum(ivec2 c) {
+    ivec2 N = ivec2(pc.size);
+    float fs = 0.0;
+    for (int k = 0; k < 4; k++) {
+        fs += batty_frac(c, (c + ST_OFFS[k] + N) % N);
+    }
+    return fs;
+}
+
+float st_damp(ivec2 c) {
+    return pc.a + pc.sponge_a * st_sponge(c);
+}
+
+float st_leak(ivec2 c) {
+    // solid cells leak hard to rest — they are not part of the wave system
+    return pc.leak + pc.sponge_a * st_sponge(c) + (1.0 - batty_open(c)) * 0.5;
+}
+
+float st_conductance(ivec2 c, ivec2 n) {
+    return (1.0 - 0.5 * pc.cn) * pc.beta * batty_frac(c, n);
+}
+
+float st_diag(ivec2 c) {
+    return 1.0 + st_damp(c) + (1.0 - 0.5 * pc.cn) * (batty_fsum(c) * pc.beta + st_leak(c));
+}
+
+float st_rhs(ivec2 c) {
+    float hc = imageLoad(h_curr, c).r;
+    float hp = imageLoad(h_prev, c).r;
+
+    // CN history term applies the SAME weighted operator to h_prev — fractions included,
+    // or the θ-scheme goes inconsistent at shorelines.
+    ivec2 N = ivec2(pc.size);
+    float hpN = 0.0;
+    float fs = 0.0;
+    for (int k = 0; k < 4; k++) {
+        ivec2 n = (c + ST_OFFS[k] + N) % N;
+        float f = batty_frac(c, n);
+        fs += f;
+        hpN += f * imageLoad(h_prev, n).r;
+    }
+    float dhp = pc.beta * hpN - (fs * pc.beta + st_leak(c)) * hp;
+
+    float force = 0.0;
+    vec2 wc = vec2(st_world(c));
+    for (int i = 0; i < 4; i++) {
+        if (pc.drops[i].w != 0.0) {
+            vec2 d = wc - pc.drops[i].xy;
+            force += pc.drops[i].w * exp(-dot(d, d) / (pc.drops[i].z * pc.drops[i].z));
+        }
+    }
+    force *= batty_open(c);   // no forcing into rock
+
+    return 2.0 * hc - hp + st_damp(c) * hp + (0.5 * pc.cn) * dhp + force;
+}

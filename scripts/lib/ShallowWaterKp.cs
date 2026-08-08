@@ -14,15 +14,26 @@ namespace GodotCsharpExperiments.Lib;
 // pass_debug (throttled reduction, async readback).
 public sealed class ShallowWaterKp
 {
-    // structural constants (shared by both hosts; fixed at runtime)
     private const float G = 9.81f;
-    public const int N = 608;
-    public const float Dx = 0.05f;
-    public const float Dt = 0.002f;
-    public const int MaxSubsteps = 12;            // per-frame cap; a host may use fewer
-    public const float Domain = N * Dx;           // 30.4 m
-    private const float WaveMode = 1.0f;          // 1 = west wavemaker
-    private const int Groups = (N + 15) / 16;     // 38
+
+    // BEACH defaults (scene 17). A host that wants a different grid passes n/dx/dt to the
+    // constructor; every compute pass reads its extent from imageSize(), so the solver
+    // itself is resolution-agnostic and nothing but these three numbers changes.
+    public const int DefaultN = 608;
+    public const float DefaultDx = 0.05f;
+    public const float DefaultDt = 0.002f;
+    public const float DefaultDomain = DefaultN * DefaultDx;   // 30.4 m
+    public const int DefaultMaxSubsteps = 12;
+
+    // grid, fixed at construction
+    public readonly int N;
+    public readonly float Dx;
+    public readonly float Dt;
+    public float Domain => N * Dx;
+    private readonly int _groups;
+
+    public int MaxSubsteps = DefaultMaxSubsteps;   // per-frame cap; a host may use fewer
+    public float WaveMode = 1.0f;     // 1 = west wavemaker, 2 = + absorbing E/N/S (ocean)
 
     // live-tunable parameters (defaults = shorewaves BEACH). Scene 17 never assigns these,
     // so it keeps the exact defaults; only a host that sets them changes behavior.
@@ -37,6 +48,14 @@ public sealed class ShallowWaterKp
     public float SolitaryH = 0.36f;   // solitary wave height (m)
     public float SolitaryX0 = 3.0f;   // solitary launch x (m)
     public bool Incommensurate = false;  // [exp E] irrational wavemaker component ratios
+
+    // Ground-memory timescales (seconds). These are LOOK controls, not physics: how long the
+    // beach stays visibly damp after the swash pulls back, how long stranded foam lace
+    // survives on the sand, and how fast returning water erases it. Defaults reproduce the
+    // values that were hardcoded in pass_ground.glsl.
+    public float DryTau = 45.0f;
+    public float StrandTau = 10.0f;
+    public float RewetTau = 0.12f;
 
     private readonly RenderingDevice _rd;
 
@@ -67,9 +86,14 @@ public sealed class ShallowWaterKp
     // latest debug readback (main thread reads)
     public float DbgVolume, DbgMaxH, DbgMaxSpeed, DbgWet, DbgNan, DbgTime;
 
-    public ShallowWaterKp(RenderingDevice rd, byte[] bottomBytes, byte[] stateBytes)
+    public ShallowWaterKp(RenderingDevice rd, byte[] bottomBytes, byte[] stateBytes,
+        int n = DefaultN, float dx = DefaultDx, float dt = DefaultDt)
     {
         _rd = rd;
+        N = n;
+        Dx = dx;
+        Dt = dt;
+        _groups = (n + 15) / 16;
 
         var fmt32 = Fmt(RenderingDevice.DataFormat.R32G32B32A32Sfloat);
         _state[0] = MakeTex(fmt32);
@@ -172,8 +196,11 @@ public sealed class ShallowWaterKp
         _rd.ComputeListAddBarrier(cl);
 
         // ground pass: the dt slot carries the frame delta, not the substep dt
+        // 12 floats here, not 8: pass_ground declares the three memory taus on the end of its
+        // block. Every other pass still takes the 8-float SimPc.
         Dispatch(cl, _pGround, _setGround[p * 2 + gparity],
-            Pc(substeps * Dt, Dx, G, Theta, Mathf.Pow(Kappa, 4.0f), Manning, tEnd, KFoam));
+            Pc(substeps * Dt, Dx, G, Theta, Mathf.Pow(Kappa, 4.0f), Manning, tEnd, KFoam,
+               DryTau, StrandTau, RewetTau, 0.0f));
         _rd.ComputeListAddBarrier(cl);
 
         _frame++;
@@ -217,7 +244,7 @@ public sealed class ShallowWaterKp
         _rd.ComputeListBindUniformSet(cl, set, 0);
         _rd.ComputeListSetPushConstant(cl, pc, (uint)pc.Length);
         if (single) { _rd.ComputeListDispatch(cl, 1, 1, 1); }
-        else { _rd.ComputeListDispatch(cl, Groups, Groups, 1); }
+        else { _rd.ComputeListDispatch(cl, (uint)_groups, (uint)_groups, 1); }
     }
 
     private byte[] SimPc(float t) => Pc(Dt, Dx, G, Theta, Mathf.Pow(Kappa, 4.0f), Manning, t, KFoam);
@@ -270,11 +297,11 @@ public sealed class ShallowWaterKp
         return _rd.ShaderCreateFromSpirV(spirv);
     }
 
-    private static RDTextureFormat Fmt(RenderingDevice.DataFormat format) => new()
+    private RDTextureFormat Fmt(RenderingDevice.DataFormat format) => new()
     {
         Format = format,
         TextureType = RenderingDevice.TextureType.Type2D,
-        Width = N, Height = N, Depth = 1, ArrayLayers = 1, Mipmaps = 1,
+        Width = (uint)N, Height = (uint)N, Depth = 1, ArrayLayers = 1, Mipmaps = 1,
         UsageBits = RenderingDevice.TextureUsageBits.SamplingBit
             | RenderingDevice.TextureUsageBits.StorageBit
             | RenderingDevice.TextureUsageBits.CanCopyToBit

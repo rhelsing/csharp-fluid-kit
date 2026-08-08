@@ -98,26 +98,22 @@ float st_conductance(ivec2 c, ivec2 n) {
 }
 
 float st_diag(ivec2 c) {
-    ivec2 mx = ivec2(pc.size) - ivec2(1);
-    const ivec2 offs[4] = ivec2[4](ivec2(1, 0), ivec2(-1, 0), ivec2(0, 1), ivec2(0, -1));
     float sum = 0.0;
-    for (int k = 0; k < 4; k++) {
-        sum += st_beta_face(c, clamp(c + offs[k], ivec2(0), mx));
+    for (int k = 0; k < ST_NB; k++) {
+        sum += st_beta_face(c, ST_NEIGHBOUR(c, k));
     }
     return 1.0 + st_damp(c) + (1.0 - 0.5 * pc.cn) * (sum + st_leak(c));
 }
 
 float st_rhs(ivec2 c) {
-    ivec2 mx = ivec2(pc.size) - ivec2(1);
     float hc = imageLoad(h_curr, c).r;
     float hp = imageLoad(h_prev, c).r;
 
     // cn share of the stiffness evaluated on the PAST level (Crank-Nicolson)  [FORCE_MARKER]
-    const ivec2 offs[4] = ivec2[4](ivec2(1, 0), ivec2(-1, 0), ivec2(0, 1), ivec2(0, -1));
     float dhp = 0.0;
     float sum = 0.0;
-    for (int k = 0; k < 4; k++) {
-        ivec2 n = clamp(c + offs[k], ivec2(0), mx);
+    for (int k = 0; k < ST_NB; k++) {
+        ST_IVEC n = ST_NEIGHBOUR(c, k);
         float bf = st_beta_face(c, n);
         dhp += bf * imageLoad(h_prev, n).r;
         sum += bf;

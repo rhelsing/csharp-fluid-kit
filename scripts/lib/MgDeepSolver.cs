@@ -96,7 +96,9 @@ public sealed class MgDeepSolver : IStampSolver
         _rsR2 = new Rid[_n]; _rsB3 = new Rid[_n];
         _prC2 = new Rid[_n]; _prF3 = new Rid[_n];
 
-        string stamp = ReadRes(stampPath);
+        // Topology block ahead of the stamp — mgd_smooth/mgd_residual and the stamp itself
+        // now use ST_NB / ST_NEIGHBOUR (solver-ledger.md §7d).
+        string stamp = ReadRes(GpuStampSolver.Nd2DPath) + "\n" + ReadRes(stampPath);
         const string wg = "#version 450\nlayout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;\n";
         // mgd_* need the level images; the stamp brings h_curr(0)/h_prev(1) and `pc`.
         const string mgdSets =
@@ -104,12 +106,33 @@ public sealed class MgDeepSolver : IStampSolver
             "layout(r32f, set = 3, binding = 0) uniform image2D u_out;\n" +
             "layout(r32f, set = 4, binding = 0) uniform image2D rhs_img;\n";
 
-        _shRhs = Compile(wg + stamp + "\n" + ReadRes("res://shaders/stamp/mg_rhs.glslinc"), "mgd-rhs");
+        // Grid-transfer and dot kernels are dimension-generic now (solver-ledger.md §7d), so
+        // the host supplies their declarations. These 2D headers are byte-for-byte what the
+        // .glslinc files used to declare themselves — verified by the residual column being
+        // unchanged to every digit.
+        string nd = ReadRes(GpuStampSolver.Nd2DPath);
+        const string rhsSets = "layout(r32f, set = 3, binding = 0) uniform image2D b0;\n";
+        const string rsSets =
+            "layout(r32f, set = 2, binding = 0) uniform image2D r_fine;\n" +
+            "layout(r32f, set = 3, binding = 0) uniform image2D r_coarse;\n" +
+            "layout(push_constant, std430) uniform P { vec2 coarse_size; vec2 fine_size; } pc;\n";
+        const string prSets =
+            "layout(r32f, set = 2, binding = 0) uniform image2D u_coarse;\n" +
+            "layout(r32f, set = 3, binding = 0) uniform image2D u_fine;\n" +
+            "layout(push_constant, std430) uniform P { vec2 fine_size; vec2 coarse_size; } pc;\n";
+        const string dotHdr =
+            "#version 450\nlayout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;\n" +
+            "layout(r32f, set = 2, binding = 0) uniform image2D a_img;\n" +
+            "layout(r32f, set = 3, binding = 0) uniform image2D b_img;\n" +
+            "layout(std430, set = 5, binding = 0) buffer Scalars { float sc[]; };\n" +
+            "layout(push_constant, std430) uniform P { vec2 size; uint slot; uint _pad; } pc;\n";
+
+        _shRhs = Compile(wg + rhsSets + stamp + "\n" + ReadRes("res://shaders/stamp/mg_rhs.glslinc"), "mgd-rhs");
         _shSm = Compile(wg + mgdSets + stamp + "\n" + ReadRes("res://shaders/stamp/mgd_smooth.glslinc"), "mgd-smooth");
         _shRe = Compile(wg + mgdSets + stamp + "\n" + ReadRes("res://shaders/stamp/mgd_residual.glslinc"), "mgd-residual");
-        _shRs = Compile(ReadRes("res://shaders/stamp/mg_restrict.glslinc"), "mgd-restrict");   // standalone, reused as-is
-        _shPr = Compile(ReadRes("res://shaders/stamp/mg_prolong.glslinc"), "mgd-prolong");     // standalone, reused as-is
-        _shDot = Compile(ReadRes("res://shaders/stamp/cg_dotbuf.glslinc"), "mgd-dot");
+        _shRs = Compile(wg + rsSets + nd + "\n" + ReadRes("res://shaders/stamp/mg_restrict.glslinc"), "mgd-restrict");
+        _shPr = Compile(wg + prSets + nd + "\n" + ReadRes("res://shaders/stamp/mg_prolong.glslinc"), "mgd-prolong");
+        _shDot = Compile(dotHdr + nd + "\n" + ReadRes("res://shaders/stamp/cg_dotbuf.glslinc"), "mgd-dot");
         if (!_shRhs.IsValid || !_shSm.IsValid || !_shRe.IsValid || !_shRs.IsValid || !_shPr.IsValid || !_shDot.IsValid)
         {
             return;

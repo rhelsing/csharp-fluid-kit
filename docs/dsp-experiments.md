@@ -28,7 +28,7 @@ across every scene:
   fps being judged and visually confounds what is being looked at. Toggle stays.
 - same readout format: `fps · <variable state> · <cost>`
 
-### One trap already hit
+### Traps already hit (all cost real debugging time)
 
 `BuildPoolMesh()` in scene 24 is **not a pool**. Its five faces are x=±1, z=±1 and
 **y=+1 — a lid, with no floor.** It was only ever a proxy volume for
@@ -40,6 +40,24 @@ Same class of trap: the `ww_*` shaders read `water_tex` as `R=height, B=normal.x
 A=normal.z`. Any path that writes the field must write normals too, or the surface
 renders as a featureless blob no matter how correct the heights are.
 
+**Dissipation goes on VELOCITY, never on height.** Scaling `info.r` mid-step is not
+damping — it is a spatially-varying rescale of the surface, and since a diode's loss
+rises exponentially, neighbouring cells differ enough to carve a cliff. The Laplacian
+hits that cliff and the explicit scheme goes. Apply losses semi-implicitly as
+`g / (1 + G)`, which is unconditionally stable for any `G >= 0` and needs no clamp —
+the same companion-stamp trick `shorewaves/sim/pass_step.glsl` uses for friction.
+
+**A solid obstacle interior must be pinned to rest, not merely decoupled.** Neighbour
+substitution stops water cells seeing *into* an obstacle, but it also leaves the
+interior with no Laplacian coupling, so trapped velocity integrates into height
+unopposed (~100x at 0.99 damping). Static obstacles never show this because nothing
+ever enters them; a MOVING one sweeps over moving water and releases the spike when it
+passes on.
+
+**A missing water mesh is the NaN signature** — `VERTEX.y += NaN` degenerates the whole
+mesh. If the plane vanishes rather than looking wrong, look for a blow-up, not a
+shading bug.
+
 ---
 
 ## The series
@@ -50,12 +68,12 @@ Hard-split — one scene per variable, so each can be shown on its own.
 
 | Scene | Isolated variable | Control |
 |---|---|---|
-| `24_base` | — (reference) | nothing added |
-| `24_col` | one column | **shape** (cylinder / square / blade), **hard↔soft as a slider**, radius, position |
-| `24_cols` | column **count** | 1 → 8, layout preset |
-| `24_src` | source **count** | 1 / 2 / 3, spacing |
-| `24_move` | object motion, **as a source** | speed, path, on/off |
-| `24_scat` | object motion, **as a scatterer** | static ↔ moving |
+| `24_base` ✅ | — (reference) | nothing added |
+| `24_col` ✅ | one column | **shape** (cylinder / square / blade), **hard↔soft as a slider**, radius, position |
+| `24_cols` ✅ | column **count** | 1 → 8, layout preset |
+| `24_src` ✅ | source **count** | 1 / 2 / 3, spacing |
+| `24_move` ✅ | object motion, **as a source** | speed, path, on/off |
+| `24_scat` ✅ | object motion, **as a scatterer** | static ↔ moving, mask uploads/s on the readout |
 
 Hard/soft is a slider, not a switch: 0 = pure absorber, 1 = perfect reflector.
 The interesting region is wherever it stops reading as a hole and starts reading
@@ -75,9 +93,9 @@ place.
 
 | Scene | Isolated variable | Source |
 |---|---|---|
-| `24_diode` | threshold loss — knee, Is/Vt | Shockley shape from `lib/mna-solver.cmajor` |
-| `24_clip` | nonlinearity **position** — off / after-loop / in-loop | MangledVerb `Softclip` / `Overdrive` |
-| `24_speed` | amplitude-dependent speed, coupling 0→1 | `c = √(g(h+η))`; Thermae's crossfade |
+| `24_diode` ✅ | threshold loss — knee, Is/Vt | Shockley shape from `lib/mna-solver.cmajor` |
+| `24_clip` ✅ | nonlinearity **position** — off / after-loop / in-loop | MangledVerb `Softclip` / `Overdrive` |
+| `24_speed` ✅ | amplitude-dependent speed, coupling 0→1 | `c = √(g(h+η))`; Thermae's crossfade |
 
 **`24_diode`** — `Gd = (Is/Vt)·exp(Vd0/Vt)` is a conductance that is ~zero below a
 knee and exponential above it. Used here as a per-cell loss term: **no matrix, no
@@ -98,12 +116,13 @@ and explicit pitch-time coupling.
 | Scene | Isolated variable | Notes |
 |---|---|---|
 | `24_cxm` ✅ | tank on/off | built. Tuned delays 7188/6005/6807/5106 intact |
-| `24_cxm_clock` | tank **clock** 300 → 48000 Hz | the only adaptation made to the source; at 48000 it is the audio patch bit-for-bit |
-| `24_cxm_taps` | **tap count + position** 4 → 7 | in audio the extra Dattorro taps only decorrelate stereo; here each tap is a *place* |
-| `24_cxm_type` | the tuned presets | Room/Plate/Hall × Diffusion × Tank mod — the source's own tables |
-| `24_zita` | **topology** | figure-of-eight ↔ Zita FDN (Hadamard, `DelayWithFeedback`). Same drive, same taps, same field |
+| `24_cxm_clock` ✅ | tank **clock** 300 → 48000 Hz | the only adaptation made to the source; at 48000 it is the audio patch bit-for-bit |
+| `24_cxm_taps` ✅ | **tap count + position** 4 → 8 | in audio the extra Dattorro taps only decorrelate stereo; here each tap is a *place* |
+| `24_cxm_field` ✅ | **how scalars become a field** | sim-drops vs analytic modal basis with the solver OFF — the "performant like a function" question, answered on the readout |
+| `24_cxm_type` ✅ | the tuned presets | Room/Plate/Hall × Diffusion × Tank mod — the source's own tables |
+| `24_zita` ✅ | **topology** | figure-of-eight ↔ Zita FDN (Hadamard, `DelayWithFeedback`). Same drive, same taps, same field |
 | `24_ir` ✅ | solver vs convolution | built |
-| `24_irlen` | **kernel length** 64 → 1024 slices | 1024 ≈ 268 MB at 256², the practical ceiling |
+| `24_irlen` ✅ | **kernel length** 64 → 1024 slices | 1024 ≈ 268 MB at 256², the practical ceiling |
 
 ---
 

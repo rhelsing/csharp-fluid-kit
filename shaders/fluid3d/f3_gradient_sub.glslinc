@@ -18,6 +18,12 @@ void main() {
     float zB = imageLoad(pres, clamp(c + ivec3(0, 0, -1), ivec3(0), mx)).r;
     vec3 v = imageLoad(vel, c).xyz;
     v -= 0.5 * vec3(xR - xL, yU - yD, zF - zB);
-    if (c.x == 0 || c.y == 0 || c.z == 0 || c.x == mx.x || c.y == mx.y || c.z == mx.z) { v = vec3(0.0); }
+    if (pc.pad.x > 0.5) {
+        // free-slip: zero only the wall-normal component — the tangential slide is
+        // what lets a bottom-impacting jet spread along the floor and roll up
+        if (c.x == 0 || c.x == mx.x) { v.x = 0.0; }
+        if (c.y == 0 || c.y == mx.y) { v.y = 0.0; }
+        if (c.z == 0 || c.z == mx.z) { v.z = 0.0; }
+    } else if (c.x == 0 || c.y == 0 || c.z == 0 || c.x == mx.x || c.y == mx.y || c.z == mx.z) { v = vec3(0.0); }
     imageStore(vel, c, vec4(v, 0.0));
 }

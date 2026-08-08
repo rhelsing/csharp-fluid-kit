@@ -1,0 +1,61 @@
+// stamp_pressure_free_3d.glslinc — the pressure-Poisson operator WITH A FREE SURFACE.
+//
+// This is the stamp that makes water curl. stamp_pressure_3d solves the projection on a box
+// that is fluid everywhere; this one solves it on a domain whose top boundary is the actual
+// water surface, which is the difference between a heightfield (y = h(x,z), single-valued,
+// an overturning lip is unrepresentable) and a volume where the crest can throw forward over
+// the trough.
+//
+// SET 0 IS THE CELL MASK, SET 1 IS THE DIVERGENCE. Unlike stamp_pressure_3d there is no
+// pressure in a bound image at all — MgDeepSolver3D in external-state mode leaves the
+// solution in its own fine-level iterate (SolutionRid), which frees both stamp slots for
+// inputs and makes the previous pressure a free warm start.
+//
+// mask: 1 = FLUID, 0 = AIR, -1 = SOLID. The three boundary conditions fall straight out of
+// the MNA reading — the operator is a resistor network and these are just what each pipe is
+// connected to (shorewaves/docs/design/path-b §3):
+//
+//   fluid neighbour : conductance beta, contributes to BOTH the sum and the diagonal
+//   air neighbour   : conductance 0 but STILL COUNTED in the diagonal  -> Dirichlet p = 0,
+//                     because a term is subtracted for a neighbour whose pressure is zero.
+//                     This is the free surface. Dropping it from the diagonal instead gives
+//                     Neumann, i.e. a rigid lid, and the water will not fall.
+//   solid neighbour : dropped from BOTH  -> Neumann, no flux through the bed.
+//
+// A cell that is not itself fluid is pinned: diag 1, no conductance, rhs 0 -> p = 0 exactly.
+
+layout(r32f, set = 0, binding = 0) uniform image3D h_curr;   // cell mask
+layout(r32f, set = 1, binding = 0) uniform image3D h_prev;   // divergence
+
+layout(push_constant, std430) uniform Params {
+    vec4  size;      // xyz = grid dims (REQUIRED first field)
+    float beta;      // face conductance = 1/dx^2, 1.0 at the fine level
+    float _p0;
+    float _p1;
+    float _p2;
+} pc;
+
+#define M_FLUID(m) ((m) > 0.5)
+#define M_SOLID(m) ((m) < -0.5)
+
+float st_conductance(ivec3 c, ivec3 n) {
+    if (!M_FLUID(imageLoad(h_curr, c).r)) { return 0.0; }
+    return M_FLUID(imageLoad(h_curr, n).r) ? pc.beta : 0.0;
+}
+
+float st_diag(ivec3 c) {
+    if (!M_FLUID(imageLoad(h_curr, c).r)) { return 1.0; }
+    float d = 0.0;
+    for (int k = 0; k < ST_NB; k++) {
+        // ST_NEIGHBOUR clamps at the box edge, so an edge cell sees ITSELF as the neighbour.
+        // That self-reference is fluid, so it counts -> the box wall behaves as solid, which
+        // is what we want; the wavemaker overrides velocity there directly.
+        if (!M_SOLID(imageLoad(h_curr, ST_NEIGHBOUR(c, k)).r)) { d += pc.beta; }
+    }
+    return max(d, 1e-6);
+}
+
+float st_rhs(ivec3 c) {
+    if (!M_FLUID(imageLoad(h_curr, c).r)) { return 0.0; }
+    return -imageLoad(h_prev, c).r;
+}

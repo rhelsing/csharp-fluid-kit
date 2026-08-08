@@ -1,0 +1,55 @@
+#version 450
+
+// bubble_cells.glslinc — scene 51.1: rasterize the CPU bubble list (von Neumann
+// coarsening, science_boi foam_reactor lift) into a weighted-Voronoi cell texture.
+// Per texel: distance to the two nearest bubbles (power-diagram style, d = |p−c| − r);
+// F2−F1 small = a PLATEAU WALL between adjacent bubbles. Window-space, regenerated
+// every tick — no scrolling, no history.
+//     R = wall/edge distance F2−F1 (m) · G = nearest bubble age 0..1 · B = proximity 0..1
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(rgba16f, set = 0, binding = 0) uniform image2D cells_out;
+
+layout(std430, set = 1, binding = 0) buffer Bubbles {
+    vec4 b[];   // xy = world pos, z = radius (m), w = age 0..1
+};
+
+layout(push_constant, std430) uniform Params {
+    vec2  size;
+    float count;
+    float origin_x;
+    float origin_y;
+    float window;    // world metres the texture covers
+    float max_range; // proximity falloff (m) — beyond this, no cell structure
+    float _p0;
+} pc;
+
+void main() {
+    ivec2 c = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 N = ivec2(pc.size);
+    if (c.x >= N.x || c.y >= N.y) {
+        return;
+    }
+    vec2 p = vec2(pc.origin_x, pc.origin_y) + (vec2(c) + 0.5) * (pc.window / pc.size.x);
+
+    float f1 = 1e9;
+    float f2 = 1e9;
+    float age = 0.0;
+    int n = int(pc.count);
+    for (int i = 0; i < n; i++) {
+        vec2 d = p - b[i].xy;
+        float dist = length(d) - b[i].z;
+        if (dist < f1) {
+            f2 = f1;
+            f1 = dist;
+            age = b[i].w;
+        } else if (dist < f2) {
+            f2 = dist;
+        }
+    }
+
+    float edge = clamp(f2 - f1, 0.0, 10.0);
+    float prox = 1.0 - clamp(f1 / max(pc.max_range, 0.01), 0.0, 1.0);
+    imageStore(cells_out, c, vec4(edge, age, prox, 0.0));
+}

@@ -1,0 +1,14 @@
+[remap]
+
+importer="glsl"
+type="RDShaderFile"
+uid="uid://inhmg6uu7smi"
+path="res://.godot/imported/pass_curl_age.glsl-696e6e14febf8dd8d98cd0820cce606e.res"
+
+[deps]
+
+source_file="res://shaders/shorewaves/pass_curl_age.glsl"
+dest_files=["res://.godot/imported/pass_curl_age.glsl-696e6e14febf8dd8d98cd0820cce606e.res"]
+
+[params]
+

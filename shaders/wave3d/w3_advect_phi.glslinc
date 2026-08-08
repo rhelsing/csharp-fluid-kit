@@ -1,0 +1,36 @@
+#version 450
+// w3_advect_phi — semi-Lagrangian advection of the water level set. Unconditionally stable,
+// and diffusive: phi smears over time, which rounds the surface. Acceptable for a first
+// light; a real build reinitializes phi to a signed distance, or switches to FLIP particles.
+layout(local_size_x = 4, local_size_y = 4, local_size_z = 4) in;
+layout(r32f,    set = 0, binding = 0) uniform image3D phi_in;
+layout(rgba32f, set = 1, binding = 0) uniform image3D vel;
+layout(r32f,    set = 2, binding = 0) uniform image3D phi_out;
+
+layout(push_constant, std430) uniform P { vec4 size; float dt; float _a; float _b; float _c; } pc;
+
+float samp(vec3 p, ivec3 mx) {
+    p = clamp(p, vec3(0.0), vec3(mx));
+    ivec3 i = ivec3(floor(p));
+    vec3 f = p - vec3(i);
+    ivec3 j = min(i + ivec3(1), mx);
+    float v000 = imageLoad(phi_in, ivec3(i.x, i.y, i.z)).r;
+    float v100 = imageLoad(phi_in, ivec3(j.x, i.y, i.z)).r;
+    float v010 = imageLoad(phi_in, ivec3(i.x, j.y, i.z)).r;
+    float v110 = imageLoad(phi_in, ivec3(j.x, j.y, i.z)).r;
+    float v001 = imageLoad(phi_in, ivec3(i.x, i.y, j.z)).r;
+    float v101 = imageLoad(phi_in, ivec3(j.x, i.y, j.z)).r;
+    float v011 = imageLoad(phi_in, ivec3(i.x, j.y, j.z)).r;
+    float v111 = imageLoad(phi_in, ivec3(j.x, j.y, j.z)).r;
+    float a = mix(mix(v000, v100, f.x), mix(v010, v110, f.x), f.y);
+    float b = mix(mix(v001, v101, f.x), mix(v011, v111, f.x), f.y);
+    return mix(a, b, f.z);
+}
+
+void main() {
+    ivec3 c = ivec3(gl_GlobalInvocationID.xyz);
+    ivec3 mx = ivec3(pc.size.xyz) - ivec3(1);
+    if (c.x > mx.x || c.y > mx.y || c.z > mx.z) { return; }
+    vec3 v = imageLoad(vel, c).xyz;
+    imageStore(phi_out, c, vec4(samp(vec3(c) - v * pc.dt, mx), 0.0, 0.0, 0.0));
+}

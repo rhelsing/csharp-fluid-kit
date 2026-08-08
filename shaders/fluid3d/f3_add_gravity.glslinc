@@ -1,0 +1,51 @@
+#version 450
+
+// f3_add_gravity — f3_add_source with DIRECTIONAL gravity and a MOVABLE container. A FORK.
+//
+// Two changes, both needed the moment the fluid is a liquid in a vessel rather than smoke in a
+// box:
+//
+//  1. GRAVITY IS A VECTOR. Rotating a container does not move the world's gravity — it swings
+//     gravity's direction IN THE FLUID'S FRAME. The host passes g already transformed, so
+//     tilting the glass is what makes the liquid run downhill.
+//
+//  2. THE CONTAINER CAN ACCELERATE. In a non-inertial frame a moving vessel adds a pseudo-force
+//     -a to every parcel: shove the cup left and the liquid piles right. That is what "move the
+//     container and the liquid moves" actually is, and it is not the same as tilting.
+//
+// Force is proportional to DENSITY, not to a dye amount. That is what lets layers work: water,
+// oil and fog are one field holding rho, and (rho - rho_ambient) * g stratifies them without
+// any per-phase logic — heavy sinks, light rises, and they find their own levels.
+
+layout(local_size_x = 4, local_size_y = 4, local_size_z = 4) in;
+layout(rgba32f, set = 0, binding = 0) uniform image3D vel;
+layout(r32f,    set = 1, binding = 0) uniform image3D rho;
+
+layout(push_constant, std430) uniform P {
+    vec4  size;
+    vec4  grav;      // xyz = gravity+pseudo-force in the FLUID frame, w = strength
+    vec4  src;       // xyz = source centre, w = radius
+    vec4  inject;    // xyz = injected velocity, w = amount
+    vec4  misc;      // x = dt, y = ambient density (what counts as neutral)
+} p;
+
+void main() {
+    ivec3 c = ivec3(gl_GlobalInvocationID.xyz);
+    ivec3 mx = ivec3(p.size.xyz) - ivec3(1);
+    if (c.x > mx.x || c.y > mx.y || c.z > mx.z) { return; }
+
+    vec3 v = imageLoad(vel, c).xyz;
+    float d = imageLoad(rho, c).r;
+
+    // Buoyancy from DENSITY CONTRAST. Denser than ambient sinks along g, lighter rises against
+    // it — one line, and it is the whole layering mechanism.
+    v += p.grav.xyz * ((d - p.misc.y) * p.grav.w * p.misc.x);
+
+    vec3 rel = vec3(c) - p.src.xyz;
+    float g = exp(-dot(rel, rel) / max(1e-4, p.src.w * p.src.w));
+    v += p.inject.xyz * g;
+    d += p.inject.w * g;
+
+    imageStore(vel, c, vec4(v, 0.0));
+    imageStore(rho, c, vec4(clamp(d, 0.0, 4.0), 0.0, 0.0, 0.0));
+}

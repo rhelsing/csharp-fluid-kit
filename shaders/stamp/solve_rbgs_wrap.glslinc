@@ -10,22 +10,25 @@
 //
 // Identical to solve_rbgs.glslinc in every other respect (see it for the RBGS notes).
 
+// The ONLY difference from solve_rbgs is ST_NEIGHBOUR_WRAP instead of ST_NEIGHBOUR — the
+// toroidal rule now lives in the nd_* file with the rest of the topology, so it generalizes
+// to N axes for free. That is the half of §7d's "tiled storage" that already works: a
+// fixed-size grid scrolling over an infinite world, O(edge) to rescroll.
+
 void main() {
-    ivec2 c = ivec2(gl_GlobalInvocationID.xy);
-    ivec2 N = ivec2(pc.size);
-    if (c.x >= N.x || c.y >= N.y) {
+    ST_IVEC c = ST_CELL();
+    if (ST_OOB(c)) {
         return;
     }
 
-    if (((c.x + c.y) & 1) != PARITY) {
+    if (ST_PARITY(c) != PARITY) {
         imageStore(iter_out, c, imageLoad(iter_in, c));   // other colour: copy through
         return;
     }
 
-    const ivec2 offs[4] = ivec2[4](ivec2(1, 0), ivec2(-1, 0), ivec2(0, 1), ivec2(0, -1));
     float acc = st_rhs(c);
-    for (int k = 0; k < 4; k++) {
-        ivec2 n = (c + offs[k] + N) % N;
+    for (int k = 0; k < ST_NB; k++) {
+        ST_IVEC n = ST_NEIGHBOUR_WRAP(c, k);
         acc += st_conductance(c, n) * imageLoad(iter_in, n).r;
     }
     imageStore(iter_out, c, vec4(acc / st_diag(c), 0.0, 0.0, 0.0));

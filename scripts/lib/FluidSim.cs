@@ -31,17 +31,33 @@ public sealed class FluidSim
     private Rid _grad0, _grad1;
     private Rid _advD0, _advD1, _advD2;
 
+    // MacCormack (optional): second-order dye advection — pass 1 is the standard
+    // semi-Lagrangian, pass 2 corrects with the reverse round-trip error (limited).
+    private Rid _sMc, _pMc, _dyeC;
+    private Rid _mc0, _mc1, _mc2, _mc3;
+    private bool _mcReady;
+
+    // Viscosity (optional): implicit Jacobi diffusion of velocity, ping-ponged with
+    // the pre-diffusion field held fixed in _velC.
+    private Rid _sVisc, _pVisc, _velC;
+    private Rid _visc0, _viscAB1, _viscAB2, _viscBA1, _viscBA2;
+    private bool _viscReady;
+
     public bool Ready { get; private set; }
     public Rid DyeRid => _dyeA;
+    public Rid VelRid => _velA;
 
-    public FluidSim(RenderingDevice rd, Vector2I grid)
+    // addKernel swaps the source stage for this instance (its push constants are
+    // opaque to Step) — e.g. scene 18's fs_add_milk. extras compiles the MacCormack
+    // + viscosity stages; default false = the original pipeline, byte-identical.
+    public FluidSim(RenderingDevice rd, Vector2I grid, string addKernel = "fs_add_source", bool extras = false)
     {
         _rd = rd;
         _grid = grid;
         _gx = (uint)((grid.X - 1) / 8 + 1);
         _gy = (uint)((grid.Y - 1) / 8 + 1);
 
-        _sAdd = Compile("fs_add_source");
+        _sAdd = Compile(addKernel);
         _sAdvV = Compile("fs_advect_vel");
         _sDiv = Compile("fs_divergence");
         _sJac = Compile("fs_pressure_jacobi");
@@ -72,12 +88,39 @@ public sealed class FluidSim
         _grad0 = Set(_velA, _sGrad, 0); _grad1 = Set(_pA, _sGrad, 1);
         _advD0 = Set(_dyeA, _sAdvD, 0); _advD1 = Set(_velA, _sAdvD, 1); _advD2 = Set(_dyeB, _sAdvD, 2);
 
+        if (extras)
+        {
+            _sMc = Compile("fs_maccormack");
+            _sVisc = Compile("fs_diffuse_vel");
+            if (_sMc.IsValid)
+            {
+                _pMc = _rd.ComputePipelineCreate(_sMc);
+                _dyeC = MakeTex(r);
+                _mc0 = Set(_dyeA, _sMc, 0);   // φⁿ
+                _mc1 = Set(_dyeB, _sMc, 1);   // forward result
+                _mc2 = Set(_velA, _sMc, 2);
+                _mc3 = Set(_dyeC, _sMc, 3);
+                _mcReady = true;
+            }
+            if (_sVisc.IsValid)
+            {
+                _pVisc = _rd.ComputePipelineCreate(_sVisc);
+                _velC = MakeTex(rg);
+                _visc0 = Set(_velC, _sVisc, 0);                          // v₀ (fixed)
+                _viscAB1 = Set(_velA, _sVisc, 1); _viscAB2 = Set(_velB, _sVisc, 2);
+                _viscBA1 = Set(_velB, _sVisc, 1); _viscBA2 = Set(_velA, _sVisc, 2);
+                _viscReady = true;
+            }
+        }
+
         Ready = true;
     }
 
     // iters is forced even so the ping-ponged pressure ends back in _pA (which gradient
-    // subtract reads and which warm-starts next frame).
-    public void Step(byte[] addPc, byte[] advVPc, byte[] simPc, byte[] advDPc, int iters)
+    // subtract reads and which warm-starts next frame). viscIters/viscPc and macCormack
+    // engage the optional stages (ctor extras: true); defaults = the original pipeline.
+    public void Step(byte[] addPc, byte[] advVPc, byte[] simPc, byte[] advDPc, int iters,
+        int viscIters = 0, byte[]? viscPc = null, bool macCormack = false, byte[]? mcPc = null)
     {
         if (!Ready) { return; }
         if ((iters & 1) == 1) { iters++; }
@@ -89,6 +132,21 @@ public sealed class FluidSim
         // 2. self-advect velocity velA -> velB, then copy back so velA stays "current"
         RunOne(_pAdvV, advVPc, (_advV0, 0u), (_advV1, 1u));
         _rd.TextureCopy(_velB, _velA, Vector3.Zero, Vector3.Zero, size, 0, 0, 0, 0);
+
+        // 2b. (optional) implicit viscosity: v₀ → _velC, Jacobi ping-pong, ends in velA
+        if (_viscReady && viscIters > 0 && viscPc != null)
+        {
+            if ((viscIters & 1) == 1) { viscIters++; }
+            _rd.TextureCopy(_velA, _velC, Vector3.Zero, Vector3.Zero, size, 0, 0, 0, 0);
+            long vcl = _rd.ComputeListBegin();
+            for (int k = 0; k < viscIters; k++)
+            {
+                if (k % 2 == 0) { Bind(vcl, _pVisc, viscPc, (_visc0, 0u), (_viscAB1, 1u), (_viscAB2, 2u)); }
+                else { Bind(vcl, _pVisc, viscPc, (_visc0, 0u), (_viscBA1, 1u), (_viscBA2, 2u)); }
+                _rd.ComputeListAddBarrier(vcl);
+            }
+            _rd.ComputeListEnd();
+        }
 
         // 3. divergence -> K Jacobi pressure iters -> subtract gradient (one compute list)
         long cl = _rd.ComputeListBegin();
@@ -105,8 +163,19 @@ public sealed class FluidSim
         _rd.ComputeListEnd();
 
         // 4. advect dye by the divergence-free velocity, copy back
-        RunOne(_pAdvD, advDPc, (_advD0, 0u), (_advD1, 1u), (_advD2, 2u));
-        _rd.TextureCopy(_dyeB, _dyeA, Vector3.Zero, Vector3.Zero, size, 0, 0, 0, 0);
+        if (_mcReady && macCormack && mcPc != null)
+        {
+            // pass 1: standard SL forward (dissip 1 — real dissip applied in pass 2)
+            RunOne(_pAdvD, advDPc, (_advD0, 0u), (_advD1, 1u), (_advD2, 2u));
+            // pass 2: reverse round trip, limited half-error correction → dyeC → dyeA
+            RunOne(_pMc, mcPc, (_mc0, 0u), (_mc1, 1u), (_mc2, 2u), (_mc3, 3u));
+            _rd.TextureCopy(_dyeC, _dyeA, Vector3.Zero, Vector3.Zero, size, 0, 0, 0, 0);
+        }
+        else
+        {
+            RunOne(_pAdvD, advDPc, (_advD0, 0u), (_advD1, 1u), (_advD2, 2u));
+            _rd.TextureCopy(_dyeB, _dyeA, Vector3.Zero, Vector3.Zero, size, 0, 0, 0, 0);
+        }
     }
 
     private void RunOne(Rid pipe, byte[] pc, params (Rid set, uint idx)[] sets)
@@ -132,15 +201,16 @@ public sealed class FluidSim
             _add0, _add1, _advV0, _advV1, _div0, _div1,
             _jacAB0, _jacAB1, _jacAB2, _jacBA0, _jacBA1, _jacBA2,
             _grad0, _grad1, _advD0, _advD1, _advD2,
+            _mc0, _mc1, _mc2, _mc3, _visc0, _viscAB1, _viscAB2, _viscBA1, _viscBA2,
         })
         {
             if (s.IsValid) { _rd.FreeRid(s); }
         }
-        foreach (var t in new[] { _velA, _velB, _dyeA, _dyeB, _pA, _pB, _div })
+        foreach (var t in new[] { _velA, _velB, _dyeA, _dyeB, _pA, _pB, _div, _dyeC, _velC })
         {
             if (t.IsValid) { _rd.FreeRid(t); }
         }
-        foreach (var sh in new[] { _sAdd, _sAdvV, _sDiv, _sJac, _sGrad, _sAdvD })
+        foreach (var sh in new[] { _sAdd, _sAdvV, _sDiv, _sJac, _sGrad, _sAdvD, _sMc, _sVisc })
         {
             if (sh.IsValid) { _rd.FreeRid(sh); }
         }

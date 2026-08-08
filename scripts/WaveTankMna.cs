@@ -193,6 +193,24 @@ public partial class WaveTankMna : Node3D
     private readonly MeshInstance3D[] _walls = new MeshInstance3D[4];
     private FreeCam _cam = null!;
     private bool _flyCam;
+    // ---- SURF: the two knobs that make breaking waves ----
+    // _surf swaps stamp_wave_tank (linear, the control) for stamp_wave_surf. Changing it
+    // rebuilds the solver, same as changing grid — the stamp is compiled into the shader.
+    //
+    // Nonlinearity is the one that matters: the tank stamp's st_depth() reads the STATIC BED
+    // only, so the wave never learns how tall it is. A linear wave cannot steepen, so it
+    // cannot break, at any resolution with any solver (hypotheses.md H-W6). Turn this up and
+    // the front face sharpens as the wave shoals.
+    private bool _surf;
+    private float _nonlinearity = 1.0f;
+
+    // Aeration patch: waves crossing it slow and bend, because in this stamp wave speed IS the
+    // conductance (H-B2). Drag it into the breaking zone to see refraction.
+    private float _voidStrength;          // 0 = clear water
+    private float _voidX = 0.35f;         // normalized -1..1
+    private float _voidZ;
+    private float _voidR = 0.25f;
+
     private IStampSolver? _solver;
     // 0 Jacobi · 1 RBGS · 2 ADI · 3 CG · 4 Multigrid (uniform β) · 5 Multigrid (deep)
     // · 6 Schwarz (block-dense) · 7 Spectral (uniform depth)
@@ -219,6 +237,14 @@ public partial class WaveTankMna : Node3D
             // stamp from the ones that invert a uniform-depth stand-in (solver-ledger.md §7a).
             // It is the discriminating variable, so it has to be settable without the GUI.
             else if (a.StartsWith("bathy=")) { _bathyMix = Mathf.Clamp(a.Substring(6).ToFloat(), 0f, 1f); }
+            else if (a.StartsWith("surf=")) { _surf = a.Substring(5).ToInt() != 0; }
+            else if (a.StartsWith("nl=")) { _nonlinearity = a.Substring(3).ToFloat(); }
+            else if (a.StartsWith("aer=")) { _voidStrength = Mathf.Clamp(a.Substring(4).ToFloat(), 0f, 0.95f); }
+            // Wave HEIGHT is the nonlinearity knob — steepening scales with height/depth — and
+            // the scene's defaults (gain 0.021 of a 4.0 range) make waves far too small for it
+            // to show. Exposed so a surf run can open already tuned instead of hunting sliders.
+            else if (a.StartsWith("padgain=")) { _padGain = a.Substring(8).ToFloat(); }
+            else if (a.StartsWith("padstroke=")) { _padStroke = a.Substring(10).ToFloat(); }
         }
         if (_benchSecs > 0.0f)
         {
@@ -249,7 +275,9 @@ public partial class WaveTankMna : Node3D
         // Jacobi, red-black Gauss-Seidel and Conjugate Gradient.
         var rd = RenderingServer.GetRenderingDevice();
         var grid = new Vector2I(SimSize, SimSize);
-        const string stamp = "res://shaders/stamp/stamp_wave_tank.glslinc";
+        string stamp = _surf
+            ? "res://shaders/stamp/stamp_wave_surf.glslinc"
+            : "res://shaders/stamp/stamp_wave_tank.glslinc";
         _solver = _solverMode switch
         {
             2 => new AdiStampSolver(rd, grid, stamp),
@@ -268,6 +296,17 @@ public partial class WaveTankMna : Node3D
             8 => new SpectralSolver(rd, grid, stamp, SpectralSolver.Basis.Sine),
             _ => new GpuStampSolver(rd, grid, stamp, (GpuStampSolver.Mode)Mathf.Clamp(_solverMode, 0, 1)),
         };
+    }
+
+    // Grid and stamp are both compiled into the shader, so changing either means a fresh
+    // solver. Dropping the Texture2Drd rid first stops the surface sampling a freed texture
+    // for the frame or two before the render thread catches up.
+    private void RebuildSolver()
+    {
+        var old = _solver;
+        _solver = null;
+        _waterTex.TextureRdRid = default;
+        RenderingServer.CallOnRenderThread(Callable.From(() => { old?.Free(); InitSolver(); }));
     }
 
     // rise per unit x; the ramp spans x in [-1,1] so the shallow end sits 2*Slope above the base
@@ -695,12 +734,19 @@ public partial class WaveTankMna : Node3D
                 _floorBase, Slope, _waterLevel, _minDepth,
                 padOn ? pxOld : 0f, padOn ? pxNew : 0f, padW, padOn ? padG : 0f,
                 cAmp, cLobes, cphOld, cphNew,
-                mAmp, mLobes, mPhOld, mPhNew,
+                // SURF stamp spends the micro-paddle slots on the void/aeration patch, and
+                // extra.x on nonlinearity (see stamp_wave_surf.glslinc). Mutually exclusive
+                // with micro chop, which is why those are the slots it takes.
+                _surf ? _voidStrength : mAmp,
+                _surf ? _voidX : mLobes,
+                _surf ? _voidZ : mPhOld,
+                _surf ? _voidR : mPhNew,
                 drop ? (ddx * 0.5f + 0.5f) * SimSize : 0f,
                 drop ? (ddz * 0.5f + 0.5f) * SimSize : 0f,
                 Mathf.Max(1.0f, _rippleSize * halfN),
                 drop ? dds : 0f,
-                cSegs, (_spongePaddleWall ? 15f : 14f) + 16f * _leakMode, _bathyMix,
+                _surf ? _nonlinearity : cSegs,
+                (_spongePaddleWall ? 15f : 14f) + 16f * _leakMode, _bathyMix,
                 Mathf.Max(0.02f, _waterLevel - FloorY(-1.0f)),
             };
             var pcb = new byte[pcf.Length * sizeof(float)];
@@ -867,12 +913,31 @@ public partial class WaveTankMna : Node3D
         ui.AddOptions("Grid (sweep me)", new[] { "256²", "512²", "1024²" }, _gridIdx, i =>
         {
             _gridIdx = i;
-            var old = _solver;
-            _solver = null;
-            _waterTex.TextureRdRid = default;
-            RenderingServer.CallOnRenderThread(Callable.From(() => { old?.Free(); InitSolver(); }));
+            RebuildSolver();
             _waterMat.SetShaderParameter("sim_texel", 1.0f / SimSize);
         });
+
+        // ---- SURF ----
+        // The stamp is compiled into the shader, so switching it rebuilds the solver exactly
+        // like switching grid. Linear is the control: identical to every measurement in the
+        // ledger. Surf adds nonlinear depth + the aeration patch.
+        ui.AddOptions("Stamp", new[] { "Linear (tank)", "Surf (nonlinear + void)" }, _surf ? 1 : 0, i =>
+        {
+            _surf = i == 1;
+            RebuildSolver();
+        });
+        // THE knob. 0 = the shipped linear operator, where the wave never learns how tall it
+        // is and therefore cannot steepen or break. 1 = full physical nonlinearity: depth is
+        // bed + surface, so the crest outruns the trough and the front face sharpens.
+        // Strongest on a SLOPING bed — shoaling raises amplitude and lowers depth together.
+        // Raise "Bathymetry coupling" and the slope angle with it.
+        ui.AddSlider("Surf · nonlinearity (0 = linear)", 0.0f, 1.5f, _nonlinearity, v => _nonlinearity = v);
+        // Aeration: waves crossing the patch slow and bend. Wave speed IS the conductance here,
+        // so this is a real medium change, not a damping hack.
+        ui.AddSlider("Surf · aeration strength", 0.0f, 0.95f, _voidStrength, v => _voidStrength = v);
+        ui.AddSlider("Surf · aeration X", -1.0f, 1.0f, _voidX, v => _voidX = v);
+        ui.AddSlider("Surf · aeration Z", -1.0f, 1.0f, _voidZ, v => _voidZ = v);
+        ui.AddSlider("Surf · aeration radius", 0.02f, 1.0f, _voidR, v => _voidR = v);
         ui.AddOptions("Solver", new[]
         {
             "Jacobi", "RBGS", "ADI (line)", "CG",

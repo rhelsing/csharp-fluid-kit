@@ -1,33 +1,51 @@
-#version 450
-// mg_prolong — interpolate a coarse correction up to the fine grid and ADD it to the
-// fine iterate (u_fine += bilinear(u_coarse)). Dispatched over the FINE grid.
+// mg_prolong — interpolate a coarse correction up to the fine grid and ADD it to the fine
+// iterate (u_fine += d-linear(u_coarse)). Dispatched over the FINE grid.
 // u_coarse = set 2, u_fine (in place) = set 3.
-
-layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
-
-layout(r32f, set = 2, binding = 0) uniform image2D u_coarse;
-layout(r32f, set = 3, binding = 0) uniform image2D u_fine;
-
-layout(push_constant, std430) uniform P {
-    vec2 fine_size;
-    vec2 coarse_size;
-} pc;
+//
+// DIMENSION-GENERIC (solver-ledger.md §7d): bilinear in 2D, TRILINEAR in 3D, one file.
+//
+// The interpolation is written as a CORNER GATHER followed by an axis-by-axis fold, not as a
+// weighted sum of 2^d products. Both are algebraically d-linear; only the fold reproduces the
+// 2D `mix(mix(a,b,tx), mix(d,e,tx), ty)` association EXACTLY, and float addition is not
+// associative — a weighted-sum form would shift the 2D multigrid residual in the last bits
+// and destroy the regression oracle this refactor is verified against. Folding axis 0 first
+// pairs corners k and k+1 (bit 0 = axis 0), which is precisely the inner `mix` over x.
+//
+// Host must supply, before this body: #version, local_size, the two r32f images (u_coarse @
+// set 2, u_fine @ set 3), and a push constant named `pc` with `fine_size` then `coarse_size`
+// (vec2 each in 2D, vec4 each in 3D).
 
 void main() {
-    ivec2 f = ivec2(gl_GlobalInvocationID.xy);
-    ivec2 fmx = ivec2(pc.fine_size) - ivec2(1);
-    if (f.x > fmx.x || f.y > fmx.y) {
+    ST_IVEC f = ST_CELL();
+    ST_IVEC fmx = ST_EXTENT(pc.fine_size) - ST_IVEC(1);
+    if (any(greaterThan(f, fmx))) {
         return;
     }
-    ivec2 cmx = ivec2(pc.coarse_size) - ivec2(1);
-    vec2 cc = (vec2(f) + 0.5) * 0.5 - 0.5;          // fine → coarse coordinate
-    ivec2 c0 = ivec2(floor(cc));
-    vec2 t = cc - vec2(c0);
-    ivec2 a = clamp(c0, ivec2(0), cmx);
-    ivec2 b = clamp(c0 + ivec2(1, 0), ivec2(0), cmx);
-    ivec2 d = clamp(c0 + ivec2(0, 1), ivec2(0), cmx);
-    ivec2 e = clamp(c0 + ivec2(1, 1), ivec2(0), cmx);
-    float v = mix(mix(imageLoad(u_coarse, a).r, imageLoad(u_coarse, b).r, t.x),
-                  mix(imageLoad(u_coarse, d).r, imageLoad(u_coarse, e).r, t.x), t.y);
-    imageStore(u_fine, f, vec4(imageLoad(u_fine, f).r + v, 0.0, 0.0, 0.0));
+    ST_IVEC cmx = ST_EXTENT(pc.coarse_size) - ST_IVEC(1);
+
+    ST_VEC cc = (ST_VEC(f) + 0.5) * 0.5 - 0.5;      // fine → coarse coordinate
+    ST_IVEC c0 = ST_IVEC(floor(cc));
+    ST_VEC t = cc - ST_VEC(c0);
+
+    float v[ST_CORNERS];
+    for (int k = 0; k < ST_CORNERS; k++) {
+        v[k] = imageLoad(u_coarse, clamp(c0 + ST_BIT_OFFSET(k), ST_IVEC(0), cmx)).r;
+    }
+
+    // Fold one axis at a time, halving the live set each pass. Unrolled per dimension rather
+    // than looped over t[i]: dynamic vector indexing emits OpVectorExtractDynamic, which some
+    // pipeline paths reject (the same reason pass_boundary.glsl unrolls its components).
+    v[0] = mix(v[0], v[1], t.x);
+    v[1] = mix(v[2], v[3], t.x);
+#if ST_DIM == 3
+    v[2] = mix(v[4], v[5], t.x);
+    v[3] = mix(v[6], v[7], t.x);
+#endif
+    v[0] = mix(v[0], v[1], t.y);
+#if ST_DIM == 3
+    v[1] = mix(v[2], v[3], t.y);
+    v[0] = mix(v[0], v[1], t.z);
+#endif
+
+    imageStore(u_fine, f, vec4(imageLoad(u_fine, f).r + v[0], 0.0, 0.0, 0.0));
 }

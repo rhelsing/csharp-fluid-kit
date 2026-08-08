@@ -1,0 +1,47 @@
+#version 450
+
+// fhn_tips.glslinc — scene 49: spiral-TIP detection — the third system on the
+// winding-number primitive (after scene 51's swell defects and eddy cores). The
+// excitation cycle traces a loop in (u,v) phase space; around a spiral CORE the
+// phase atan2(v−v₀, u−u₀) winds ±2π on a 2×2 plaquette. Sign = chirality
+// (written as ±gain so the display can colour CW vs CCW differently).
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(rg16f, set = 0, binding = 0) uniform image2D state_in;
+layout(r16f, set = 1, binding = 0) uniform image2D tips_out;
+
+layout(push_constant, std430) uniform Params {
+    vec2  size;
+    float u0;      // phase centre (≈ the rest state / limit-cycle centre)
+    float v0;
+    float thresh;  // |winding| rad
+    float gain;
+    float _p0;
+    float _p1;
+} pc;
+
+float wrap_pi(float a) {
+    return a - 6.2831853 * floor((a + 3.14159265) / 6.2831853);
+}
+
+float ph(ivec2 c, ivec2 mx) {
+    vec2 s = imageLoad(state_in, clamp(c, ivec2(0), mx)).rg;
+    return atan(s.g - pc.v0, s.r - pc.u0);
+}
+
+void main() {
+    ivec2 c = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 N = ivec2(pc.size);
+    if (c.x >= N.x || c.y >= N.y) {
+        return;
+    }
+    ivec2 mx = N - ivec2(1);
+    float t00 = ph(c, mx);
+    float t10 = ph(c + ivec2(1, 0), mx);
+    float t11 = ph(c + ivec2(1, 1), mx);
+    float t01 = ph(c + ivec2(0, 1), mx);
+    float w = wrap_pi(t10 - t00) + wrap_pi(t11 - t10) + wrap_pi(t01 - t11) + wrap_pi(t00 - t01);
+    float o = abs(w) > pc.thresh ? sign(w) * pc.gain : 0.0;
+    imageStore(tips_out, c, vec4(o, 0.0, 0.0, 0.0));
+}

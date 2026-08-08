@@ -1,0 +1,175 @@
+// stamp_wave_surf.glslinc — the wave tank with the two knobs that make surf: NONLINEAR DEPTH
+// and a positionable VOID (aeration) patch. Scene 25's "Surf" stamp.
+//
+// A FORK of stamp_wave_tank, which stays untouched as the linear control — same discipline as
+// MgvSolver/MgDeepSolver (solver-ledger.md §7a). Everything from the parent is here verbatim:
+// bed ramp, per-face depth conductance, sponge edges, all six DC modes, paddle, macro wave,
+// drop. Two things are added and one is spent.
+//
+// ── 1. NONLINEAR DEPTH (H-W6, confirmed) ────────────────────────────────────────────────
+//     parent:  depth = bed(x)                      <- STATIC. The wave never learns its height.
+//     surf:    depth = bed(x) + nl * h_curr(c)     <- total water column
+//
+// Shallow-water speed is c = sqrt(g*h), so with total depth the CREST (deeper water) outruns
+// the TROUGH. The front face steepens, goes vertical, and in the real world overturns. With
+// static depth every part travels at one speed and the profile is preserved forever: a linear
+// wave cannot steepen, so it cannot break, at ANY resolution with ANY solver. Measured on a
+// FLAT bed: max|dh/dx| growth 1.130 (nl=0) -> 1.409 (nl=1). On the tank's SLOPING bed it
+// should be stronger, because shoaling raises amplitude and lowers depth at the same time and
+// nonlinearity scales with the ratio of the two.
+//
+// No Newton loop: h_curr is constant across a Step(), so every sweep re-linearizes against the
+// same state — a frozen-coefficient (Picard) scheme, re-linearized once per tick, free.
+//
+// ── 2. VOID / AERATION PATCH (H-B2, confirmed) ──────────────────────────────────────────
+// Aerated water is a different medium — ~1% void fraction drops sound speed from ~1500 to
+// ~100 m/s. Here wave speed IS the conductance, so aeration is a conductance field. A gaussian
+// patch you can drag around with sliders; waves crossing it slow and bend. Measured refraction
+// follows sqrt(1/mul) with the control exact.
+//
+// ── 3. WHAT IT COSTS: the micro paddle ──────────────────────────────────────────────────
+// The push layout is byte-identical to stamp_wave_tank so every host, solver and bench drives
+// it unchanged. The new fields ride in slots the parent spends on the MICRO paddle, which is a
+// secondary chop detail and mutually exclusive with a surf experiment:
+//     extra.x  = nonlinearity strength   (parent: micro segment count)
+//     micro.x  = void strength, 0 = clear (parent: micro amplitude)
+//     micro.y  = void centre x, normalized -1..1
+//     micro.z  = void centre z, normalized -1..1
+//     micro.w  = void radius, normalized
+// Same documented slot-sharing the parent already does for DC mode 3 vs leak.
+
+layout(r32f, set = 0, binding = 0) uniform image2D h_curr;
+layout(r32f, set = 1, binding = 0) uniform image2D h_prev;
+
+layout(push_constant, std430) uniform Params {
+    vec2  size;
+    float beta_scale;
+    float a;
+
+    float leak;
+    float cn;
+    float sponge_w;
+    float sponge_a;
+
+    float floor_base;
+    float slope;
+    float water_level;
+    float min_depth;
+
+    vec4  paddle;       // x = face x_old, y = x_new, z = reach, w = gain
+    vec4  macro;        // amp, lobes, phase_old, phase_new
+    vec4  micro;        // VOID: strength, centre x, centre z, radius
+    vec4  drop;         // xy = centre px, z = radius px, w = strength
+    vec4  extra;        // x = NONLINEARITY, y = edge mask | DC mode << 4,
+                        // z = bathymetry coupling, w = ref depth
+} pc;
+
+const float ST_PI = 3.141592653589793;
+
+int st_dc_mode() { return int(pc.extra.y + 0.5) >> 4; }
+int st_edge_mask() { return int(pc.extra.y + 0.5) & 15; }
+
+float st_x(ivec2 c) { return (float(c.x) + 0.5) / pc.size.x * 2.0 - 1.0; }
+float st_z(ivec2 c) { return (float(c.y) + 0.5) / pc.size.y * 2.0 - 1.0; }
+
+// ---- the medium ----
+// Aeration multiplies the local depth down: a gaussian patch of "how much air is in the water".
+float st_void(ivec2 c) {
+    if (pc.micro.x <= 0.0) {
+        return 1.0;
+    }
+    vec2 d = vec2(st_x(c) - pc.micro.y, st_z(c) - pc.micro.z);
+    float r = max(1.0e-3, pc.micro.w);
+    float g = exp(-dot(d, d) / (r * r));
+    return max(0.02, 1.0 - clamp(pc.micro.x, 0.0, 1.0) * g);
+}
+
+float st_depth(ivec2 c) {
+    float bed = max(pc.min_depth, pc.water_level - (pc.floor_base + pc.slope * (st_x(c) + 1.0)));
+    float d = mix(pc.extra.w, bed, clamp(pc.extra.z, 0.0, 1.0));
+    d += pc.extra.x * imageLoad(h_curr, c).r;      // total water column — the breaking term
+    d *= st_void(c);                                // aeration — the medium term
+    return max(pc.min_depth, d);
+}
+
+float st_beta_face(ivec2 c, ivec2 n) {
+    return pc.beta_scale * 0.5 * (st_depth(c) + st_depth(n));
+}
+
+// ---- losses (parent, verbatim) ----
+float st_sponge(ivec2 c) {
+    vec2 mxf = pc.size - vec2(1.0);
+    int m = st_edge_mask();
+    float d = 1.0e9;
+    if ((m & 1) != 0) { d = min(d, float(c.x)); }
+    if ((m & 2) != 0) { d = min(d, mxf.x - float(c.x)); }
+    if ((m & 4) != 0) { d = min(d, float(c.y)); }
+    if ((m & 8) != 0) { d = min(d, mxf.y - float(c.y)); }
+    float t = clamp(1.0 - d / max(pc.sponge_w, 1.0), 0.0, 1.0);
+    return t * t;
+}
+
+float st_damp(ivec2 c) { return pc.a + pc.sponge_a * st_sponge(c); }
+float st_leak(ivec2 c) {
+    float k = (st_dc_mode() == 3) ? 0.0 : pc.leak;
+    return k + pc.sponge_a * st_sponge(c);
+}
+
+// ---- the stamp ----
+float st_conductance(ivec2 c, ivec2 n) {
+    return (1.0 - 0.5 * pc.cn) * st_beta_face(c, n);
+}
+
+float st_diag(ivec2 c) {
+    float sum = 0.0;
+    for (int k = 0; k < ST_NB; k++) {
+        sum += st_beta_face(c, ST_NEIGHBOUR(c, k));
+    }
+    return 1.0 + st_damp(c) + (1.0 - 0.5 * pc.cn) * (sum + st_leak(c));
+}
+
+float st_rhs(ivec2 c) {
+    float hc = imageLoad(h_curr, c).r;
+    float hp = imageLoad(h_prev, c).r;
+
+    float dhp = 0.0;
+    float sum = 0.0;
+    for (int k = 0; k < ST_NB; k++) {
+        ST_IVEC n = ST_NEIGHBOUR(c, k);
+        float bf = st_beta_face(c, n);
+        dhp += bf * imageLoad(h_prev, n).r;
+        sum += bf;
+    }
+    dhp -= (sum + st_leak(c)) * hp;
+
+    float force = 0.0;
+
+    if (pc.drop.w != 0.0) {
+        vec2 d = vec2(c) - pc.drop.xy;
+        force += pc.drop.w * exp(-dot(d, d) / (pc.drop.z * pc.drop.z));
+    }
+
+    // Paddle: macro wave only. The micro paddle's slots are the void field in this stamp.
+    if (pc.paddle.w != 0.0) {
+        float x = st_x(c);
+        float z = st_z(c);
+        float face_old = pc.paddle.x + pc.macro.x * sin(pc.macro.y * ST_PI * z + pc.macro.z);
+        float face_new = pc.paddle.y + pc.macro.x * sin(pc.macro.y * ST_PI * z + pc.macro.w);
+        float reach = max(1.0e-4, pc.paddle.z);
+        float sd = x - face_new;
+        float dist = abs(sd);
+        if (dist < reach) {
+            float w;
+            if (st_dc_mode() == 5) {
+                w = sin(ST_PI * dist / reach) * sign(sd);
+            } else {
+                w = 0.5 + 0.5 * cos(ST_PI * dist / reach);
+            }
+            force += (face_new - face_old) * pc.paddle.w * w;
+        }
+    }
+
+    if (st_dc_mode() == 3) { force -= pc.leak; }
+
+    return 2.0 * (hc + force) - hp + st_damp(c) * hp + (0.5 * pc.cn) * dhp;
+}

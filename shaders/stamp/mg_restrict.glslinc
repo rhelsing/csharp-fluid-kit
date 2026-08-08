@@ -1,30 +1,32 @@
-#version 450
-// mg_restrict — transfer a fine-grid field to the next coarser grid by 2×2 averaging
-// (full-weighting-ish). Dispatched over the COARSE grid: coarse cell c gathers fine
-// cells 2c, 2c+x, 2c+y, 2c+xy. r_fine = set 2, r_coarse = set 3.
-
-layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
-
-layout(r32f, set = 2, binding = 0) uniform image2D r_fine;
-layout(r32f, set = 3, binding = 0) uniform image2D r_coarse;
-
-layout(push_constant, std430) uniform P {
-    vec2 coarse_size;
-    vec2 fine_size;
-} pc;
+// mg_restrict — transfer a fine-grid field to the next coarser grid by 2^d averaging
+// (full-weighting-ish). Dispatched over the COARSE grid: coarse cell c gathers the 2^d fine
+// cells at 2c + {0,1}^d. r_fine = set 2, r_coarse = set 3.
+//
+// DIMENSION-GENERIC (solver-ledger.md §7d). 2x2 in 2D, 2x2x2 in 3D, from one file: the
+// gather set is ST_BIT_OFFSET over ST_CORNERS and the divisor is ST_CORNERS.
+//
+// The 2D path is BIT-IDENTICAL to the hand-written version it replaces. The old form was
+// 0.25*(((a+b)+c)+d); the loop accumulates from 0.0 in the same order (0.0+a == a exactly)
+// and divides by 4.0 instead of multiplying by 0.25 — both exact powers of two. That matters:
+// the residual column is the regression oracle for this whole refactor, so restriction had
+// to stay exact rather than merely equivalent.
+//
+// Host must supply, before this body: #version, local_size, the two r32f images (r_fine @
+// set 2, r_coarse @ set 3), and a push constant named `pc` with `coarse_size` then
+// `fine_size` (vec2 each in 2D, vec4 each in 3D).
 
 void main() {
-    ivec2 c = ivec2(gl_GlobalInvocationID.xy);
-    ivec2 cmx = ivec2(pc.coarse_size) - ivec2(1);
-    if (c.x > cmx.x || c.y > cmx.y) {
+    ST_IVEC c = ST_CELL();
+    ST_IVEC cmx = ST_EXTENT(pc.coarse_size) - ST_IVEC(1);
+    if (any(greaterThan(c, cmx))) {
         return;
     }
-    ivec2 fmx = ivec2(pc.fine_size) - ivec2(1);
-    ivec2 f = c * 2;
-    float v = 0.25 * (
-        imageLoad(r_fine, min(f, fmx)).r +
-        imageLoad(r_fine, min(f + ivec2(1, 0), fmx)).r +
-        imageLoad(r_fine, min(f + ivec2(0, 1), fmx)).r +
-        imageLoad(r_fine, min(f + ivec2(1, 1), fmx)).r);
-    imageStore(r_coarse, c, vec4(v, 0.0, 0.0, 0.0));
+    ST_IVEC fmx = ST_EXTENT(pc.fine_size) - ST_IVEC(1);
+    ST_IVEC f = c * 2;
+
+    float acc = 0.0;
+    for (int k = 0; k < ST_CORNERS; k++) {
+        acc += imageLoad(r_fine, min(f + ST_BIT_OFFSET(k), fmx)).r;
+    }
+    imageStore(r_coarse, c, vec4(acc / float(ST_CORNERS), 0.0, 0.0, 0.0));
 }

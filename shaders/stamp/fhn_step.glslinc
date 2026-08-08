@@ -1,0 +1,54 @@
+#version 450
+
+// fhn_step.glslinc — scene 49: one explicit Euler step of FitzHugh–Nagumo excitable
+// media (science_boi chiral_spirals lift, docs/science-boi-lift.md):
+//     u̇ = D∇²u + u − u³/3 − v      (fast activator — diffuses)
+//     v̇ = ε(u + a − b·v)           (slow inhibitor — local)
+// R = u, G = v in one ping-pong RG16F pair. Neumann (clamped) boundaries.
+// A poke excites u locally — poke into another wave's refractory tail and the broken
+// front curls into a rotating spiral. No solver: the medium IS the computer.
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(rg16f, set = 0, binding = 0) uniform image2D state_in;
+layout(rg16f, set = 1, binding = 0) uniform image2D state_out;
+
+layout(push_constant, std430) uniform Params {
+    vec2  size;
+    float du;      // activator diffusion
+    float dt;
+    float eps;     // inhibitor rate (small = long refractory tail)
+    float a;
+    float b;
+    float drop_x;  // poke centre (px)
+    float drop_y;
+    float drop_r;  // poke radius (px)
+    float drop_w;  // poke strength on u (0 = none)
+    float _p0;
+} pc;
+
+void main() {
+    ivec2 c = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 N = ivec2(pc.size);
+    if (c.x >= N.x || c.y >= N.y) {
+        return;
+    }
+    ivec2 mx = N - ivec2(1);
+
+    vec2 s = imageLoad(state_in, c).rg;
+    float lap = imageLoad(state_in, clamp(c + ivec2(1, 0), ivec2(0), mx)).r
+              + imageLoad(state_in, clamp(c + ivec2(-1, 0), ivec2(0), mx)).r
+              + imageLoad(state_in, clamp(c + ivec2(0, 1), ivec2(0), mx)).r
+              + imageLoad(state_in, clamp(c + ivec2(0, -1), ivec2(0), mx)).r
+              - 4.0 * s.r;
+
+    float force = 0.0;
+    if (pc.drop_w != 0.0) {
+        vec2 d = vec2(c) - vec2(pc.drop_x, pc.drop_y);
+        force = pc.drop_w * exp(-dot(d, d) / max(pc.drop_r * pc.drop_r, 1e-3));
+    }
+
+    float u = s.r + pc.dt * (pc.du * lap + s.r - s.r * s.r * s.r / 3.0 - s.g) + force;
+    float v = s.g + pc.dt * pc.eps * (s.r + pc.a - pc.b * s.g);
+    imageStore(state_out, c, vec4(clamp(u, -3.0, 3.0), clamp(v, -3.0, 3.0), 0.0, 0.0));
+}

@@ -1,0 +1,69 @@
+// nd_2d.glslinc — the CONNECTIVITY half of the stamp contract, 2D instance.
+//
+// solver-ledger.md §7d, option B. The stamp already owned the OPERATOR
+// (st_diag / st_conductance / st_rhs); it did not own the TOPOLOGY, which was hardcoded as
+// `const ivec2 offs[4]` in all eight solve bodies. That is the one line that made 3D a
+// forked copy (`shaders/stamp3d/`) instead of a parameter, and it is the property the
+// original cmajor MNA never lost — there, adjacency is two integer node ids
+// (solver-ledger.md §1a).
+//
+// WHY MACROS AND NOT FUNCTIONS. The helpers reference `pc.size`, which is declared inside
+// the stamp; the stamp's own st_diag/st_rhs need the offsets. Functions would be circular.
+// Macros expand at the use site, so this whole block can sit BEFORE the stamp and both
+// directions resolve. Cost is zero — the loop unrolls exactly as the hardcoded version did.
+//
+// WHY B AND NOT "ivec3 EVERYWHERE, z=0". Compiling two variants from one source is the
+// mechanism `PARITY` already uses for RBGS red/black, and it guarantees the 2D path emits
+// byte-identical code. The 2D path is the one that ships; it does not get put at risk to
+// make the 3D path tidy.
+//
+// SWAPPING DIMENSION is now a host argument: concatenate nd_3d.glslinc instead of this file
+// (see IStampSolver hosts, `ndPath`). Nothing else in the solve bodies changes.
+//
+// SCOPE: 2D and 3D. 4D is deliberately not designed for (user, this session) — ST_NB is just
+// a number so it is not forbidden, but nothing here is complicated to anticipate it.
+
+#define ST_DIM  2
+#define ST_NB   4
+#define ST_IVEC ivec2
+
+const ivec2 ST_OFFS[ST_NB] = ivec2[ST_NB](
+    ivec2( 1,  0),
+    ivec2(-1,  0),
+    ivec2( 0,  1),
+    ivec2( 0, -1));
+
+#define ST_CELL()            ivec2(gl_GlobalInvocationID.xy)
+#define ST_SIZE()            ivec2(pc.size)
+#define ST_MAX()             (ivec2(pc.size) - ivec2(1))
+#define ST_OOB(c)            ((c).x > ST_MAX().x || (c).y > ST_MAX().y)
+
+// Checkerboard colour, for red-black ordering. Sums every axis so the colouring stays a
+// true bipartite split of the ST_NB-neighbour graph in any dimension.
+#define ST_PARITY(c)         (((c).x + (c).y) & 1)
+
+// Neumann / reflective walls — the boundary condition every solve body has always used.
+#define ST_NEIGHBOUR(c, k)   clamp((c) + ST_OFFS[k], ivec2(0), ST_MAX())
+
+// Flattened addressing, for the ELEMENTWISE kernels (CG's saxpy and dot). Those walk the
+// field as one linear run rather than a lattice — they have no neighbours and no stencil —
+// so cell count and linear-index→cell are all the topology they need.
+#define ST_TOTAL()           (uint(pc.size.x) * uint(pc.size.y))
+#define ST_FROM_LINEAR(t)    ivec2(int((t) % uint(pc.size.x)), \
+                                   int((t) / uint(pc.size.x)))
+
+// ---- multigrid grid transfer -------------------------------------------------
+// Restriction and prolongation are the only kernels that straddle TWO grids, so they carry
+// their own extents rather than reading pc.size. ST_EXTENT converts whichever vector type
+// the host declared (vec2 here, vec4 in 3D) into a cell index.
+#define ST_VEC               vec2
+#define ST_EXTENT(v)         ivec2(v)
+
+// The 2^ST_DIM corners of a cell, indexed by the bits of k: bit i selects axis i. Gives
+// restriction its gather set and prolongation its interpolation stencil in any dimension.
+#define ST_CORNERS           4
+#define ST_BIT_OFFSET(k)     ivec2((k) & 1, ((k) >> 1) & 1)
+
+// Toroidal addressing for a world-anchored scrolling window (scene 50; the seam is parked
+// inside the absorbing sponge — mna-next-steps.md §2.5). Generalizes to N axes unchanged.
+#define ST_NEIGHBOUR_WRAP(c, k)  (((c) + ST_OFFS[k] + ST_SIZE()) % ST_SIZE())

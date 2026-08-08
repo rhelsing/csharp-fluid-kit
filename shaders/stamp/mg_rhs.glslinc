@@ -4,15 +4,15 @@
 // `requires (48) bytes ... supplied: (128)` against a richer stamp. Now it just calls
 // st_rhs(c), so it inherits whatever sources/terms the stamp defines.
 //
-// The stamp declares h_curr (set 0), h_prev (set 1) and the push constant; this body adds
-// only the output image. Host must compile it as: "#version 450" + local_size + stamp + this.
-
-layout(r32f, set = 3, binding = 0) uniform image2D b0;
+// DIMENSION-GENERIC (solver-ledger.md §7d): the cell math goes through ST_CELL / ST_OOB, and
+// the b0 image declaration moved to the host so the image type can be 2D or 3D.
+//
+// The stamp declares h_curr (set 0), h_prev (set 1) and the push constant. Host must compile
+// as: "#version 450" + local_size + `b0` @ set 3 + nd + stamp + this.
 
 void main() {
-    ivec2 c = ivec2(gl_GlobalInvocationID.xy);
-    ivec2 mx = ivec2(pc.size) - ivec2(1);
-    if (c.x > mx.x || c.y > mx.y) {
+    ST_IVEC c = ST_CELL();
+    if (ST_OOB(c)) {
         return;
     }
     imageStore(b0, c, vec4(st_rhs(c), 0.0, 0.0, 0.0));

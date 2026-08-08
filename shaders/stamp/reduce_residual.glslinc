@@ -11,16 +11,14 @@ layout(std430, set = 4, binding = 0) buffer Partials { float partial[]; };
 shared float sdata[64];   // local_size 8*8 = 64
 
 void main() {
-    ivec2 c = ivec2(gl_GlobalInvocationID.xy);
-    ivec2 mx = ivec2(pc.size) - ivec2(1);
+    ST_IVEC c = ST_CELL();
 
     float r2 = 0.0;
-    if (c.x <= mx.x && c.y <= mx.y) {
-        const ivec2 offs[4] = ivec2[4](ivec2(1, 0), ivec2(-1, 0), ivec2(0, 1), ivec2(0, -1));
+    if (!ST_OOB(c)) {
         float x = imageLoad(iter_in, c).r;
         float off = 0.0;
-        for (int k = 0; k < 4; k++) {
-            ivec2 n = clamp(c + offs[k], ivec2(0), mx);
+        for (int k = 0; k < ST_NB; k++) {
+            ST_IVEC n = ST_NEIGHBOUR(c, k);
             off += st_conductance(c, n) * imageLoad(iter_in, n).r;
         }
         float r = st_rhs(c) + off - st_diag(c) * x;
@@ -37,7 +35,10 @@ void main() {
         barrier();
     }
     if (li == 0u) {
-        uint wg = gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x;
+        // Linear workgroup index, dimension-safe: in 2D the z terms are 0 and 1 so this
+        // reduces exactly to y*numX + x. The host sizes the partials buffer the same way.
+        uint wg = (gl_WorkGroupID.z * gl_NumWorkGroups.y + gl_WorkGroupID.y) * gl_NumWorkGroups.x
+                + gl_WorkGroupID.x;
         partial[wg] = sdata[0];
     }
 }

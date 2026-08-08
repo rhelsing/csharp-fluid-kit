@@ -62,7 +62,11 @@ public sealed class AdiStampSolver : IStampSolver
         _rgy = (uint)((grid.Y - 1) / 8 + 1);
         _numWg = _rgx * _rgy;
 
-        string stamp = FileAccess.GetFileAsString(stampPath);
+        // Topology block ahead of the stamp — the stamp's st_diag/st_rhs use ST_NB /
+        // ST_NEIGHBOUR now (solver-ledger.md §7d). ADI's own line sweep is still explicitly
+        // 2-axis (AXIS 0 / AXIS 1); generalizing THAT is a separate job from the contract.
+        string stamp = FileAccess.GetFileAsString(GpuStampSolver.Nd2DPath) + "\n"
+                     + FileAccess.GetFileAsString(stampPath);
         string body = FileAccess.GetFileAsString(AdiBodyPath);
         if (string.IsNullOrEmpty(stamp) || string.IsNullOrEmpty(body))
         {

@@ -51,7 +51,7 @@ public partial class PoolCxm : Node3D
     private DirectionalLight3D _plainSun = null!;
     private ArrayMesh _rtPoolMesh = null!, _plainPoolMesh = null!;
 
-    private float _pokeStrength = 0.06f;
+    private float _pokeStrength = 0.066f;
     private bool _auto = true;
     private float _pokeT;
     private int _pokeI;
@@ -67,7 +67,7 @@ public partial class PoolCxm : Node3D
     // as Dattorro wrote them. At 3600 Hz the longest delay is ~2 s.
     private float _tankRate = 3600.0f;
     private bool _tankOn = true;
-    private float _tankGain = 1.0f;
+    private float _tankGain = 20.0f;
     private float _tankDrive = 1.0f;
     private double _tankAcc;
     private float _lastTankOut;
@@ -437,7 +437,7 @@ public partial class PoolCxm : Node3D
             + "cost from solver cost. Auto-pokes; LEFT-CLICK to poke.");
         _readout = ui.AddReadout("— fps");
         ui.AddToggle("Auto-poke", _auto, v => _auto = v);
-        ui.AddSlider("Poke strength", 0.005f, 0.3f, _pokeStrength, v => _pokeStrength = v);
+        ui.AddSlider("Poke strength", 0.005f, 1.0f, _pokeStrength, v => _pokeStrength = v);
 
         ui.AddSection("CXM tank");
         ui.AddToggle("Tank on", _tankOn, v => { _tankOn = v; if (!v) { _tank.Reset(); } });
@@ -448,7 +448,7 @@ public partial class PoolCxm : Node3D
             _tank.SetDamping(4000.0f * v / 48000.0f);
             _tank.SetCrossover(362.0f * v / 48000.0f);
         });
-        ui.AddSlider("Return gain", 0.0f, 10.0f, _tankGain, v => _tankGain = v);
+        ui.AddSlider("Return gain", 0.0f, 200.0f, _tankGain, v => _tankGain = v);
         ui.AddSlider("Drive", 0.0f, 4.0f, _tankDrive, v => _tankDrive = v);
         ui.AddSlider("Pre-delay (ms)", 0.0f, 2000.0f, 0.0f, v => _tank.SetPreDelayMs(v));
         ui.AddOptions("Type", new[] { "Room", "Plate", "Hall" }, 2, v => _tank.SetType(v));

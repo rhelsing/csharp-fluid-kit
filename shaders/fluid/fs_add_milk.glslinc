@@ -1,0 +1,57 @@
+#version 450
+// fs_add_milk — scene 18's source pass: POUR (dye + radial splash where the stream
+// hits the surface) + STIR (directional velocity along the mouse drag) + signed
+// Boussinesq drift (density contrast: − sinks like cold milk, + rises like crema).
+// The drift force scales with dye concentration, so it fades as the milk dilutes —
+// the "heavier-then-lighter as it mixes" behaviour, for free.
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+layout(rg32f, set = 0, binding = 0) uniform image2D vel;   // in-place (vx,vy)
+layout(r32f,  set = 1, binding = 0) uniform image2D dye;   // in-place
+
+layout(push_constant, std430) uniform P {
+    vec2  size;
+    float dt;
+    float drift;     // signed density drift: v.y += dt*drift*dye (− = milk sinks)
+    float pour_x;    // pour centre (grid px); pour_amt 0 = no pour
+    float pour_y;
+    float pour_r;
+    float pour_amt;
+    float pour_push; // radial splash velocity at the pour point
+    float stir_x;    // stir centre (grid px); stir vx/vy 0 = no stir
+    float stir_y;
+    float stir_r;
+    float stir_vx;
+    float stir_vy;
+    float _p0;
+    float _p1;
+} p;
+
+void main() {
+    ivec2 c = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 mx = ivec2(p.size) - ivec2(1);
+    if (c.x > mx.x || c.y > mx.y) { return; }
+
+    vec2 v = imageLoad(vel, c).rg;
+    float d = imageLoad(dye, c).r;
+
+    v.y += p.dt * p.drift * d;   // signed Boussinesq drift, ∝ concentration
+
+    if (p.pour_amt != 0.0) {
+        vec2 rel = vec2(c) - vec2(p.pour_x, p.pour_y);
+        float g = exp(-dot(rel, rel) / (p.pour_r * p.pour_r));
+        d += p.pour_amt * g;
+        float rl = length(rel);
+        if (rl > 1e-4) {
+            v += (rel / rl) * p.pour_push * g;   // the stream splashes outward
+        }
+    }
+
+    if (p.stir_vx != 0.0 || p.stir_vy != 0.0) {
+        vec2 rel = vec2(c) - vec2(p.stir_x, p.stir_y);
+        float g = exp(-dot(rel, rel) / (p.stir_r * p.stir_r));
+        v += vec2(p.stir_vx, p.stir_vy) * g;
+    }
+
+    imageStore(vel, c, vec4(v, 0.0, 0.0));
+    imageStore(dye, c, vec4(d, 0.0, 0.0, 0.0));
+}

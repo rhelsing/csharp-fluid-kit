@@ -59,7 +59,7 @@ public abstract partial class ExpPoolScene : Node3D
     private float _fpsAccum;
 
     // ---- the frozen drive ----
-    protected float DriveStrength = 0.06f;
+    protected float DriveStrength = 0.066f;
     protected float DriveInterval = 1.2f;
     private float _driveT;
     protected bool AutoDrive = true;
@@ -75,6 +75,19 @@ public abstract partial class ExpPoolScene : Node3D
 
     /// <summary>Extra state for the readout, after `fps · `.</summary>
     protected virtual string StateText() => "baseline";
+
+    /// <summary>
+    /// False means DO NOT advance the solver at all — used by 24_cxm_field's modal-basis mode,
+    /// where the whole point is that no time stepping happens. Drive collection, display
+    /// binding and the readout still run.
+    /// </summary>
+    protected virtual bool StepSolver => true;
+
+    /// <summary>Runs after the solver step (or in place of it when StepSolver is false).</summary>
+    protected virtual void AfterStep(float dt) { }
+
+    /// <summary>Point the displayed texture at an IrField's reconstruction instead of the solver's.</summary>
+    protected void BindIrDisplay(IrField ir) { _waterTex.TextureRdRid = ir.DisplayRid; }
 
     /// <summary>Drive points this frame, in [-1,1] sim space. Default: one cycling source.</summary>
     protected virtual void CollectDrive(float dt, System.Collections.Generic.List<Vector3> outDrops)
@@ -330,15 +343,19 @@ public abstract partial class ExpPoolScene : Node3D
         }
 
         _waterTex.TextureRdRid = solver.DisplayRid;
-        var extra = new System.Collections.Generic.List<Vector4>();
-        for (int i = 1; i < drops.Count; ++i) { extra.Add(new Vector4(drops[i].X, drops[i].Y, solver.DropRadius, drops[i].Z)); }
-        bool hasFirst = drops.Count > 0;
-        float fx = hasFirst ? drops[0].X : 0.0f, fz = hasFirst ? drops[0].Y : 0.0f, fs = hasFirst ? drops[0].Z : 0.0f;
-        RenderingServer.CallOnRenderThread(Callable.From(() =>
+        if (StepSolver)
         {
-            if (extra.Count > 0) { solver.InjectDrops(extra); }
-            solver.Step(hasFirst, fx, fz, fs, true, SphereCenter, SphereCenter);
-        }));
+            var extra = new System.Collections.Generic.List<Vector4>();
+            for (int i = 1; i < drops.Count; ++i) { extra.Add(new Vector4(drops[i].X, drops[i].Y, solver.DropRadius, drops[i].Z)); }
+            bool hasFirst = drops.Count > 0;
+            float fx = hasFirst ? drops[0].X : 0.0f, fz = hasFirst ? drops[0].Y : 0.0f, fs = hasFirst ? drops[0].Z : 0.0f;
+            RenderingServer.CallOnRenderThread(Callable.From(() =>
+            {
+                if (extra.Count > 0) { solver.InjectDrops(extra); }
+                solver.Step(hasFirst, fx, fz, fs, true, SphereCenter, SphereCenter);
+            }));
+        }
+        AfterStep(dt);
 
         _fpsAccum += dt;
         if (_readout != null && _fpsAccum >= 0.4f)
@@ -375,7 +392,7 @@ public abstract partial class ExpPoolScene : Node3D
 
         ui.AddSection("Baseline (frozen — same in every scene)");
         ui.AddToggle("Auto drive", AutoDrive, v => AutoDrive = v);
-        ui.AddSlider("Drive strength", 0.005f, 0.3f, DriveStrength, v => DriveStrength = v);
+        ui.AddSlider("Drive strength", 0.005f, 1.0f, DriveStrength, v => DriveStrength = v);
         ui.AddSlider("Drive interval (s)", 0.1f, 4.0f, DriveInterval, v => DriveInterval = v);
         ui.AddToggle("Raytrace + caustics", false, SetRaytrace);
         // The neutral water shading is deliberately plain, which makes small ripples hard to

@@ -30,8 +30,11 @@ float st_conductance(ivec3 c, ivec3 n) {
     return pc.beta;
 }
 
+// ST_NB, not a literal 6 — the neighbour count is the topology's business now, so this stamp
+// is dimension-agnostic too: compile it against nd_2d and the diagonal is correct for a
+// 4-neighbour lattice without editing this line (solver-ledger.md §7d).
 float st_diag(ivec3 c) {
-    return 1.0 + pc.a + 6.0 * pc.beta + pc.leak;
+    return 1.0 + pc.a + float(ST_NB) * pc.beta + pc.leak;
 }
 
 float st_rhs(ivec3 c) {

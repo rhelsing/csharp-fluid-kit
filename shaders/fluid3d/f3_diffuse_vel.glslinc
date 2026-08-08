@@ -1,0 +1,25 @@
+#version 450
+// f3_diffuse_vel — one Jacobi sweep of implicit velocity diffusion (viscosity) in 3D:
+//     v' = (v₀ + a·Σ₆ v_nb) / (1 + 6a),  a = ν·dt.  Ping-ponged K times, v₀ fixed.
+layout(local_size_x = 4, local_size_y = 4, local_size_z = 4) in;
+layout(rgba32f, set = 0, binding = 0) uniform image3D vel0;
+layout(rgba32f, set = 1, binding = 0) uniform image3D vel_in;
+layout(rgba32f, set = 2, binding = 0) uniform image3D vel_out;
+
+layout(push_constant, std430) uniform P { vec4 size; float a; float _p0; float _p1; float _p2; } p;
+
+void main() {
+    ivec3 c = ivec3(gl_GlobalInvocationID.xyz);
+    ivec3 mx = ivec3(p.size.xyz) - ivec3(1);
+    if (c.x > mx.x || c.y > mx.y || c.z > mx.z) { return; }
+
+    vec3 s = imageLoad(vel_in, clamp(c + ivec3(-1, 0, 0), ivec3(0), mx)).xyz
+           + imageLoad(vel_in, clamp(c + ivec3(1, 0, 0), ivec3(0), mx)).xyz
+           + imageLoad(vel_in, clamp(c + ivec3(0, -1, 0), ivec3(0), mx)).xyz
+           + imageLoad(vel_in, clamp(c + ivec3(0, 1, 0), ivec3(0), mx)).xyz
+           + imageLoad(vel_in, clamp(c + ivec3(0, 0, -1), ivec3(0), mx)).xyz
+           + imageLoad(vel_in, clamp(c + ivec3(0, 0, 1), ivec3(0), mx)).xyz;
+    vec3 v0 = imageLoad(vel0, c).xyz;
+    vec3 v = (v0 + p.a * s) / (1.0 + 6.0 * p.a);
+    imageStore(vel_out, c, vec4(v, 0.0));
+}

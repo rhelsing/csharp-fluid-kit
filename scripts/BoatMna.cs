@@ -965,6 +965,9 @@ public partial class BoatMna : Node3D
             Far = 3000f,
             Current = true,
             Position = new Vector3(0f, 3.5f, 8f),
+            // driven at render rate in _Process — physics interpolation would re-smooth
+            // it from stale physics snapshots (engine warns; same fix as scene 17)
+            PhysicsInterpolationMode = Node.PhysicsInterpolationModeEnum.Off,
         };
         AddChild(_cam);
     }

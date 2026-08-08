@@ -1,0 +1,77 @@
+#version 450
+
+// singularity_mask.glslinc — scene 51 v2: PHASE-SINGULARITY whitecap source on the
+// composite Gerstner phasor field (science_boi defect_soc lift), reworked for
+// natural, high-res caps:
+//   · texel-matched to the foam grid (512² == MnaGrid) and WORLD-ANCHORED via the
+//     same toroidal origin/tex_off map — the foam kernel samples it 1:1 at texel c.
+//   · STATEFUL EMA in time: mask -> mix(prev, detect, alpha). Caps fade in and out
+//     over the smoothing time instead of popping per tick.
+//   · SOFT detection: a graded smoothstep on |winding| around the threshold, not a
+//     binary cut — less pronounced, naturally.
+//   · PROBE size: the winding plaquette is sampled `probe` metres apart, decoupled
+//     from the texel grid — the detection-scale knob.
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(r16f, set = 0, binding = 0) uniform image2D mask_st;   // persistent EMA state
+
+layout(push_constant, std430) uniform Params {   // 12 scalars + 5 vec4 = 128B exact
+    float wave_time;
+    float cell;       // window metres per texel
+    float origin_x;   // window min corner (world XZ) — shared with the MNA window
+    float origin_y;
+    float thresh;     // |winding| centre (rad)
+    float gain;       // steady whitecap source strength at a full defect
+    float tex_off_x;  // toroidal scroll offset (texels) — same as the MNA window's
+    float tex_off_y;
+    float alpha;      // EMA blend/tick (smoothing-time knob)
+    float softw;      // detection softness: response ramps thresh·(1∓softw)
+    float probe;      // plaquette spacing (m) — the detection-scale knob
+    float _pad;
+    vec4  b0;         // per band: (kv.x, kv.y, omega, amp) — 5 largest bands
+    vec4  b1;
+    vec4  b2;
+    vec4  b3;
+    vec4  b4;
+} pc;
+
+float f_phase(vec2 p) {
+    float re = 0.0;
+    float im = 0.0;
+    vec4 bands[5] = vec4[5](pc.b0, pc.b1, pc.b2, pc.b3, pc.b4);
+    for (int i = 0; i < 5; i++) {
+        float ph = bands[i].x * p.x + bands[i].y * p.y - bands[i].z * pc.wave_time;
+        re += bands[i].w * cos(ph);
+        im += bands[i].w * sin(ph);
+    }
+    return atan(im, re);
+}
+
+float wrap_pi(float a) {
+    return a - 6.2831853 * floor((a + 3.14159265) / 6.2831853);
+}
+
+void main() {
+    ivec2 c = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 N = imageSize(mask_st);
+    if (c.x >= N.x || c.y >= N.y) {
+        return;
+    }
+
+    ivec2 wc = ((c - ivec2(pc.tex_off_x, pc.tex_off_y)) % N + N) % N;
+    vec2 p00 = vec2(pc.origin_x, pc.origin_y) + (vec2(wc) + 0.5) * pc.cell;
+    float pr = max(pc.probe, pc.cell);
+    float t00 = f_phase(p00);
+    float t10 = f_phase(p00 + vec2(pr, 0.0));
+    float t11 = f_phase(p00 + vec2(pr, pr));
+    float t01 = f_phase(p00 + vec2(0.0, pr));
+    float w = wrap_pi(t10 - t00) + wrap_pi(t11 - t10) + wrap_pi(t01 - t11) + wrap_pi(t00 - t01);
+
+    float lo = pc.thresh * (1.0 - pc.softw);
+    float hi = pc.thresh * (1.0 + pc.softw) + 1e-3;
+    float target = smoothstep(lo, hi, abs(w)) * pc.gain;
+
+    float prev = imageLoad(mask_st, c).r;
+    imageStore(mask_st, c, vec4(mix(prev, target, pc.alpha), 0.0, 0.0, 0.0));
+}

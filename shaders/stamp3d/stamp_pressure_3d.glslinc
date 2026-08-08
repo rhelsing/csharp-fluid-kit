@@ -1,0 +1,52 @@
+// stamp_pressure_3d.glslinc — the 3D pressure-Poisson operator ∇²p = div, as a stamp.
+//
+// This is the linear solve that makes water CURL. A shallow-water heightfield is
+// single-valued in y and therefore cannot overturn no matter how good its solver is;
+// an overturning lip needs a genuine 3D velocity field, and what drives the lip over is
+// incompressibility — i.e. this solve. KP07 has no equivalent because it is fully explicit
+// (solver-ledger.md §10, and shorewaves/docs/design/path-b §3).
+//
+// EXACTLY reproduces f3_pressure_jacobi.glslinc at beta = 1. That kernel is
+//     p(c) = (Σ 6 neighbours − div) / 6
+// and the repo's stamp convention is
+//     A u = st_diag·u − Σ st_conductance·u_n = st_rhs,  smoothed as u = (st_rhs + Σ cond·u_n)/diag
+// so with cond = 1, diag = 6, rhs = −div the two are the same iteration, one written
+// matrix-free by hand and one driven by any IStampSolver. That equivalence is the point:
+// it makes the Jacobi-vs-multigrid comparison a swap, not a rewrite.
+//
+// SET 0 IS THE PRESSURE, SET 1 IS THE DIVERGENCE. The stamp contract names these h_curr and
+// h_prev because its first users were wave solvers; here the "state" is the previous
+// pressure (which MgDeepSolver3D uses as the warm start, and that is a real win — the field
+// is highly correlated frame to frame) and the "history" slot carries the rhs source.
+//
+// Neighbour clamping is Neumann, matching f3_pressure_jacobi's clamp() exactly: solid walls,
+// no flow through the box. A FREE SURFACE needs a fluid mask instead — conductance 0 across a
+// fluid/air face and a Dirichlet p = 0 in air — which is the next layer, not this one.
+
+layout(r32f, set = 0, binding = 0) uniform image3D h_curr;   // pressure: warm start in, solution out
+layout(r32f, set = 1, binding = 0) uniform image3D h_prev;   // divergence (the rhs source)
+
+layout(push_constant, std430) uniform Params {
+    vec4  size;      // xyz = grid dims (REQUIRED first field)
+    float beta;      // face conductance = 1/dx². 1.0 at the fine level.
+    float _p0;
+    float _p1;
+    float _p2;
+} pc;
+
+float st_conductance(ivec3 c, ivec3 n) {
+    return pc.beta;
+}
+
+// ST_NB, not a literal 6 — compile this against nd_2d and the diagonal is correct for a
+// 4-neighbour lattice with no edit (solver-ledger.md §7d).
+float st_diag(ivec3 c) {
+    return float(ST_NB) * pc.beta;
+}
+
+// NOT scaled by beta. The equation is (6p_c − Σp_n)/dx² = −div, so the operator carries
+// 1/dx² and the right-hand side does not. Scaling the rhs too would make the solve
+// dx-independent and quietly wrong on every coarse level.
+float st_rhs(ivec3 c) {
+    return -imageLoad(h_prev, c).r;
+}

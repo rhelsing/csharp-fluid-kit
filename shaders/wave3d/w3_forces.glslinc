@@ -1,0 +1,39 @@
+#version 450
+// w3_forces — gravity, the wavemaker, and the solid no-slip condition, in one pass.
+// Runs before projection: it makes the velocity field wrong (divergent) on purpose, and the
+// pressure solve is what makes it right again. That is the whole structure of the method.
+layout(local_size_x = 4, local_size_y = 4, local_size_z = 4) in;
+layout(rgba32f, set = 0, binding = 0) uniform image3D vel;
+layout(r32f,    set = 1, binding = 0) uniform image3D mask;
+
+layout(push_constant, std430) uniform P {
+    vec4  size;
+    float dt;
+    float gravity;     // cells/s^2, negative = down
+    float wave_amp;    // paddle velocity amplitude (cells/s)
+    float wave_omega;  // rad/s
+    float time;
+    float paddle_w;    // paddle thickness in cells at the deep (x = 0) edge
+    float _p0;
+    float _p1;
+} pc;
+
+void main() {
+    ivec3 c = ivec3(gl_GlobalInvocationID.xyz);
+    ivec3 mx = ivec3(pc.size.xyz) - ivec3(1);
+    if (c.x > mx.x || c.y > mx.y || c.z > mx.z) { return; }
+
+    float m = imageLoad(mask, c).r;
+    if (m < -0.5) { imageStore(vel, c, vec4(0.0)); return; }   // solid: no-slip
+
+    vec4 v = imageLoad(vel, c);
+    if (m > 0.5) { v.y += pc.gravity * pc.dt; }                // gravity, water only
+    else { v = vec4(0.0); }                                     // air carries no momentum
+
+    // Wavemaker: a slab of prescribed horizontal velocity at the deep edge, only in water.
+    // Velocity forcing rather than a moving wall keeps it a source the projection can absorb.
+    if (pc.wave_amp != 0.0 && float(c.x) < pc.paddle_w && m > 0.5) {
+        v.x = pc.wave_amp * sin(pc.wave_omega * pc.time);
+    }
+    imageStore(vel, c, v);
+}

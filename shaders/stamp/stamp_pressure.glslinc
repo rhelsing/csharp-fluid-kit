@@ -1,0 +1,63 @@
+// stamp_pressure.glslinc — the PRESSURE POISSON as a stamp (hypotheses.md H-W1, §8b).
+//
+// `fluid3d/f3_pressure_jacobi.glslinc` is a hand-rolled Jacobi relaxation of ∇²p = div that
+// never joined the stamp contract:
+//     p(c) = (Σ 6 neighbours − div) / 6
+// which is exactly solve_jacobi's `x(c) = (st_rhs + Σ st_conductance·x(n)) / st_diag` with
+// the three functions below. That makes it the SIMPLEST stamp in the repo — and converting it
+// hands the fluid every solver in the dropdown instead of the one it has.
+//
+// The operator is CONSTANT-COEFFICIENT (unit conductances, uniform diagonal). That is the
+// condition that makes spectral exact, and it is the condition the wave tank cannot meet
+// because bathymetry varies β per face. See H-W2.
+//
+// SLOT REUSE. The contract gives a stamp two state images: h_curr (set 0) and h_prev (set 1).
+// Pressure has no time history — it is solved fresh from the current divergence each frame —
+// so set 0 carries the DIVERGENCE and set 1 is declared-but-unread. The host must still bind
+// it; that is the same arrangement cg_spmv already relies on.
+//
+// SINGULARITY, stated up front. With all-Neumann walls this operator has a nullspace: p is
+// defined only up to an additive constant, because adding a constant to p changes no gradient.
+// Consequences, which differ per solver and are the point of measuring:
+//   * Jacobi / RBGS tolerate it — the DC component of the iterate wanders, the residual still
+//     converges, and projection only ever uses ∇p, so the wandering is harmless.
+//   * A solution EXISTS iff b has zero mean (b must lie in the range of A). A divergence field
+//     from a real velocity field with closed walls satisfies this; a seeded test field must be
+//     mean-subtracted or the residual has an irreducible floor.
+//   * Spectral divides by λ(0,0) = 0. The wave stamp dodges this via `1 + a + leak > 0`;
+//     pressure has no such term, so the DC mode must be pinned explicitly (H-W2).
+
+layout(r32f, set = 0, binding = 0) uniform image2D div_field;   // divergence — the rhs
+layout(r32f, set = 1, binding = 0) uniform image2D unused_prev; // declared by contract, unread
+
+layout(push_constant, std430) uniform Params {
+    vec2  size;      // REQUIRED first member (2D contract)
+    float scale;     // rhs scale — 1.0 reproduces f3_pressure_jacobi exactly
+    float reg;       // optional diagonal regularization; 0 = the true (singular) operator
+    vec4  _pad0;
+    vec4  _pad1;
+    vec4  _pad2;
+    vec4  _pad3;
+    vec4  _pad4;
+    vec4  _pad5;
+    vec4  _pad6;
+} pc;
+
+// Unit conductance on every face — this is what "constant-coefficient" means here.
+float st_conductance(ivec2 c, ivec2 n) {
+    return 1.0;
+}
+
+// The neighbour count, from the topology rather than a literal 6 (or 4) — so this same file is
+// the 2D and the 3D pressure operator with no edit (solver-ledger.md §7d).
+//
+// `reg` exists so the singular case can be measured against a regularized one on the same
+// stamp: reg > 0 lifts the nullspace and makes the system SPD, at the cost of solving a
+// slightly different (screened-Poisson) problem.
+float st_diag(ivec2 c) {
+    return float(ST_NB) + pc.reg;
+}
+
+float st_rhs(ivec2 c) {
+    return -pc.scale * imageLoad(div_field, c).r;
+}

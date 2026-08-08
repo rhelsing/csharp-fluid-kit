@@ -1,0 +1,98 @@
+// stamp_wave_void.glslinc — wave stamp with a SPATIALLY VARYING void fraction (H-B2).
+//
+// A fork, like stamp_wave_nl. The parent stays the control.
+//
+// THE IDEA. Aerated water is a different medium: at 1% void fraction the speed of sound falls
+// from ~1500 to ~100 m/s. In this stamp wave speed IS the conductance (H-W3 measured c ∝ √β to
+// 2-8%), so a bubble field is a conductance field. This stamp paints one analytically — a
+// half-plane split in z — so a wave crossing it has half its front in slow water and half in
+// fast, and must bend.
+//
+// WHY A HALF-PLANE AND NOT AN ANGLED INTERFACE. Snell's law in its angle form
+// (sin θ₁/sin θ₂ = c₁/c₂) needs a wavefront-angle fit, which is fragile to measure. Splitting
+// the domain along the direction of travel gives the same physics as a distance ratio: after N
+// steps the front has advanced x₁ in the clear half and x₂ in the aerated half, and
+//     x₁ / x₂ = c₁ / c₂ = sqrt(beta₁ / beta₂)
+// which is one subtraction to measure and impossible to fudge. The bending is then literally
+// the kink between the two halves.
+//
+// Analytic rather than a painted texture on purpose: a third input image would need a free
+// descriptor set, and set 4 is already the multigrid rhs. That plumbing is worth doing when
+// bubbles are dynamic; it is not worth doing to answer whether the medium works.
+//
+// Push layout is byte-identical to stamp_wave_tank so every host drives it unchanged.
+//   extra.x = void multiplier applied to depth where z >= size.y/2  (1.0 = no void = control)
+//   extra.w = reference depth
+
+layout(r32f, set = 0, binding = 0) uniform image2D h_curr;
+layout(r32f, set = 1, binding = 0) uniform image2D h_prev;
+
+layout(push_constant, std430) uniform Params {
+    vec2  size;
+    float beta_scale;
+    float a;
+
+    float leak;
+    float cn;
+    float sponge_w;
+    float sponge_a;
+
+    float floor_base;
+    float slope;
+    float water_level;
+    float min_depth;
+
+    vec4  paddle;
+    vec4  macro;
+    vec4  micro;
+    vec4  drop;
+    vec4  extra;        // x = void multiplier, w = ref depth
+} pc;
+
+// The medium. Everything else in this file is the parent stamp with the sources trimmed.
+float st_depth(ivec2 c) {
+    float d = pc.extra.w;
+    if (float(c.y) >= pc.size.y * 0.5) {
+        d *= pc.extra.x;          // aerated half — lower depth => lower beta => slower
+    }
+    return max(pc.min_depth, d);
+}
+
+float st_beta_face(ivec2 c, ivec2 n) {
+    return pc.beta_scale * 0.5 * (st_depth(c) + st_depth(n));
+}
+
+float st_conductance(ivec2 c, ivec2 n) {
+    return (1.0 - 0.5 * pc.cn) * st_beta_face(c, n);
+}
+
+float st_diag(ivec2 c) {
+    float sum = 0.0;
+    for (int k = 0; k < ST_NB; k++) {
+        sum += st_beta_face(c, ST_NEIGHBOUR(c, k));
+    }
+    return 1.0 + pc.a + (1.0 - 0.5 * pc.cn) * (sum + pc.leak);
+}
+
+float st_rhs(ivec2 c) {
+    float hc = imageLoad(h_curr, c).r;
+    float hp = imageLoad(h_prev, c).r;
+
+    float dhp = 0.0;
+    float sum = 0.0;
+    for (int k = 0; k < ST_NB; k++) {
+        ST_IVEC n = ST_NEIGHBOUR(c, k);
+        float bf = st_beta_face(c, n);
+        dhp += bf * imageLoad(h_prev, n).r;
+        sum += bf;
+    }
+    dhp -= (sum + pc.leak) * hp;
+
+    float force = 0.0;
+    if (pc.drop.w != 0.0) {
+        vec2 d = vec2(c) - pc.drop.xy;
+        force += pc.drop.w * exp(-dot(d, d) / (pc.drop.z * pc.drop.z));
+    }
+
+    return 2.0 * (hc + force) - hp + pc.a * hp + (0.5 * pc.cn) * dhp;
+}

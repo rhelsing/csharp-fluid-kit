@@ -1,0 +1,59 @@
+// nd_3d.glslinc — the CONNECTIVITY half of the stamp contract, 3D instance.
+//
+// Drop-in swap for nd_2d.glslinc. Every solve body that uses ST_CELL / ST_NB / ST_NEIGHBOUR
+// compiles unchanged against this and solves the 6-neighbour problem instead of the
+// 4-neighbour one. That is the whole point of solver-ledger.md §7d: dimension becomes a host
+// argument, not a forked file.
+//
+// This is what replaces `shaders/stamp3d/solve_jacobi_3d.glslinc` — a hand-copied 3D fork of
+// solve_jacobi with its own `ivec3 offs[6]` and its own host (`GpuStampSolver3D`).
+//
+// A 3D stamp must declare the extent (vec3 OR vec4, see ST_SIZE) as the first member of its
+// push constant — the 2D contract says `vec2 size`; the rule is really "the extent, in cells,
+// comes first".
+//
+// Exercised by `stamp_blob_3d` via GpuStampSolver3D, which now compiles the SHARED
+// solve_jacobi.glslinc against this file. That deleted `stamp3d/solve_jacobi_3d.glslinc` —
+// the hand-copied 3D fork that §3e was actually complaining about.
+
+#define ST_DIM  3
+#define ST_NB   6
+#define ST_IVEC ivec3
+
+const ivec3 ST_OFFS[ST_NB] = ivec3[ST_NB](
+    ivec3( 1,  0,  0),
+    ivec3(-1,  0,  0),
+    ivec3( 0,  1,  0),
+    ivec3( 0, -1,  0),
+    ivec3( 0,  0,  1),
+    ivec3( 0,  0, -1));
+
+#define ST_CELL()            ivec3(gl_GlobalInvocationID.xyz)
+// .xyz, not a bare cast: the existing 3D stamp (stamp_blob_3d) declares `vec4 size` because
+// std430 wanted the alignment, while a fresh 3D stamp would declare vec3. Swizzling works for
+// both, so the contract does not care which the stamp chose.
+#define ST_SIZE()            ivec3(pc.size.xyz)
+#define ST_MAX()             (ivec3(pc.size.xyz) - ivec3(1))
+#define ST_OOB(c)            ((c).x > ST_MAX().x || (c).y > ST_MAX().y || (c).z > ST_MAX().z)
+
+#define ST_PARITY(c)         (((c).x + (c).y + (c).z) & 1)
+
+#define ST_NEIGHBOUR(c, k)   clamp((c) + ST_OFFS[k], ivec3(0), ST_MAX())
+
+// Flattened addressing — see nd_2d. x-fastest, then y, then z, matching ReadField()'s order.
+#define ST_TOTAL()           (uint(pc.size.x) * uint(pc.size.y) * uint(pc.size.z))
+#define ST_FROM_LINEAR(t)    ivec3(int((t) % uint(pc.size.x)), \
+                                   int(((t) / uint(pc.size.x)) % uint(pc.size.y)), \
+                                   int((t) / (uint(pc.size.x) * uint(pc.size.y))))
+
+// ---- multigrid grid transfer -------------------------------------------------
+// See nd_2d. Coarsening in 3D removes 8x the cells per level rather than 4x, which is what
+// makes the pyramid CHEAPER relative to its fine grid here than in 2D: total cost is
+// 1 + 1/2^d + 1/4^d + ... = 4/3 in 2D but only 8/7 in 3D.
+#define ST_VEC               vec3
+#define ST_EXTENT(v)         ivec3((v).xyz)
+
+#define ST_CORNERS           8
+#define ST_BIT_OFFSET(k)     ivec3((k) & 1, ((k) >> 1) & 1, ((k) >> 2) & 1)
+
+#define ST_NEIGHBOUR_WRAP(c, k)  (((c) + ST_OFFS[k] + ST_SIZE()) % ST_SIZE())

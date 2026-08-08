@@ -1,0 +1,43 @@
+#version 450
+// f3_confine — vorticity confinement (Fedkiw et al.): recover the swirl that coarse
+// grids + semi-Lagrangian advection dissipate. ω = ∇×v; N̂ = normalized ∇|ω| (points
+// toward vortex cores); v += ε·dt·(N̂ × ω). ε = 0 is a true no-op. Reads vel_in,
+// writes vel_out (host copies back) — no in-place races.
+layout(local_size_x = 4, local_size_y = 4, local_size_z = 4) in;
+layout(rgba32f, set = 0, binding = 0) uniform image3D vel_in;
+layout(rgba32f, set = 1, binding = 0) uniform image3D vel_out;
+
+layout(push_constant, std430) uniform P { vec4 size; float dt; float eps; float _p0; float _p1; } p;
+
+vec3 curl_at(ivec3 c, ivec3 mx) {
+    vec3 xR = imageLoad(vel_in, clamp(c + ivec3(1, 0, 0), ivec3(0), mx)).xyz;
+    vec3 xL = imageLoad(vel_in, clamp(c + ivec3(-1, 0, 0), ivec3(0), mx)).xyz;
+    vec3 yU = imageLoad(vel_in, clamp(c + ivec3(0, 1, 0), ivec3(0), mx)).xyz;
+    vec3 yD = imageLoad(vel_in, clamp(c + ivec3(0, -1, 0), ivec3(0), mx)).xyz;
+    vec3 zF = imageLoad(vel_in, clamp(c + ivec3(0, 0, 1), ivec3(0), mx)).xyz;
+    vec3 zB = imageLoad(vel_in, clamp(c + ivec3(0, 0, -1), ivec3(0), mx)).xyz;
+    return 0.5 * vec3(
+        (yU.z - yD.z) - (zF.y - zB.y),
+        (zF.x - zB.x) - (xR.z - xL.z),
+        (xR.y - xL.y) - (yU.x - yD.x));
+}
+
+void main() {
+    ivec3 c = ivec3(gl_GlobalInvocationID.xyz);
+    ivec3 mx = ivec3(p.size.xyz) - ivec3(1);
+    if (c.x > mx.x || c.y > mx.y || c.z > mx.z) { return; }
+
+    vec3 w = curl_at(c, mx);
+    // ∇|ω| via |curl| at the six neighbours
+    float mR = length(curl_at(clamp(c + ivec3(1, 0, 0), ivec3(0), mx), mx));
+    float mL = length(curl_at(clamp(c + ivec3(-1, 0, 0), ivec3(0), mx), mx));
+    float mU = length(curl_at(clamp(c + ivec3(0, 1, 0), ivec3(0), mx), mx));
+    float mD = length(curl_at(clamp(c + ivec3(0, -1, 0), ivec3(0), mx), mx));
+    float mF = length(curl_at(clamp(c + ivec3(0, 0, 1), ivec3(0), mx), mx));
+    float mB = length(curl_at(clamp(c + ivec3(0, 0, -1), ivec3(0), mx), mx));
+    vec3 N = 0.5 * vec3(mR - mL, mU - mD, mF - mB);
+    N /= (length(N) + 1e-5);
+
+    vec3 v = imageLoad(vel_in, c).xyz + p.eps * p.dt * cross(N, w);
+    imageStore(vel_out, c, vec4(v, 0.0));
+}
