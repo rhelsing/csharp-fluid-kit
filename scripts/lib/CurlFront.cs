@@ -36,7 +36,7 @@ public sealed class CurlFront
 
     /// <summary>Steepness gate. Shares the measured 0.515 with CurlAge — the same physical
     /// event defines both, so they must not drift apart.</summary>
-    public float BirthSteep = 0.515f;
+    public float BirthSteep = 0.5175f;
     public float MinDepth = 0.05f;
 
     public CurlFront(RenderingDevice rd, int n)

@@ -71,6 +71,7 @@ uniform float sl_len : hint_range(0.3, 20.0) = 3.0;          // slice length alo
 // pointing that way", which is what tuning coverage actually requires.
 uniform float sl_spacing : hint_range(0.5, 40.0) = 8.0;      // metres between slice centres
 uniform float sl_circle_r : hint_range(0.1, 8.0) = 1.5;      // TRUE radius in metres — uniform
+uniform float sl_half_len : hint_range(0.5, 30.0) = 6.0;     // half-length ALONG the axis (m)
 uniform float sl_yaw_off : hint_range(-180.0, 180.0) = 0.0;  // deg, RELATIVE to wave forward
 uniform float sl_pitch_off : hint_range(-90.0, 90.0) = 0.0;  // deg, relative to horizontal
 uniform float sl_off_across : hint_range(-20.0, 20.0) = 0.0; // m, along wave forward
@@ -95,7 +96,7 @@ uniform float sl_smooth : hint_range(0.05, 4.0) = 0.7;
 uniform float sl_ridge_amp : hint_range(0.0, 1.5) = 0.18;
 uniform float sl_ridge_scale : hint_range(0.05, 3.0) = 0.7;
 uniform float sl_ridge_stretch : hint_range(0.5, 8.0) = 3.0;
-uniform float sl_spin : hint_range(0.0, 4.0) = 0.6;
+uniform float sl_spin : hint_range(-4.0, 4.0) = 1.88;
 
 uniform vec3 water_shallow : source_color = vec3(0.32, 0.66, 0.62);
 uniform vec3 water_deep : source_color = vec3(0.02, 0.16, 0.24);
@@ -184,61 +185,72 @@ float BarrelCarveField(vec3 pos, float t) {
 	return capsule + sl_ridge_amp * abs(fbm_4(nd)) * br_radius;
 }
 
+// A slice is 210's CAPSULE, placed on the front curve instead of by hand.
+//
+// THE AXIS RUNS ALONG THE CREST, i.e. along the curve's TANGENT — perpendicular to the
+// shoreward normal that the debug lines draw. The lines mark where a tube goes and which way
+// the wave is coming; the tube lies across them. Getting that 90 degrees wrong is what made
+// earlier attempts look like they were standing on end.
+//
+// Every coordinate below is METRES, so R is a true radius and the cross-section is a circle.
+// No age-derived axis, no mismatched units, no warping.
 float BarrelSliceFieldA(vec3 pos, float t, out float ang_out, out float age_out, out float slice_out) {
-	vec2 uv = clamp(pos.xz / DOMAIN_SIZE, vec2(0.0), vec2(1.0));
 	ang_out = 0.0; age_out = 0.0; slice_out = 0.0;
 
-	// WHERE the front is, in world metres — from the curve, not the field.
-	vec4 fr = texture(tx_front, vec2(uv.y, 0.5));
-	if (fr.a < 0.5) { return 1e5; }
-	float front_x = fr.r;
-	float surf = fr.g;
-
-	// Age is now ONLY a clock: how far through its crash this stretch of front is. It has no
-	// say in the tube's size or position, which is the entire fix — a clock is not a ruler.
-	float age = texture(tx_age, uv).r;
-	age_out = age;
-
-	// Slice identity from a STABLE world axis. Previously this was dot(pos.xz, tdir) with tdir
-	// recomputed per sample from the local gradient — a rotating axis measured from the world
-	// origin, so the floor() boundaries wandered and every sample landed in a different slice.
-	// That is what produced a fine-toothed sawtooth instead of N discrete tubes.
-	float slice = floor(pos.z / max(sl_spacing, 0.1));
+	float spacing = max(sl_spacing, 0.1);
+	float slice = floor(pos.z / spacing);           // stable world axis -> stable identity
 	slice_out = slice;
+	float zc = (slice + 0.5) * spacing;             // this slice's centre, along-shore
+
+	// --- the curve, sampled at the slice centre and either side for the tangent ---
+	float du = spacing / DOMAIN_SIZE;
+	vec4 f0 = texture(tx_front, vec2(clamp(zc / DOMAIN_SIZE, 0.0, 1.0), 0.5));
+	if (f0.a < 0.5) { return 1e5; }                 // no front on this row: no tube
+	vec4 fa = texture(tx_front, vec2(clamp((zc - spacing * 0.5) / DOMAIN_SIZE, 0.0, 1.0), 0.5));
+	vec4 fb = texture(tx_front, vec2(clamp((zc + spacing * 0.5) / DOMAIN_SIZE, 0.0, 1.0), 0.5));
+
+	// tangent = along-crest. dz is the along-shore step, dx the front's drift across it.
+	vec2 tang = vec2(fb.r - fa.r, spacing);
+	tang = length(tang) > 1e-5 ? normalize(tang) : vec2(0.0, 1.0);
+	vec2 norm = vec2(tang.y, -tang.x);              // shoreward normal (the debug line)
+	if (norm.x < 0.0) { norm = -norm; }
+
+	float age = texture(tx_age, clamp(pos.xz / DOMAIN_SIZE, vec2(0.0), vec2(1.0))).r;
+	age_out = age;
 	float seed = hash11(slice) * sl_seed_var;
 
-	// Cylinder frame, all in METRES: across-crest, vertical, along-crest.
-	float across = (pos.x - front_x) + sl_off_across;
-	float below  = (surf - sl_depth - sl_off_up) - pos.y;
-	float along  = pos.z - (slice + 0.5) * max(sl_spacing, 0.1) + sl_off_along;
+	// --- slice centre, then project the sample point into the tube's own frame ---
+	vec2 C = vec2(f0.r, zc) + norm * sl_off_across + tang * sl_off_along;
+	float Cy = f0.g - sl_depth - sl_off_up;
+	vec2 dxz = pos.xz - C;
+	float a = dot(dxz, tang);                       // along the axis
+	float b = dot(dxz, norm);                       // across the wave
+	float c = pos.y - Cy;                           // vertical
 
-	// Rotation RELATIVE to the wave's forward direction (+x across-shore is the wave's normal),
-	// so an angle dialled once holds as the front moves.
+	// yaw turns the axis within the horizontal plane, pitch tilts it — both RELATIVE to the
+	// curve, so an angle dialled once keeps meaning the same thing as the front moves.
 	float cy2 = cos(radians(sl_yaw_off)), sy2 = sin(radians(sl_yaw_off));
-	vec2 h2 = vec2(cy2 * across - sy2 * along, sy2 * across + cy2 * along);
+	vec2 ab = vec2(cy2 * a - sy2 * b, sy2 * a + cy2 * b);
 	float cp2 = cos(radians(sl_pitch_off)), sp2 = sin(radians(sl_pitch_off));
-	vec2 v2 = vec2(cp2 * h2.x - sp2 * below, sp2 * h2.x + cp2 * below);
+	vec2 ac = vec2(cp2 * ab.x - sp2 * c, sp2 * ab.x + cp2 * c);
 
-	// TRUE CIRCLE: both axes are metres, so the radius means what it says and the tube is round
-	// at any size — independent of how thin the breaking band happens to be.
-	float r = length(v2);
-	float axial = h2.y;
+	float axial = ac.x;
+	float across = ab.y;
+	float vert = ac.y;
 
-	// radius in metres; the crash phase closes it, the birth strength sizes it
-	float R = (sl_circle_r + fr.b * sl_radius_by_steep * 0.5) * (1.0 - sl_crash * age);
-	R = max(R, 0.02);
+	float R = max((sl_circle_r + f0.b * sl_radius_by_steep * 0.5) * (1.0 - sl_crash * age), 0.02);
+	float L = max(sl_half_len, 0.05);
 
-	// capped along its own axis so a slice is a tube segment, not an infinite cylinder
-	float capped = max(abs(axial) - max(sl_spacing, 0.1) * 0.5, 0.0);
+	// 210's capsule, unchanged: a segment of length 2L swept by a sphere of radius R.
+	float capsule = length(vec3(max(abs(axial) - L, 0.0), across, vert)) - R;
 
-	// 210's ridge, per slice: spun with TIME, decorrelated by the slice seed
-	float ang = atan(v2.y, v2.x) - t * sl_spin * (1.0 + (seed - 0.5) * sl_spin_var) + seed * 6.283;
+	// 210's ridge: |fbm| in the spun angular frame about the axis
+	float ang = atan(vert, across) - t * sl_spin * (1.0 + (seed - 0.5) * sl_spin_var) + seed * 6.283;
 	ang_out = ang;
-	vec3 nd = vec3(slice * 0.7 + seed * 13.0,
+	vec3 nd = vec3(axial * sl_ridge_scale + seed * 13.0,
 		cos(ang) * R * sl_ridge_scale / sl_ridge_stretch,
 		sin(ang) * R * sl_ridge_scale / sl_ridge_stretch);
-
-	return length(vec2(r, capped)) - R + sl_ridge_amp * abs(fbm_4(nd)) * R;
+	return capsule + sl_ridge_amp * abs(fbm_4(nd)) * R;
 }
 
 float BarrelSliceField(vec3 pos, float t) {
@@ -304,11 +316,13 @@ void fragment() {
 		// The capsule is a genuine SDF, so its own distance is a safe stride. The slice path
 		// returns a 1e5 sentinel over open water, which needs the surface as a proximity oracle
 		// or the march samples at the feature scale and steps over every tube.
+		// One stride for both paths. The proximity gate that used to creep at 0.18 m near the
+		// surface existed for the OLD slice field, which was a degenerate slab thin enough to
+		// alias through. It is actively harmful now: the camera looks ALONG the water, so a ray
+		// is within a few metres of the surface for most of its length, and 80 steps x 0.18 m
+		// reaches only ~14 m — the march died long before the surf 40 m away. Both fields are
+		// true SDFs now, so sphere tracing converges on its own.
 		float step_max = 2.0;
-		if (br_fixed < 0.5) {
-			float near_surf = abs(WaterField(p));
-			step_max = near_surf > 4.0 ? 2.0 : 0.18;
-		}
 		dist += clamp(d * 0.7, 0.02, step_max);   // under-relaxed: a heightfield SDF overestimates
 		// 92 m domain -> ~130 m diagonal. 90 cut off the far half of the shore.
 		if (dist > 160.0) { break; }

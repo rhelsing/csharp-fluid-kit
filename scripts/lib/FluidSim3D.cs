@@ -53,6 +53,17 @@ public sealed class FluidSim3D
     public Rid DensityRid => _dyeA;
     public Rid VelocityRid => _velA;
 
+    // Scene 250b's artifact view: the divergence volume, raymarched as a second channel
+    // in #E23D6D (docs/artifacts-250.md). Holds the solve's right-hand side normally, or
+    // the true post-projection RESIDUAL when MeasureDivergence is on — see below.
+    public Rid DivRid => _div;
+
+    // Opt-in: re-run the divergence pass AFTER the gradient subtract, so DivRid holds the
+    // compressibility the truncated solve left behind rather than the divergence it was
+    // handed. Distinct from Step's measureResidual arg, which is the multigrid's scalar
+    // residual NORM. Off by default: scenes 09/32 keep the original pipeline.
+    public bool MeasureDivergence { get; set; }
+
     /// <summary>
     /// Build the multigrid pressure path over the EXISTING pressure/divergence textures —
     /// external-state mode, so p is warm-started from last frame and the solution lands back
@@ -192,6 +203,11 @@ public sealed class FluidSim3D
             _rd.ComputeListAddBarrier(cl);
             _rd.ComputeListEnd();
         }
+
+        // (optional) re-measure divergence of the now-projected velocity → _div becomes the
+        // residual. Safe to clobber: the solve is done with it and next tick rewrites it
+        // first. One dispatch, and only when the flag is on. Same for both solver paths.
+        if (MeasureDivergence) { RunOne(_pDiv, simPc, (_div0, 0u), (_div1, 1u)); }
 
         if (_mcReady && macCormack && mcPc != null)
         {

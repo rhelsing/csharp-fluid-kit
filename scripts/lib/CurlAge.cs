@@ -47,12 +47,12 @@ public sealed class CurlAge
     /// <summary>Gradient magnitude that starts a barrel. 0.515 measured on screen — a breaking
     /// front is an order of magnitude steeper than ordinary swell, so a low gate lights the
     /// whole surf zone and carries no information.</summary>
-    public float BirthSteep = 0.515f;
+    public float BirthSteep = 0.5175f;
     public float MinDepth = 0.05f;
     /// <summary>Seconds from birth to fully crashed.</summary>
-    public float CrashSeconds = 0.5f;
+    public float CrashSeconds = 0.746f;
     /// <summary>Seconds to forget a front that stopped breaking.</summary>
-    public float DecaySeconds = 2.0f;
+    public float DecaySeconds = 3.0155f;
     /// <summary>Scales sqrt(g·h) in the advection. 0 = drift on flow alone, 1 = full wave speed.</summary>
     public float Celerity = 1.0f;
     /// <summary>

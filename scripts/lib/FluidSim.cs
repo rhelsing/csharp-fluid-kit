@@ -47,6 +47,17 @@ public sealed class FluidSim
     public Rid DyeRid => _dyeA;
     public Rid VelRid => _velA;
 
+    // The divergence texture — scene 250's artifact view (docs/artifacts-250.md).
+    // NOTE what this holds depends on MeasureResidual: normally it is the divergence of
+    // the PRE-projection velocity (the solve's right-hand side). Set MeasureResidual to
+    // re-run the divergence pass after the gradient subtract so it holds the true
+    // post-projection RESIDUAL — the compressibility truncated Jacobi left behind.
+    public Rid DivRid => _div;
+
+    // Opt-in extra divergence dispatch at the end of the projection (see DivRid).
+    // Off by default: scenes 07/18 keep the original pipeline, byte-identical.
+    public bool MeasureResidual { get; set; }
+
     // addKernel swaps the source stage for this instance (its push constants are
     // opaque to Step) — e.g. scene 18's fs_add_milk. extras compiles the MacCormack
     // + viscosity stages; default false = the original pipeline, byte-identical.
@@ -160,6 +171,14 @@ public sealed class FluidSim
         }
         Bind(cl, _pGrad, simPc, (_grad0, 0u), (_grad1, 1u));
         _rd.ComputeListAddBarrier(cl);
+        // 3b. (optional) re-measure divergence of the NOW-projected velocity, overwriting
+        // _div with the residual. Same pass, same sets — the solve is finished with _div,
+        // so this is safe to clobber. One dispatch; only paid when the flag is on.
+        if (MeasureResidual)
+        {
+            Bind(cl, _pDiv, simPc, (_div0, 0u), (_div1, 1u));
+            _rd.ComputeListAddBarrier(cl);
+        }
         _rd.ComputeListEnd();
 
         // 4. advect dye by the divergence-free velocity, copy back

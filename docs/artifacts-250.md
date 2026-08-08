@@ -9,6 +9,13 @@ isolate it in one scene, then layer.
 Proven instances that seeded this: Jacobi-vs-multigrid in scene 32 (Jacobi's squish won),
 the Cn dial (BE dissipation vs CN ring), substeps (dispersion).
 
+**Extension → [`artifacts-270.md`](artifacts-270.md)** — Blocks D–G (270–289): detector
+artifacts, second-backend discretization character, coefficient hysteresis, and telemetry
+as control, seeded by [`science-boi-lift.md`](science-boi-lift.md). *This* document is the
+frozen base — 270 appends later phases (order of work steps 8–13) and modifies nothing here.
+Same contract in both: one artifact per scene · knobs · reference A/B · artifact view in
+`#E23D6D`.
+
 ## Orientation — a fresh agent starts here
 
 Repo: `godot-csharp-experiments` (Godot 4.6.2 **.NET** — `/Applications/Godot-mono.app`,
@@ -205,3 +212,5 @@ Artifacts live at different stages, so they **compose by construction**:
 5. Block B (258–260) — mostly reframing existing stamp knobs into isolated scenes.
 6. Block C (261 rail → 263 pipe → 264 tap; 262 leak when Uzawa is worth it).
 7. 269 mixer.
+
+→ steps 8–13 continue in [`artifacts-270.md`](artifacts-270.md) (Blocks D–G).
