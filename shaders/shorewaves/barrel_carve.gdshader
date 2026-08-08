@@ -41,6 +41,11 @@ uniform sampler2D tx_state : filter_linear, repeat_disable;   // r = w (free sur
 uniform sampler2D tx_bottom : filter_linear, repeat_disable;  // r = B (bed)
 uniform sampler2D tx_derived : filter_linear, repeat_disable; // r=n.x g=n.z (surface gradient)
 uniform sampler2D tx_age : filter_linear, repeat_disable;     // r=age 0..1  g=birth steepness
+// The breaking front as a CURVE, one entry per along-shore row: r = front x (m), g = surface
+// height there, b = strength, a = valid. This is what makes a tube possible — age could only
+// ever say "breaking here", never WHERE, so geometry derived from it collapsed to the ribbon's
+// own width. See pass_curl_front.glsl.
+uniform sampler2D tx_front : filter_linear, repeat_disable;
 uniform float DOMAIN_SIZE = 92.16;
 uniform int steps : hint_range(16, 192) = 80;
 
@@ -181,62 +186,59 @@ float BarrelCarveField(vec3 pos, float t) {
 
 float BarrelSliceFieldA(vec3 pos, float t, out float ang_out, out float age_out, out float slice_out) {
 	vec2 uv = clamp(pos.xz / DOMAIN_SIZE, vec2(0.0), vec2(1.0));
-	vec2 ag = texture(tx_age, uv).rg;
-	float age = ag.r;
-	ang_out = 0.0; age_out = age; slice_out = 0.0;
-	if (age <= 0.001) { return 1e5; }            // nothing breaking here: no carve at all
+	ang_out = 0.0; age_out = 0.0; slice_out = 0.0;
 
-	float w = texture(tx_state, uv).r;
-	float bed = texture(tx_bottom, uv).r;
-	float surf = max(w, bed);
+	// WHERE the front is, in world metres — from the curve, not the field.
+	vec4 fr = texture(tx_front, vec2(uv.y, 0.5));
+	if (fr.a < 0.5) { return 1e5; }
+	float front_x = fr.r;
+	float surf = fr.g;
 
-	// crest tangent = perpendicular to the surface gradient. Quantising along it gives each
-	// slice a stable identity, hence its own ridge seed and spin phase — which is what stops a
-	// long tube reading as one repeated extrusion.
-	vec2 grad = texture(tx_derived, uv).rg;
-	vec2 gdir = length(grad) > 1e-5 ? normalize(grad) : vec2(1.0, 0.0);
-	vec2 tdir = vec2(-gdir.y, gdir.x);
-	float slice = floor(dot(pos.xz, tdir) / max(sl_spacing, 0.1));
+	// Age is now ONLY a clock: how far through its crash this stretch of front is. It has no
+	// say in the tube's size or position, which is the entire fix — a clock is not a ruler.
+	float age = texture(tx_age, uv).r;
+	age_out = age;
+
+	// Slice identity from a STABLE world axis. Previously this was dot(pos.xz, tdir) with tdir
+	// recomputed per sample from the local gradient — a rotating axis measured from the world
+	// origin, so the floor() boundaries wandered and every sample landed in a different slice.
+	// That is what produced a fine-toothed sawtooth instead of N discrete tubes.
+	float slice = floor(pos.z / max(sl_spacing, 0.1));
+	slice_out = slice;
 	float seed = hash11(slice) * sl_seed_var;
 
-	// bore radius: sized by the wave that birthed it, shrunk as it crashes
-	float R = (sl_circle_r + ag.g * sl_radius_by_steep * 0.5) * (1.0 - sl_crash * age);
+	// Cylinder frame, all in METRES: across-crest, vertical, along-crest.
+	float across = (pos.x - front_x) + sl_off_across;
+	float below  = (surf - sl_depth - sl_off_up) - pos.y;
+	float along  = pos.z - (slice + 0.5) * max(sl_spacing, 0.1) + sl_off_along;
+
+	// Rotation RELATIVE to the wave's forward direction (+x across-shore is the wave's normal),
+	// so an angle dialled once holds as the front moves.
+	float cy2 = cos(radians(sl_yaw_off)), sy2 = sin(radians(sl_yaw_off));
+	vec2 h2 = vec2(cy2 * across - sy2 * along, sy2 * across + cy2 * along);
+	float cp2 = cos(radians(sl_pitch_off)), sp2 = sin(radians(sl_pitch_off));
+	vec2 v2 = vec2(cp2 * h2.x - sp2 * below, sp2 * h2.x + cp2 * below);
+
+	// TRUE CIRCLE: both axes are metres, so the radius means what it says and the tube is round
+	// at any size — independent of how thin the breaking band happens to be.
+	float r = length(v2);
+	float axial = h2.y;
+
+	// radius in metres; the crash phase closes it, the birth strength sizes it
+	float R = (sl_circle_r + fr.b * sl_radius_by_steep * 0.5) * (1.0 - sl_crash * age);
 	R = max(R, 0.02);
 
-	// ACROSS-CREST DISTANCE IN REAL METRES.
-	// The old form was (age - centre) * sl_age_metres against a depth in metres, i.e. two
-	// different units fed to one length() — an ellipse whose aspect drifted with an unrelated
-	// slider, which is exactly the skew that made these never look round. Converting through
-	// the age field's OWN gradient gives metres, so the cross-section is a circle by
-	// construction no matter what range age happens to occupy.
-	float tx = 1.0 / DOMAIN_SIZE;
-	float aR = texture(tx_age, uv + vec2(tx, 0.0)).r;
-	float aL = texture(tx_age, uv - vec2(tx, 0.0)).r;
-	float aU = texture(tx_age, uv + vec2(0.0, tx)).r;
-	float aD = texture(tx_age, uv - vec2(0.0, tx)).r;
-	float age_per_m = max(length(vec2(aR - aL, aU - aD)) * 0.5, 1e-4);
-	float across = (age - sl_age_centre) / age_per_m + sl_off_across;
-
-	float below = (surf - sl_depth - sl_off_up) - pos.y;
-
-	// rotation RELATIVE to the wave's forward direction: the field supplies the frame, these
-	// two offsets aim inside it, so an angle dialled once holds as the crest curves and moves.
-	float cy2 = cos(radians(sl_yaw_off)), sy2 = sin(radians(sl_yaw_off));
-	float along = dot(pos.xz, tdir) - (slice + 0.5) * max(sl_spacing, 0.1) + sl_off_along;
-	vec2 rot = vec2(cy2 * across - sy2 * along, sy2 * across + cy2 * along);
-	float cp2 = cos(radians(sl_pitch_off)), sp2 = sin(radians(sl_pitch_off));
-	vec2 rot2 = vec2(cp2 * rot.x - sp2 * below, sp2 * rot.x + cp2 * below);
-
-	// UNIFORM CIRCLE: both axes are metres now, so this is round, full stop.
-	float r = length(vec2(rot2.x, rot2.y));
+	// capped along its own axis so a slice is a tube segment, not an infinite cylinder
+	float capped = max(abs(axial) - max(sl_spacing, 0.1) * 0.5, 0.0);
 
 	// 210's ridge, per slice: spun with TIME, decorrelated by the slice seed
-	float ang = atan(below, across) - t * sl_spin * (1.0 + (seed - 0.5) * sl_spin_var) + seed * 6.283;
-	ang_out = ang; slice_out = slice;
+	float ang = atan(v2.y, v2.x) - t * sl_spin * (1.0 + (seed - 0.5) * sl_spin_var) + seed * 6.283;
+	ang_out = ang;
 	vec3 nd = vec3(slice * 0.7 + seed * 13.0,
 		cos(ang) * R * sl_ridge_scale / sl_ridge_stretch,
 		sin(ang) * R * sl_ridge_scale / sl_ridge_stretch);
-	return r - R + sl_ridge_amp * abs(fbm_4(nd)) * R;
+
+	return length(vec2(r, capped)) - R + sl_ridge_amp * abs(fbm_4(nd)) * R;
 }
 
 float BarrelSliceField(vec3 pos, float t) {

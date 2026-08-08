@@ -83,6 +83,8 @@ public partial class ShoreCurl : Node3D
     private int _lineTick;
     private int _lineCount;   // tuned on screen: normals/steepness field
     private CurlAge? _age;
+    private CurlFront? _front;
+    private Texture2Drd _texFront = null!;
     private Texture2Drd _texAge = null!;
     private Godot.Environment _env = null!;
 
@@ -167,6 +169,13 @@ public partial class ShoreCurl : Node3D
             ca.Bind(s.StateRids, s.BottomRid, s.DerivedRid, Dx);
             _age = ca;
         }
+        // The breaking front as a curve. Age says WHEN; this says WHERE.
+        var cf = new CurlFront(RenderingServer.GetRenderingDevice(), N);
+        if (cf.Ready)
+        {
+            cf.Bind(s.StateRids, s.BottomRid, s.DerivedRid, Dx);
+            _front = cf;
+        }
     }
 
     private void BuildEnvironment()
@@ -211,6 +220,7 @@ public partial class ShoreCurl : Node3D
     {
         _texGround = new Texture2Drd();
         _texAge = new Texture2Drd();
+        _texFront = new Texture2Drd();
         _sandMat = new ShaderMaterial { Shader = GD.Load<Shader>(ShaderDir + "sand_min.gdshader") };
         _sandMat.SetShaderParameter("tx_ground", _texGround);
         // The stock wet_col is nearly black and the swash band saturates, so the shore reads
@@ -344,11 +354,13 @@ public partial class ShoreCurl : Node3D
     private void RebuildLines()
     {
         var age = _age;
+        var front = _front;
         if (_lineMesh == null) { return; }
         _lineMesh.ClearSurfaces();
-        if (!_linesOn || age is not { Ready: true }) { _lineCount = 0; return; }
+        if (!_linesOn || front is not { Ready: true }) { _lineCount = 0; return; }
 
-        var slices = age.ExtractSlices(Domain, _lineSpacing, _lineMinAge);
+        // From the CURVE, not the age field: placement needs positions, and age has none.
+        var slices = front.ExtractSlices(Domain, _lineSpacing, _lineMinAge);
         _lineCount = slices.Count;
         if (slices.Count == 0) { GD.Print("[lines] ZERO slices extracted"); return; }
 
@@ -386,6 +398,7 @@ public partial class ShoreCurl : Node3D
         _barrelMat.SetShaderParameter("tx_bottom", _texBottom);
         _barrelMat.SetShaderParameter("tx_derived", _texDerived);
         _barrelMat.SetShaderParameter("tx_age", _texAge);
+        _barrelMat.SetShaderParameter("tx_front", _texFront);
         _barrelMat.SetShaderParameter("DOMAIN_SIZE", Domain);
         // OFF by default — placement is unsolved (curl-hypotheses.md §3), so it ships dark
         // rather than shipping a slab. The tuned shape values below survive for when the
@@ -432,6 +445,7 @@ public partial class ShoreCurl : Node3D
         _texBottom.TextureRdRid = solver.BottomRid;
         _texDerived.TextureRdRid = solver.DerivedRid;
         if (_age is { Ready: true }) { _texAge.TextureRdRid = _age.AgeRid; }
+        if (_front is { Ready: true }) { _texFront.TextureRdRid = _front.FrontRid; }
 
         // KP07 off = the reference stops advancing. The surface freezes rather than
         // vanishing, which is what you want when a candidate solver takes over the frame.
@@ -455,6 +469,7 @@ public partial class ShoreCurl : Node3D
         int parity = _parity, gparity = _gparity;
         float t0 = _simTime;
         var age = _age;
+        var front = _front;
         float period = solver.WavePeriod;
         bool wantStats = _tickStat++ % 30 == 0;
         RenderingServer.CallOnRenderThread(Callable.From(() =>
@@ -462,6 +477,7 @@ public partial class ShoreCurl : Node3D
             solver.Step(steps, t0, parity, solitary, gparity);
             // after the solver, so derived/state are this frame's
             age?.Step(steps * solver.Dt, finalParity, period);
+            front?.Step(finalParity);
             if (wantStats) { age?.CaptureStats(); }
         }));
 
@@ -503,9 +519,12 @@ public partial class ShoreCurl : Node3D
         {
             if (t != null) { t.TextureRdRid = default; }
         }
-        foreach (var t in new[] { _texAge }) { if (t != null) { t.TextureRdRid = default; } }
+        foreach (var t in new[] { _texAge, _texFront }) { if (t != null) { t.TextureRdRid = default; } }
         var a = _age;
         _age = null;
+        var f = _front;
+        _front = null;
+        if (f != null) { RenderingServer.CallOnRenderThread(Callable.From(() => f.Free())); }
         if (a != null) { RenderingServer.CallOnRenderThread(Callable.From(() => a.Free())); }
         var s = _solver;
         _solver = null;

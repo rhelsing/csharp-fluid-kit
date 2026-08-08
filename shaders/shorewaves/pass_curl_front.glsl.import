@@ -1,0 +1,14 @@
+[remap]
+
+importer="glsl"
+type="RDShaderFile"
+uid="uid://cbqlga2y2mj5i"
+path="res://.godot/imported/pass_curl_front.glsl-0ad0225cc9bc65f96d96de7d7e3190de.res"
+
+[deps]
+
+source_file="res://shaders/shorewaves/pass_curl_front.glsl"
+dest_files=["res://.godot/imported/pass_curl_front.glsl-0ad0225cc9bc65f96d96de7d7e3190de.res"]
+
+[params]
+

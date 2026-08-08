@@ -10,7 +10,7 @@ namespace GodotCsharpExperiments.Lib;
 // expressed that way at all — it needs to know *when* a front started breaking, which means
 // state that survives between frames. This is that state.
 //
-// rgba16f ping-pong: r = age, g = birth steepness, ba = propagation direction (unit xz).
+// rg16f ping-pong: r = age (0..1), g = steepness at birth (big waves get big tubes).
 //
 // AGE IS ALSO A COORDINATE. The barrel's cross-section is a circle in (age, depth), so age
 // doubles as the across-crest axis — oldest where breaking began, ~0 at the leading edge. That
@@ -83,7 +83,7 @@ public sealed class CurlAge
 
         var fmt = new RDTextureFormat
         {
-            Format = RenderingDevice.DataFormat.R16G16B16A16Sfloat,
+            Format = RenderingDevice.DataFormat.R16G16Sfloat,
             TextureType = RenderingDevice.TextureType.Type2D,
             Width = (uint)n, Height = (uint)n, Depth = 1, ArrayLayers = 1, Mipmaps = 1,
             UsageBits = RenderingDevice.TextureUsageBits.SamplingBit
@@ -93,7 +93,7 @@ public sealed class CurlAge
         };
         _age[0] = MakeTex(fmt);
         _age[1] = MakeTex(fmt);
-        StatBytes = n * n * 8;   // rgba16f = 8 bytes/texel
+        StatBytes = n * n * 4;   // rg16f = 4 bytes/texel
         Ready = true;
     }
 
@@ -169,86 +169,18 @@ public sealed class CurlAge
     {
         if (!Ready) { return; }
         byte[] d = _rd.TextureGetData(_age[_agePar], 0);
-        int texels = Math.Min(_n * _n, d.Length / 8);
+        int texels = Math.Min(_n * _n, d.Length / 4);
         float max = 0.0f, sum = 0.0f;
         int live = 0;
         for (int i = 0; i < texels; i++)
         {
-            float a = (float)BitConverter.ToHalf(d, i * 8);   // r channel of rgba16f
+            float a = (float)BitConverter.ToHalf(d, i * 4);   // r channel of rg16f
             if (a > max) { max = a; }
             if (a > 0.001f) { live++; sum += a; }
         }
         StatMax = max;
         StatMean = live > 0 ? sum / live : 0.0f;
         StatLive = live;
-    }
-
-    /// <summary>One record per slice: a point, a heading and a speed. This is what a line
-    /// renderer needs — a screen-space distance test cannot produce it, which is why the
-    /// previous debug view came out as contour blobs rather than vectors.</summary>
-    public struct Slice
-    {
-        public Vector2 Pos;    // world XZ (metres)
-        public Vector2 Dir;    // unit heading
-        public float Age;
-        public float Speed;    // |flow| proxy, from birth steepness
-    }
-
-    /// <summary>
-    /// Read the age field back and reduce it to evenly spaced slice records.
-    ///
-    /// Binning is on a FIXED WORLD AXIS (z), not on the local crest tangent. That is the whole
-    /// point: the tangent is recomputed per sample and rotates, so quantising against it gives
-    /// boundaries that wander and a crest that shatters into a sawtooth. A world axis is stable,
-    /// so a slice keeps its identity frame to frame — which is what makes the lines (and later
-    /// the tubes) sit still instead of flickering.
-    ///
-    /// Averaging every crest cell in a bin also kills the per-pixel noise that made the
-    /// screen-space version fragment: one mean position and one mean heading per bin, period.
-    /// </summary>
-    public System.Collections.Generic.List<Slice> ExtractSlices(float domain, float spacingM, float minAge)
-    {
-        var outp = new System.Collections.Generic.List<Slice>();
-        if (!Ready) { return outp; }
-        byte[] d = _rd.TextureGetData(_age[_agePar], 0);
-        int texels = Math.Min(_n * _n, d.Length / 8);
-        float cell = domain / _n;
-        int bins = Math.Max(1, (int)(domain / Math.Max(spacingM, 0.1f)));
-
-        var sx = new double[bins]; var sz = new double[bins];
-        var dx = new double[bins]; var dz = new double[bins];
-        var sa = new double[bins]; var ss = new double[bins];
-        var cnt = new int[bins];
-
-        for (int i = 0; i < texels; i++)
-        {
-            float age = (float)BitConverter.ToHalf(d, i * 8);
-            if (age <= minAge) { continue; }
-            int gx = i % _n, gz = i / _n;
-            float wx = (gx + 0.5f) * cell, wz = (gz + 0.5f) * cell;
-            int b = Math.Clamp((int)(wz / Math.Max(spacingM, 0.1f)), 0, bins - 1);
-            sx[b] += wx; sz[b] += wz;
-            dx[b] += (float)BitConverter.ToHalf(d, i * 8 + 4);
-            dz[b] += (float)BitConverter.ToHalf(d, i * 8 + 6);
-            sa[b] += age;
-            ss[b] += (float)BitConverter.ToHalf(d, i * 8 + 2);
-            cnt[b]++;
-        }
-
-        for (int b = 0; b < bins; b++)
-        {
-            if (cnt[b] < 4) { continue; }              // ignore specks; a slice needs support
-            var dir = new Vector2((float)(dx[b] / cnt[b]), (float)(dz[b] / cnt[b]));
-            if (dir.LengthSquared() < 1e-6f) { continue; }
-            outp.Add(new Slice
-            {
-                Pos = new Vector2((float)(sx[b] / cnt[b]), (float)(sz[b] / cnt[b])),
-                Dir = dir.Normalized(),
-                Age = (float)(sa[b] / cnt[b]),
-                Speed = (float)(ss[b] / cnt[b]),
-            });
-        }
-        return outp;
     }
 
     public void Free()
