@@ -59,6 +59,51 @@ surface.
 - **Prior art in-repo:** scene 27 (`WaveSim3D`) has the projection, masking, BCs and raymarch
   working; only the multigrid coarsening was wrong. Much of it is reusable.
 
+### C — Raymarch the whole scene from the solver (scene 29) — 🟡 PROMISING, NOT YET RIGHT
+
+No meshes at all. One fullscreen `ColorRect` running the scene-210 Moana raymarch
+(`moana_shore.gdshader`), with its analytic swell and analytic ground replaced by KP07:
+
+```
+204/210:  water = sin/cos swell + fbm + sdPlane      ground = sdPlane
+C:        water = pos.y - tx_state.r                 ground = pos.y - tx_bottom.r
+```
+
+**The port is genuinely small** — one function, `QueryOceanDistanceField`, plus the ground
+term. 204's fake bay (a sphere subtracted from the swell) is dropped, because ShoreScenario
+has a real curved shoreline with a sandbar and a Dean profile and the fake would fight it.
+`shader_type canvas_item` on a full-rect ColorRect in a `CanvasLayer(-1)`, exactly as
+water-kit mounts 210 — no mesh, no depth buffer, no camera matrix; yaw/pitch are pushed from
+`FreeCam`'s forward vector.
+
+**Why it is the right instinct.** E's failures were never about the carve — they were the
+SEAM between an SDF layer and a mesh ocean: a second water material, the layer repainting the
+whole sea, discard logic to contain it, foam that did not match, depth fights. If the ocean IS
+the raymarch there is no seam, and a barrel becomes one more SDF term instead of a second pass
+arguing with the first.
+
+**What is verified:** compiles, 119 fps, `sim x1.00`, nan 0, and it renders the real
+bathymetry — curved shoreline, sandbar, shelf — with no meshes.
+
+**What failed:** the result was rejected on sight (user, this session). **The visual failure
+mode is NOT diagnosed** — do not assume it is the two suspects below without looking.
+
+**The two known-weak points, either of which could be it:**
+- **Scale.** Every tuned constant in the oracle is in 35 m-bay units — 15 m swell amplitude,
+  35 m bay radius, 5 m white-water height, caustic and voronoi scales to match. Ours is a 92 m
+  shore with ~1 m waves. None of that was remapped; the cheap matte mode hides it, Full will
+  not.
+- **Heightfield stepping.** `pos.y - surf(pos.xz)` OVERESTIMATES distance on steep faces —
+  precisely at breaking crests — so an under-relaxed march is the difference between resolving
+  a wave and striding through it. `Step relax` exists for this and was never tuned against a
+  known-good reference.
+
+**"Done smarter" probably means:** not a verbatim oracle port. Take the raymarch architecture
+(one representation, no seam) and write shading sized for THIS domain, rather than importing
+850 lines of constants tuned for a different ocean and hoping they remap.
+
+---
+
 ### E — SDF barrel carve (no topology limit)
 
 A ridged capsule smooth-subtracted from the water so the surface wraps a tube-shaped void.
@@ -100,8 +145,15 @@ barrel spawn threshold** — it is the one measured result the whole curl thread
 Channel isolation (steepness / aeration / direction, each alone with alpha = the value) was
 what made it tunable; the blended view could not be.
 
-**E wants a field, B wants a point, A wants a curve.** That is why there is no single right
-tracker, and why the method must be selectable rather than chosen once.
+**E wants a field, B wants a point, A wants a curve.**
+
+**⚠️ THAT WAS WRONG ABOUT E, and it cost several rounds.** A field says "breaking here"; it
+cannot say WHERE THE FRONT IS in world space, and placing a tube needs a position. Age is not
+a distance field either — it ramps inside the breaking ribbon and is flat zero outside, so any
+across-crest distance derived from it saturates at the ribbon width (~0.6 m) and the tube
+collapses into a horizontal slab: a ribbon with a top and a bottom instead of a cylinder.
+**E needs a CURVE too** — hence `pass_curl_front.glsl` / `CurlFront.cs`, one entry per
+along-shore row. Age's only correct job is the crash clock: when, never where or how big.
 
 **Rule: a tracker that is OFF costs nothing.** Not "cheap" — nothing. Implemented by hiding the
 debug mesh (Godot skips hidden geometry entirely) and gating any tracker pass on the selected

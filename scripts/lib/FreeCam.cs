@@ -8,10 +8,30 @@ public partial class FreeCam : Camera3D
 {
     [Export] public float Speed = 6.0f;
     private bool _looking;
+    private bool _enabled = true;
+
+    /// <summary>
+    /// Gate the whole rig. Needed because SetProcess(false) does NOT hold: Godot enables
+    /// processing for any script that overrides _Process, so a camera parked with
+    /// SetProcess(false) before AddChild silently wakes up on tree entry — and then fights
+    /// whatever else drives the transform. Defaults true, so scenes that just `new FreeCam`
+    /// (Curl3D, RipplePool, Shorewaves, ShoreCurl, ShoreBase) are unchanged.
+    /// </summary>
+    [Export]
+    public bool Enabled
+    {
+        get => _enabled;
+        set
+        {
+            _enabled = value;
+            // Don't leave a half-finished drag armed for the next time we're switched on.
+            if (!value) { _looking = false; }
+        }
+    }
 
     public override void _UnhandledInput(InputEvent e)
     {
-        if (!Current) { return; }
+        if (!_enabled || !Current) { return; }
         if (e is InputEventMouseButton mb && mb.ButtonIndex == MouseButton.Right)
         {
             _looking = mb.Pressed;
@@ -28,7 +48,7 @@ public partial class FreeCam : Camera3D
 
     public override void _Process(double delta)
     {
-        if (!Current) { return; }
+        if (!_enabled || !Current) { return; }
         var dir = Vector3.Zero;
         Basis b = Transform.Basis;
         if (Input.IsKeyPressed(Key.W)) { dir -= b.Z; }

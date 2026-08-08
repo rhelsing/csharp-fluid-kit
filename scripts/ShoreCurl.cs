@@ -407,23 +407,23 @@ public partial class ShoreCurl : Node3D
         // zero here makes every downstream symptom — no tubes, no ghost, no carve — look like a
         // geometry bug. fragment() discards on the very first line when it is off.
         _barrelMat.SetShaderParameter("sl_enabled", 1.0f);   // layer on
-        _barrelMat.SetShaderParameter("sl_debug", 1.0f);     // magenta ghost on
+        _barrelMat.SetShaderParameter("sl_debug", 0.0f);     // ghost off
         _barrelMat.SetShaderParameter("br_fixed", 0.0f);   // dynamic slices, ghost-visualised
-        _barrelMat.SetShaderParameter("sl_smooth", 0.7018f);
+        _barrelMat.SetShaderParameter("sl_smooth", 0.05f);
         _barrelMat.SetShaderParameter("br_yaw_deg", -10.8f);
         // Tuned on screen. Set explicitly because a slider's callback only runs when it MOVES,
         // so anything left to the shader default silently disagrees with the panel.
-        _barrelMat.SetShaderParameter("sl_spacing", 6.82f);
-        _barrelMat.SetShaderParameter("sl_half_len", 1.68f);
-        _barrelMat.SetShaderParameter("sl_circle_r", 0.9295f);
+        _barrelMat.SetShaderParameter("sl_spacing", 0.5f);
+        _barrelMat.SetShaderParameter("sl_half_len", 0.5f);
+        _barrelMat.SetShaderParameter("sl_circle_r", 0.732f);
         _barrelMat.SetShaderParameter("sl_off_across", 0.2f);
-        _barrelMat.SetShaderParameter("sl_off_up", -0.08f);
-        _barrelMat.SetShaderParameter("sl_radius_by_steep", 1.005f);
-        _barrelMat.SetShaderParameter("sl_depth", 0.705f);
+        _barrelMat.SetShaderParameter("sl_off_up", 0.0f);
+        _barrelMat.SetShaderParameter("sl_radius_by_steep", 0.0f);
+        _barrelMat.SetShaderParameter("sl_depth", 0.855f);
         _barrelMat.SetShaderParameter("sl_crash", 0.0f);
         _barrelMat.SetShaderParameter("sl_seed_var", 0.7f);
-        _barrelMat.SetShaderParameter("sl_ridge_amp", 0.18f);
-        _barrelMat.SetShaderParameter("sl_spin", -1.64f);
+        _barrelMat.SetShaderParameter("sl_ridge_amp", 0.0f);
+        _barrelMat.SetShaderParameter("sl_spin", -0.6f);
         _barrelMat.SetShaderParameter("sl_spin_var", 0.0f);
         _barrelMat.SetShaderParameter("br_center", new Vector3(61.7472f, 1.14f, 41.9328f));
         _barrelMat.SetShaderParameter("br_radius", 1.601f);
@@ -563,7 +563,7 @@ public partial class ShoreCurl : Node3D
         _readout = ui.AddReadout("— fps");
 
         ui.AddSection("Tests");
-        ui.AddSlider("Sim speed", 0.05f, 1.5f, 0.05f, v => _simSpeed = v);
+        ui.AddSlider("Sim speed", 0.05f, 1.5f, 1.0215f, v => _simSpeed = v);
 
         ui.AddSection("Solvers");
         ui.AddToggle("KP07 — reference (central-upwind SWE)", true, v => _kp07 = v);
@@ -586,7 +586,7 @@ public partial class ShoreCurl : Node3D
         });
 
         ui.AddSection("Slice debug lines");
-        ui.AddToggle("Show slice lines", true, v => { _linesOn = v; RebuildLines(); });
+        ui.AddToggle("Show slice lines", false, v => { _linesOn = v; RebuildLines(); });
         ui.AddSlider("Line spacing (m)", 1.0f, 40.0f, 8.02f, v => { _lineSpacing = v; RebuildLines(); });
         ui.AddSlider("Line length (m)", 0.5f, 20.0f, 4.985f, v => { _lineLen = v; RebuildLines(); });
         ui.AddSlider("Min age to place", 0.0f, 0.5f, 0.01f, v => { _lineMinAge = v; RebuildLines(); });
@@ -633,7 +633,7 @@ public partial class ShoreCurl : Node3D
         // how big, which way they spin. On by default because placement is what is being tuned;
         // with it off you are judging a subtraction by its absence, which is what made the first
         // barrel attempt unfalsifiable.
-        ui.AddToggle("Placement ghost (magenta)", true,
+        ui.AddToggle("Placement ghost (magenta)", false,
             v => _barrelMat.SetShaderParameter("sl_debug", v ? 1.0f : 0.0f));
         // Both timing modes exist because neither is obviously right: wall-clock tunes
         // directly, phase-driven couples the crash to the swell's own frequency.
@@ -645,25 +645,25 @@ public partial class ShoreCurl : Node3D
         // The knob that made age sweep at all: at 0 the field ages per-column and never leaves
         // the blue end; at 1 it rides the front at full sqrt(g·h) and accumulates a real life.
         ui.AddSlider("Age rides wave (celerity)", 0.0f, 2.0f, 1.0f, v => { if (_age != null) { _age.Celerity = v; } });
-        ui.AddSlider("Spacing (m)", 0.5f, 40.0f, 6.82f, v => { _barrelMat.SetShaderParameter("sl_spacing", v); _trackMat.SetShaderParameter("sl_spacing", v); });
-        ui.AddSlider("Length (m, half)", 0.5f, 30.0f, 1.68f, v => _barrelMat.SetShaderParameter("sl_half_len", v));
-        ui.AddSlider("Radius (m, circular)", 0.1f, 8.0f, 0.9295f, v => _barrelMat.SetShaderParameter("sl_circle_r", v));
+        ui.AddSlider("Spacing (m)", 0.5f, 40.0f, 0.5f, v => { _barrelMat.SetShaderParameter("sl_spacing", v); _trackMat.SetShaderParameter("sl_spacing", v); });
+        ui.AddSlider("Length (m, half)", 0.5f, 30.0f, 0.5f, v => _barrelMat.SetShaderParameter("sl_half_len", v));
+        ui.AddSlider("Radius (m, circular)", 0.1f, 8.0f, 0.732f, v => _barrelMat.SetShaderParameter("sl_circle_r", v));
         ui.AddSlider("Yaw vs wave (deg)", -180.0f, 180.0f, 0.0f, v => _barrelMat.SetShaderParameter("sl_yaw_off", v));
         ui.AddSlider("Pitch vs wave (deg)", -90.0f, 90.0f, 0.0f, v => _barrelMat.SetShaderParameter("sl_pitch_off", v));
         ui.AddSlider("Offset across (m)", -20.0f, 20.0f, 0.2f, v => _barrelMat.SetShaderParameter("sl_off_across", v));
-        ui.AddSlider("Offset up (m)", -8.0f, 8.0f, -0.08f, v => _barrelMat.SetShaderParameter("sl_off_up", v));
+        ui.AddSlider("Offset up (m)", -8.0f, 8.0f, 0.0f, v => _barrelMat.SetShaderParameter("sl_off_up", v));
         ui.AddSlider("Offset along (m)", -20.0f, 20.0f, 0.0f, v => _barrelMat.SetShaderParameter("sl_off_along", v));
         ui.AddSlider("Slice length (m)", 0.3f, 20.0f, 3.846f, v => _barrelMat.SetShaderParameter("sl_len", v));
         ui.AddSlider("Bore radius (m)", 0.05f, 3.0f, 2.2625f, v => _barrelMat.SetShaderParameter("sl_radius", v));
-        ui.AddSlider("Radius by wave size", 0.0f, 3.0f, 1.005f, v => _barrelMat.SetShaderParameter("sl_radius_by_steep", v));
-        ui.AddSlider("Bore depth (m)", 0.0f, 3.0f, 0.705f, v => _barrelMat.SetShaderParameter("sl_depth", v));
+        ui.AddSlider("Radius by wave size", 0.0f, 3.0f, 0.0f, v => _barrelMat.SetShaderParameter("sl_radius_by_steep", v));
+        ui.AddSlider("Bore depth (m)", 0.0f, 3.0f, 0.855f, v => _barrelMat.SetShaderParameter("sl_depth", v));
         ui.AddSlider("Crash amount", 0.0f, 1.0f, 0.0f, v => _barrelMat.SetShaderParameter("sl_crash", v));
         ui.AddSlider("Age span (m)", 0.2f, 40.0f, 40.0f, v => _barrelMat.SetShaderParameter("sl_age_metres", v));
         ui.AddSlider("Widest at age", 0.0f, 1.0f, 0.0f, v => { _barrelMat.SetShaderParameter("sl_age_centre", v); _trackMat.SetShaderParameter("sl_age_centre", v); });
         ui.AddSlider("Slice variability", 0.0f, 1.0f, 0.7f, v => _barrelMat.SetShaderParameter("sl_seed_var", v));
-        ui.AddSlider("Lip feather", 0.05f, 4.0f, 0.7018f, v => _barrelMat.SetShaderParameter("sl_smooth", v));
-        ui.AddSlider("Ridge depth", 0.0f, 1.5f, 0.18f, v => _barrelMat.SetShaderParameter("sl_ridge_amp", v));
-        ui.AddSlider("Ridge spin (rad/s)", -4.0f, 4.0f, -1.64f, v => _barrelMat.SetShaderParameter("sl_spin", v));
+        ui.AddSlider("Lip feather", 0.05f, 4.0f, 0.05f, v => _barrelMat.SetShaderParameter("sl_smooth", v));
+        ui.AddSlider("Ridge depth", 0.0f, 1.5f, 0.0f, v => _barrelMat.SetShaderParameter("sl_ridge_amp", v));
+        ui.AddSlider("Ridge spin (rad/s)", -4.0f, 4.0f, -0.6f, v => _barrelMat.SetShaderParameter("sl_spin", v));
         ui.AddSlider("Foam gain", 0.0f, 4.0f, 1.4f, v => _barrelMat.SetShaderParameter("foam_gain", v));
         ui.AddSlider("Raymarch steps", 16, 192, 80, v => _barrelMat.SetShaderParameter("steps", (int)v));
         ui.AddSlider("Spin variability", 0.0f, 1.0f, 0.0f, v => _barrelMat.SetShaderParameter("sl_spin_var", v));

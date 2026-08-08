@@ -18,7 +18,12 @@ namespace GodotCsharpExperiments;
 // artifact-view plumbing and the similarity table on physics we already trust, so that
 // 251+ can be a formula swap into this template.
 //
-//   artifact  Jacobi K, truncated       reference  K = 400 (scaled ∝ N²)
+// Unlike 18, the domain is honest about what it is: a VERTICAL SLICE seen from the side
+// (see SideView below). 18 renders the same buoyancy-driven pipeline top-down through a
+// cup rim, which makes its drift term a sideways bias with no physical reading. Standing
+// the slice up costs nothing and makes 250 → 250b a genuine dimensional lift.
+//
+//   artifact  Jacobi K, truncated       reference  K = 400, capped (see MaxReferenceIters)
 //   field     dye, ink on paper         artifact view  |∇·v| AFTER projection
 //
 // Left-click pours, drag stirs; auto-demo pours a wandering stream and stirs a spiral.
@@ -61,6 +66,18 @@ public partial class Squish : Scene250Base
     private int _k = 132;                  // truncated Jacobi — the dial
     private const int ReferenceK = 400;    // the accurate solve, at the reference grid
 
+    // HARD CEILING on the reference solve. The similarity table says the reference should
+    // take K ∝ N², which at 1024² is 1600 sweeps a frame — that is not an A/B, that is a
+    // freeze. Capped, the toggle stays instant at every grid.
+    private const int MaxReferenceIters = 400;
+
+    private int ReferenceIters => Mathf.Min(ScaleJacobi(ReferenceK), MaxReferenceIters);
+
+    // When the cap bites, the reference is NOT matched-convergence any more, and part of
+    // what you see in the A/B is the cap rather than the material. Never let that be
+    // silent — the readout says so.
+    private bool ReferenceCapped => ScaleJacobi(ReferenceK) > MaxReferenceIters;
+
     protected override string SceneTitle => "250 · squish — residual divergence as compressibility";
 
     protected override string SceneHint =>
@@ -87,6 +104,13 @@ public partial class Squish : Scene250Base
     // doc's "default 512²". Flagged, not silent; one line to revert.
     protected override int GridDefault => 1024;
 
+    // A VERTICAL SLICE, seen from the side. fs_add_milk's drift term (v.y += dt·drift·d)
+    // is buoyancy in the plane, so the only orientation that makes it mean anything is
+    // the one where the sim's y axis is world up. Rendering this top-down — which is what
+    // scene 18 does, cup rim and all — turns buoyancy into an arbitrary sideways bias.
+    // It also makes 250b a real lift instead of a reinterpretation: same up, one more axis.
+    protected override bool SideView => true;
+
     protected override Rid FieldRid => _fluid?.DyeRid ?? default;
     protected override Rid ArtifactRid => _fluid?.DivRid ?? default;
 
@@ -110,8 +134,9 @@ public partial class Squish : Scene250Base
 
     protected override string ReadoutText()
     {
-        int k = ReferenceOn ? ScaleJacobi(ReferenceK) : _k;
-        return $"squish · {N}² · K {k}{(ReferenceOn ? " (REFERENCE)" : "")} · t×{TimeScale:0.00} "
+        int k = ReferenceOn ? ReferenceIters : _k;
+        string tag = ReferenceOn ? (ReferenceCapped ? " (REFERENCE · capped)" : " (REFERENCE)") : "";
+        return $"squish · {N}² · K {k}{tag} · t×{TimeScale:0.00} "
             + $"· ν·dt {ScaleVisc(_viscosity):0.00} cells² · {Engine.GetFramesPerSecond():0}fps";
     }
 
@@ -152,7 +177,10 @@ public partial class Squish : Scene250Base
                 float t = _demoT;
                 if (Mathf.PosMod(t, 4.0f) < 1.17f)   // scene 18's 70-in-240 ticks, in seconds
                 {
-                    pour = new Vector2(0.5f + 0.16f * Mathf.Sin(t * 0.7f), 0.5f + 0.16f * Mathf.Cos(t * 0.53f));
+                    // Source low and wandering along the floor: with drift positive the dye
+                    // is buoyant, so this reads as a rising plume — and a plume is where a
+                    // truncated projection shows itself, squashing as it climbs.
+                    pour = new Vector2(0.5f + 0.16f * Mathf.Sin(t * 0.7f), 0.14f);
                     pourAmt = _pourAmt;
                 }
                 float sa = t * 0.9f;
@@ -180,7 +208,7 @@ public partial class Squish : Scene250Base
         byte[] viscB = ToBytes(visc), mcB = ToBytes(mc);
 
         // THE A/B: one number. Everything else about the solve is identical.
-        int iters = ReferenceOn ? ScaleJacobi(ReferenceK) : _k;
+        int iters = ReferenceOn ? ReferenceIters : _k;
         int viscIters = _viscosity > 0.0005f ? _viscIters : 0;
         bool mcOn = _macCormack;
         RenderingServer.CallOnRenderThread(Callable.From(() =>

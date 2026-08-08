@@ -33,11 +33,19 @@ public abstract partial class Scene250Base : Node3D
 
     protected const string ViewShader = "res://shaders/artifact_view.gdshader";
 
-    // Every baked default in the series is authored at this grid; the similarity table
-    // scales RELATIVE to it, so tuned Copy-values stay literally correct at the default
-    // and only move when the dropdown does. Same trick as ReactiveWaveField.SpeedScale.
-    public const int RefGrid = 512;
-    protected static readonly int[] GridChoices = { 256, 512, 1024 };
+    /// <summary>
+    /// The grid this scene's baked defaults are authored at; the similarity table scales
+    /// RELATIVE to it, so tuned Copy-values stay literally correct at the default and only
+    /// move when the dropdown does (same trick as ReactiveWaveField.SpeedScale). 512 suits
+    /// a 2D scene; a 3D one overrides — 56³ is a completely different budget.
+    /// </summary>
+    protected virtual int RefGrid => 512;
+
+    /// <summary>Grid dropdown entries. 3D scenes override: 1024³ is not a thing.</summary>
+    protected virtual int[] GridOptions => new[] { 256, 512, 1024 };
+
+    /// <summary>How a grid choice is spelled in the panel.</summary>
+    protected virtual string GridLabel(int n) => $"{n}²";
 
     // ── scene identity ────────────────────────────────────────────────────────────
     protected abstract string SceneTitle { get; }
@@ -51,8 +59,17 @@ public abstract partial class Scene250Base : Node3D
     protected virtual float WorldSize => 6.0f;
     protected virtual float CameraFov => 40.0f;
 
+    /// <summary>
+    /// True = the plane is a VERTICAL SLICE seen from the side: the sim's +y axis is
+    /// world up, so an in-plane buoyancy term is real buoyancy and the scene lifts
+    /// straight to a 3D vessel. False = a horizontal slice seen from above, which is
+    /// what a height field wants (lit-height mode assumes it).
+    /// Get this wrong and the physics says one thing while the camera says another.
+    /// </summary>
+    protected virtual bool SideView => false;
+
     // ── live state the panel owns ─────────────────────────────────────────────────
-    public int N { get; private set; } = RefGrid;
+    public int N { get; private set; } = 512;   // _Ready overwrites from GridDefault
     protected Vector2I Grid => new(N, N);
 
     /// <summary>Multiplies dt in every pass. Fades must go through <see cref="Fade"/>.</summary>
@@ -75,9 +92,19 @@ public abstract partial class Scene250Base : Node3D
     protected virtual float FieldGainDefault => 1.0f;
     protected virtual float FieldGammaDefault => 1.0f;
 
+    /// <summary>
+    /// Fly camera active: the scene must stop driving the camera while this is true.
+    /// A scene with its own camera rig (250b's orbit) checks this before overriding.
+    /// </summary>
+    protected bool FlyMode { get; private set; } = true;
+
+    /// <summary>Fly camera on at open. On by default — you want to move before you want a rig.</summary>
+    protected virtual bool FlyDefault => true;
+
     protected DemoUI Ui = null!;
     protected Label Readout = null!;
     protected Camera3D Cam = null!;
+    private FreeCam _fly = null!;
     protected MeshInstance3D Plane = null!;
     protected ShaderMaterial Mat = null!;
 
@@ -95,6 +122,13 @@ public abstract partial class Scene250Base : Node3D
     protected abstract Rid FieldRid { get; }
     protected abstract Rid ArtifactRid { get; }
     protected virtual Rid DefectRid => default;
+
+    /// <summary>
+    /// Build the display when UsesFlatPlane is false (a volume raymarch, say). Runs where
+    /// BuildPlane would, i.e. BEFORE the panel — assign <see cref="Mat"/> here and the
+    /// artifact toggle + intensity wire themselves up exactly as they do in 2D.
+    /// </summary>
+    protected virtual void BuildDisplay() { }
 
     protected abstract void BuildSimKnobs(DemoUI ui);
     protected abstract void BuildArtifactKnobs(DemoUI ui);
@@ -165,12 +199,15 @@ public abstract partial class Scene250Base : Node3D
     protected Vector2 PlaneMouseUv()
     {
         var mp = GetViewport().GetMousePosition();
-        var ground = new Plane(Vector3.Up, 0.0f);
-        if (ground.IntersectsRay(Cam.ProjectRayOrigin(mp), Cam.ProjectRayNormal(mp)) is not Vector3 hit)
+        // Match the plane built above: the slice faces −Z, the top-down plane faces +Y.
+        var face = new Plane(SideView ? Vector3.Forward : Vector3.Up, 0.0f);
+        if (face.IntersectsRay(Cam.ProjectRayOrigin(mp), Cam.ProjectRayNormal(mp)) is not Vector3 hit)
         {
             return new Vector2(-1, -1);
         }
-        var uv = new Vector2(hit.X / WorldSize + 0.5f, hit.Z / WorldSize + 0.5f);
+        var uv = SideView
+            ? new Vector2(hit.X / WorldSize + 0.5f, hit.Y / WorldSize + 0.5f)
+            : new Vector2(hit.X / WorldSize + 0.5f, hit.Z / WorldSize + 0.5f);
         return uv.X < 0 || uv.X > 1 || uv.Y < 0 || uv.Y > 1 ? new Vector2(-1, -1) : uv;
     }
 
@@ -180,7 +217,7 @@ public abstract partial class Scene250Base : Node3D
         N = GridDefault;
         TimeScale = TimeScaleDefault;
         BuildEnvironment();
-        if (UsesFlatPlane) { BuildPlane(); }
+        if (UsesFlatPlane) { BuildPlane(); } else { BuildDisplay(); }
         RenderingServer.CallOnRenderThread(Callable.From(BuildSim));
         BuildUi();
     }
@@ -212,10 +249,30 @@ public abstract partial class Scene250Base : Node3D
 
     private void BuildEnvironment()
     {
-        float h = WorldSize * 0.5f / Mathf.Tan(Mathf.DegToRad(CameraFov * 0.5f)) * 1.06f;
-        Cam = new Camera3D { Fov = CameraFov, Position = new Vector3(0, h, 0.01f), Far = 200.0f, Current = true };
+        float d = WorldSize * 0.5f / Mathf.Tan(Mathf.DegToRad(CameraFov * 0.5f)) * 1.06f;
+
+        // Always a FreeCam, gated OFF until the fly toggle turns it on — so every scene in
+        // the series can be flown without re-deriving a rig. Enabled, not SetProcess: see
+        // FreeCam.Enabled for why the process flag can't be trusted here.
+        FlyMode = FlyDefault;
+        _fly = new FreeCam
+        {
+            Speed = WorldSize, Fov = CameraFov, Far = 200.0f, Current = true, Enabled = FlyMode,
+        };
+        Cam = _fly;
         AddChild(Cam);
-        Cam.LookAt(Vector3.Zero, Vector3.Forward);
+
+        if (SideView)
+        {
+            // Stand off along −Z and look at the slice face-on, up = world up.
+            Cam.Position = new Vector3(0, 0, -d);
+            Cam.LookAt(Vector3.Zero, Vector3.Up);
+        }
+        else
+        {
+            Cam.Position = new Vector3(0, d, 0.01f);
+            Cam.LookAt(Vector3.Zero, Vector3.Forward);
+        }
 
         // LINEAR tonemap on purpose: the palette is designed, and a filmic curve would
         // shift every one of its six colours. What artifact_view writes is what you see.
@@ -236,6 +293,13 @@ public abstract partial class Scene250Base : Node3D
             CastShadow = GeometryInstance3D.ShadowCastingSetting.Off,
             ExtraCullMargin = 4.0f,
         };
+        if (SideView)
+        {
+            // PlaneMesh lies in XZ with UV u←x, v←z. Rotating −90° about X sends local
+            // +Z to world +Y, so v (the sim's y axis) becomes world UP — buoyancy rises
+            // on screen — and the face normal turns to −Z, toward the camera.
+            Plane.RotationDegrees = new Vector3(-90.0f, 0.0f, 0.0f);
+        }
         _fieldTex = new Texture2Drd();
         _artifactTex = new Texture2Drd();
         _defectTex = new Texture2Drd();
@@ -266,11 +330,12 @@ public abstract partial class Scene250Base : Node3D
         Ui.AddSlider("TIME scale (slow-mo; fades follow)", 0.05f, 1.5f, TimeScale, v => TimeScale = v);
 
         // 3. Grid — live rebuild, with the similarity table applied to every Scale* knob.
-        int sel = System.Array.IndexOf(GridChoices, N);
-        var names = new string[GridChoices.Length];
-        for (int i = 0; i < GridChoices.Length; i++) { names[i] = $"{GridChoices[i]}²"; }
+        var choices = GridOptions;
+        int sel = System.Array.IndexOf(choices, N);
+        var names = new string[choices.Length];
+        for (int i = 0; i < choices.Length; i++) { names[i] = GridLabel(choices[i]); }
         Ui.AddOptions("Grid (rebuilds; knobs keep world meaning)", names, sel < 0 ? 0 : sel,
-            i => SetGrid(GridChoices[i]));
+            i => SetGrid(choices[i]));
 
         // 4. scene sim knobs
         BuildSimKnobs(Ui);
@@ -299,6 +364,14 @@ public abstract partial class Scene250Base : Node3D
 
         // 7. render
         Ui.AddSection("Render");
+        Ui.AddToggle("Camera · FLY (hold RMB look · WASD · Q/E · Shift fast)", FlyMode, on =>
+        {
+            FlyMode = on;
+            _fly.Enabled = on;
+            // Leaving fly mode mid-look would otherwise strand the pointer captured.
+            if (!on) { Input.MouseMode = Input.MouseModeEnum.Visible; }
+        });
+        Ui.AddSlider("Camera · fly speed", 0.5f, 40.0f, _fly.Speed, v => _fly.Speed = v);
         if (UsesFlatPlane)
         {
             Ui.AddOptions("Display mode",

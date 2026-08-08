@@ -205,7 +205,13 @@ float BarrelSliceFieldA(vec3 pos, float t, out float ang_out, out float age_out,
 	// --- the curve, sampled at the slice centre and either side for the tangent ---
 	float du = spacing / DOMAIN_SIZE;
 	vec4 f0 = texture(tx_front, vec2(clamp(zc / DOMAIN_SIZE, 0.0, 1.0), 0.5));
-	if (f0.a < 0.5) { return 1e5; }                 // no front on this row: no tube
+	// CONTINUOUS lookup at THIS point's own z, not the slice centre. Sampling only at the
+	// centre made each tube a straight chord across a curving front, so it drifted off the wave
+	// by up to half a slice at the ends — the tubes looked out of sync with the crest even
+	// though placement was correct. The front texture is filter_linear, so this interpolates
+	// between rows for free and the tube sweeps along the curve.
+	vec4 fp = texture(tx_front, vec2(clamp(pos.z / DOMAIN_SIZE, 0.0, 1.0), 0.5));
+	if (fp.a < 0.5) { return 1e5; }                 // no front here: no tube
 	vec4 fa = texture(tx_front, vec2(clamp((zc - spacing * 0.5) / DOMAIN_SIZE, 0.0, 1.0), 0.5));
 	vec4 fb = texture(tx_front, vec2(clamp((zc + spacing * 0.5) / DOMAIN_SIZE, 0.0, 1.0), 0.5));
 
@@ -220,8 +226,8 @@ float BarrelSliceFieldA(vec3 pos, float t, out float ang_out, out float age_out,
 	float seed = hash11(slice) * sl_seed_var;
 
 	// --- slice centre, then project the sample point into the tube's own frame ---
-	vec2 C = vec2(f0.r, zc) + norm * sl_off_across + tang * sl_off_along;
-	float Cy = f0.g - sl_depth - sl_off_up;
+	vec2 C = vec2(fp.r, zc) + norm * sl_off_across + tang * sl_off_along;
+	float Cy = fp.g - sl_depth - sl_off_up;
 	vec2 dxz = pos.xz - C;
 	float a = dot(dxz, tang);                       // along the axis
 	float b = dot(dxz, norm);                       // across the wave
@@ -238,7 +244,7 @@ float BarrelSliceFieldA(vec3 pos, float t, out float ang_out, out float age_out,
 	float across = ab.y;
 	float vert = ac.y;
 
-	float R = max((sl_circle_r + f0.b * sl_radius_by_steep * 0.5) * (1.0 - sl_crash * age), 0.02);
+	float R = max((sl_circle_r + fp.b * sl_radius_by_steep * 0.5) * (1.0 - sl_crash * age), 0.02);
 	float L = max(sl_half_len, 0.05);
 
 	// 210's capsule, unchanged: a segment of length 2L swept by a sphere of radius R.
@@ -330,14 +336,25 @@ void fragment() {
 	if (hit < 0.0) { discard; }
 
 	vec3 p = ro + rd * hit;
+
+	// DISCARD WHERE THE CARVE ISN'T. Scene() is sdSmoothSubtraction(carve, WaterField), and
+	// WaterField is defined across the ENTIRE domain because its UVs are clamped — so without
+	// this the march hits water everywhere and the layer repaints the whole sea in its own
+	// colours, laying a second water material over the real one. That is not a shading bug to
+	// tune, it is this pass running where it has no business running. Only pixels the carve
+	// actually reaches belong to this layer; everywhere else the water mesh owns the frame.
+	float infl = br_fixed > 0.5 ? BarrelCarveField(p, TIME) : BarrelSliceField(p, TIME);
+	if (infl > sl_smooth * 2.0) { discard; }
+
 	vec3 n = SceneNormal(p, TIME, 0.03);
 
 	float lam = clamp(dot(n, normalize(sun_dir)), 0.0, 1.0);
 	float fres = pow(1.0 - clamp(dot(n, -rd), 0.0, 1.0), 3.0);
-	// how far the carve reached here — the lip and the throat are where foam belongs
-	float carve = br_fixed > 0.5 ? BarrelCarveField(p, TIME) : BarrelSliceField(p, TIME);
-	float lip = clamp(1.0 - abs(carve) / max(sl_smooth, 1e-3), 0.0, 1.0);
-	float froth = clamp(pow(lip, 2.0) * foam_gain, 0.0, 1.0);
+	// NO BESPOKE FOAM. This layer used to paint froth wherever a sample sat near the carve
+	// surface — a decorative term keyed to distance-from-carve, with no physics behind it, and
+	// it did not match the water shader. The water's own foam (tx_derived, foam_breakup) is the
+	// only foam now, so the barrel reads as the same water rather than a second material.
+	float froth = 0.0;
 
 	vec2 uv = clamp(p.xz / DOMAIN_SIZE, vec2(0.0), vec2(1.0));
 	float depth = clamp((texture(tx_state, uv).r - texture(tx_bottom, uv).r) * 0.8, 0.0, 1.0);

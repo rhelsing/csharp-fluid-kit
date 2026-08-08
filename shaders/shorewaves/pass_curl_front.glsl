@@ -42,6 +42,11 @@ void main() {
 	// has a steep face AND a steep back, and the seaward edge is the one the lip throws from.
 	// Taking the max would sit the tube on whichever side happened to be sharper this frame,
 	// which reads as the barrel flickering between the front and back of the same wave.
+	// First cell past the gate, then stop. Restored: the sub-cell + no-hard-miss version made
+	// the flicker WORSE, and the reason is the fallback, not the interpolation — when no cell
+	// crossed the gate it reported the row's strongest wet cell instead, which can be anywhere
+	// (far offshore, or at the shoreline). So a marginal row stopped losing its tube and
+	// started TELEPORTING it, which reads far worse than a clean disappearance.
 	float best_x = -1.0;
 	float best_s = 0.0;
 	float best_w = 0.0;
