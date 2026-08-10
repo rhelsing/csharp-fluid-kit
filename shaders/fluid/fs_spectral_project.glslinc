@@ -1,0 +1,105 @@
+#version 450
+// fs_spectral_project — scene 257 eq. THE instrument of the artifact series: an equalizer
+// on incompressibility.
+//
+// In the cosine basis the discrete Poisson operator is DIAGONAL. The 5-point Laplacian the
+// whole fluid is built on has eigenvalues
+//
+//     λ(p,q) = 2(cos(πp/N) − 1) + 2(cos(πq/N) − 1)
+//
+// so the exact solve of ∇²p = div is one divide per cell — no iteration, no truncation, no
+// convergence to argue about:
+//
+//     p̂ = d̂ / λ            and then            p̂ ← W(k) · p̂
+//
+// W(k) = 1 is EXACT projection. Every other artifact in Block A is "the honest answer minus
+// however much the solver failed to do"; this one is the honest answer times a curve you
+// draw. That is the whole difference between an error and an instrument.
+//
+// W = lowpass(knee, slope) × notch(centre, width, depth), both in NORMALISED wavenumber
+// κ = √(p² + q²)/N ∈ [0, √2]. The host converts a world WAVELENGTH into κ, which is what
+// makes the knee the series' only fully grid-proof artifact knob (artifacts-250.md "Grid &
+// similarity", design response #1) — squish's residual length is measured in cells and
+// plaid's is welded to two of them, but a world wavenumber means the same thing at any N.
+//
+// WHY THIS SCENE ANSWERS 256. docs/artifacts-log.md §1: a residual reads as a material when
+// it is low-frequency and convects, and as noise when it sits at the grid frequency. Here
+// that is not a discovery you live with, it is two sliders — keep the long wavelengths
+// under-projected (compliance, the good part of squish) and leave the short ones fully
+// projected (no grid-frequency junk, the bad part of plaid).
+//
+// λ(0,0) = 0 is the Neumann null space: pressure is only defined up to a constant, so the
+// DC mode is set to zero rather than divided by zero.
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(r32f, set = 0, binding = 0) uniform image2D spec;   // in-place: d̂ → p̂
+
+layout(push_constant, std430) uniform P {
+    vec2  size;
+    float knee;        // lowpass corner, normalised κ
+    float slope;       // rolloff order (1 = gentle, 8 = brick)
+    float notch_at;    // notch centre, normalised κ
+    float notch_width;
+    float notch_depth; // 0 = no notch, 1 = full kill
+    float bypass;      // != 0 → W ≡ 1, the EXACT projection (the reference A/B)
+    float tilt;        // 0 = lowpass, 1 = highpass — see below
+    // PAD TO 48 BYTES — 12 floats exactly. Godot rounds a push-constant block up to a
+    // multiple of 16, so this struct's natural 36 bytes make the pipeline demand 48 and
+    // the host's 9-float array is rejected outright at dispatch. Keep the padding explicit
+    // and the C# side at 12 floats; the mismatch is invisible until the scene runs.
+    float _p0;
+    float _p1;
+    float _p2;
+} pc;
+
+// TILT — which way the shelf faces, and it decides WHICH MATERIAL you get.
+//
+//   tilt 0  LOWPASS.  W≈1 below the knee, →0 above. Long features fully projected and
+//           rigid; short ones left compressible. This is fine-scale-only compressibility,
+//           i.e. exactly what the plan calls 254 macro-honest.
+//   tilt 1  HIGHPASS. W→0 below the knee, ≈1 above. Long features under-projected and
+//           compliant; short ones rigid. This is squish's smooth, domain-scale residual —
+//           the material docs/artifacts-log.md §1 found people actually like — with the
+//           grid-frequency junk that ruined 256 explicitly kept OUT.
+//
+// Both are one line apart, and having only the lowpass (which is all the base doc names)
+// would mean this scene could produce the artifact 256 lost with and not the one 250 won
+// with. The tension §1 identified is only resolvable if the curve can face either way.
+
+const float PI = 3.14159265358979;
+
+void main() {
+    ivec2 c = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 mx = ivec2(pc.size) - ivec2(1);
+    if (c.x > mx.x || c.y > mx.y) { return; }
+
+    // Neumann Poisson eigenvalue for the 5-point stencil, unit spacing.
+    float lam = 2.0 * (cos(PI * float(c.x) / pc.size.x) - 1.0)
+              + 2.0 * (cos(PI * float(c.y) / pc.size.y) - 1.0);
+
+    if (lam > -1.0e-12) {
+        imageStore(spec, c, vec4(0.0, 0.0, 0.0, 0.0));   // DC / null space
+        return;
+    }
+
+    float phat = imageLoad(spec, c).r / lam;
+
+    if (pc.bypass == 0.0) {
+        float kx = float(c.x) / pc.size.x;
+        float ky = float(c.y) / pc.size.y;
+        float kappa = sqrt(kx * kx + ky * ky);
+
+        // Butterworth-style shelf; tilt picks which side of the knee keeps its projection.
+        float lp = 1.0 / (1.0 + pow(max(kappa, 1.0e-6) / max(pc.knee, 1.0e-6), 2.0 * pc.slope));
+        lp = mix(lp, 1.0 - lp, clamp(pc.tilt, 0.0, 1.0));
+
+        // Gaussian notch — a band of scales simply removed from the projection.
+        float d = (kappa - pc.notch_at) / max(pc.notch_width, 1.0e-6);
+        float notch = 1.0 - pc.notch_depth * exp(-d * d);
+
+        phat *= clamp(lp * notch, 0.0, 1.0);
+    }
+
+    imageStore(spec, c, vec4(phat, 0.0, 0.0, 0.0));
+}

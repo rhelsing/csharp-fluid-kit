@@ -1,0 +1,48 @@
+#version 450
+// fs_pressure_warm — scale the pressure field by μ before the solve. The entire mechanism
+// of scene 253 memory, in one line.
+//
+// Every Stam solver already warm-starts: last frame's p is this frame's initial guess, and
+// with a truncated solve that means some of last frame's pressure SURVIVES into this one.
+// Normally that is an implementation detail nobody dials. Here it is the instrument:
+//
+//     p₀ ← μ · p_prev
+//
+//   μ = 0      cold start. No memory; the fluid forgets every frame.
+//   μ → 1      the standard warm start — pressure persists and decays only as the solve
+//              corrects it. The material remembers being squeezed.
+//   μ > 1      SELF-EXCITING. Each frame re-amplifies what the last one left, and a
+//              truncated solve cannot remove it fast enough — p grows without bound.
+//              The host clamps the slider just above 1 so the edge is reachable and the
+//              blow-up is not.
+//
+// In-place is safe here precisely because there are no neighbour reads: every cell scales
+// only itself, so there is no read/write hazard of the kind that forced fs_pressure_rbgs
+// to ping-pong.
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+layout(r32f, set = 0, binding = 0) uniform image2D p;   // in-place
+
+// The same 4-float block the rest of the projection stage takes. μ rides in the 4th slot,
+// which fs_pressure_rbgs declares as _pad and fs_divergence / fs_gradient_sub ignore.
+layout(push_constant, std430) uniform P {
+    vec2  size;
+    float omega;
+    float mu;
+} pc;
+
+// Magnitude rail. μ > 1 is a genuine positive feedback loop, and without this a few
+// seconds past the edge leaves p at inf — the scene never recovers and has to be
+// relaunched. Clamping keeps the self-exciting range EXPLORABLE, which is the point of
+// having it on a slider at all. Far above any pressure the fluid produces on its own, so
+// it does nothing until the loop is already running away.
+const float P_RAIL = 1.0e4;
+
+void main() {
+    ivec2 c = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 mx = ivec2(pc.size) - ivec2(1);
+    if (c.x > mx.x || c.y > mx.y) { return; }
+
+    float v = imageLoad(p, c).r * pc.mu;
+    imageStore(p, c, vec4(clamp(v, -P_RAIL, P_RAIL), 0.0, 0.0, 0.0));
+}

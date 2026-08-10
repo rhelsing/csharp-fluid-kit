@@ -1,0 +1,49 @@
+#version 450
+// f3_pressure_rbgs — the 3D twin of fs_pressure_rbgs: one red-black Gauss-Seidel
+// HALF-sweep of ∇²p = div (7-point), with SOR over-relaxation. Scene 251b's solver.
+//
+//     p_GS = (Σ 6 neighbours − div) / 6      p = p_old + ω (p_GS − p_old)
+//
+// ω < 1 pillow · ω = 1 plain Gauss-Seidel · 1 < ω < 2 ringing · ω ≥ 2 divergent.
+//
+// PARITY IS SUMMED OVER ALL THREE AXES — (x+y+z)&1, not the 2D (x+y)&1. This is the one
+// thing that does not survive the dimensional lift by inspection: a 2D-style parity does
+// NOT two-colour a 6-neighbour lattice, so half the "black" cells would end up adjacent
+// to each other and the pass would read values it is concurrently writing. The stamp
+// solver hit this first and solve_rbgs.glslinc carries the same warning.
+
+layout(local_size_x = 4, local_size_y = 4, local_size_z = 4) in;
+layout(r32f, set = 0, binding = 0) uniform image3D p_in;
+layout(r32f, set = 1, binding = 0) uniform image3D div;
+layout(r32f, set = 2, binding = 0) uniform image3D p_out;
+
+// Same 8-float block every 3D projection pass takes ({ vec4 size; vec4 pad; }); ω rides
+// in pad.y, which f3_divergence / f3_gradient_sub ignore.
+layout(push_constant, std430) uniform P {
+    vec4 size;
+    vec4 pad;      // .x = free-slip flag (gradient pass), .y = omega
+} pc;
+
+void main() {
+    ivec3 c = ivec3(gl_GlobalInvocationID.xyz);
+    ivec3 mx = ivec3(pc.size.xyz) - ivec3(1);
+    if (c.x > mx.x || c.y > mx.y || c.z > mx.z) { return; }
+
+    float pOld = imageLoad(p_in, c).r;
+    if (((c.x + c.y + c.z) & 1) != PARITY) {
+        imageStore(p_out, c, vec4(pOld, 0.0, 0.0, 0.0));   // other colour: copy through
+        return;
+    }
+
+    float s =
+        imageLoad(p_in, clamp(c + ivec3(1, 0, 0), ivec3(0), mx)).r +
+        imageLoad(p_in, clamp(c + ivec3(-1, 0, 0), ivec3(0), mx)).r +
+        imageLoad(p_in, clamp(c + ivec3(0, 1, 0), ivec3(0), mx)).r +
+        imageLoad(p_in, clamp(c + ivec3(0, -1, 0), ivec3(0), mx)).r +
+        imageLoad(p_in, clamp(c + ivec3(0, 0, 1), ivec3(0), mx)).r +
+        imageLoad(p_in, clamp(c + ivec3(0, 0, -1), ivec3(0), mx)).r;
+    float d = imageLoad(div, c).r;
+
+    float pGs = (s - d) / 6.0;
+    imageStore(p_out, c, vec4(pOld + pc.pad.y * (pGs - pOld), 0.0, 0.0, 0.0));
+}

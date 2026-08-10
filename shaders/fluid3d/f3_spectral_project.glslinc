@@ -1,0 +1,74 @@
+#version 450
+// f3_spectral_project — scene 257b. The equalizer on incompressibility, in a volume.
+//
+// The 7-point Laplacian is diagonal in the cosine basis, so the exact solve of ∇²p = div is
+// one divide per cell:
+//
+//     λ(p,q,r) = 2(cos(πp/Nx) − 1) + 2(cos(πq/Ny) − 1) + 2(cos(πr/Nz) − 1)
+//     p̂ = d̂ / λ                then                p̂ ← W(k) · p̂
+//
+// W = lowpass(knee, slope) × notch(centre, width, depth), in normalised wavenumber
+// κ = √((p/Nx)² + (q/Ny)² + (r/Nz)²). The host converts a world WAVELENGTH into κ, which is
+// what keeps the knee grid-proof — the same knob means the same thing at 56³ and 96³.
+//
+// λ(0,0,0) = 0 is the Neumann null space: pressure is defined only up to a constant, so the
+// DC mode is zeroed rather than divided by zero.
+//
+// The 3D box is NOT cubic (N × 1.5N × N), so each axis is normalised by its OWN length.
+// Using a single N would tilt the filter — a mode of the same physical wavelength would sit
+// at a different κ depending on which way it ran, and the "knee" would be direction-
+// dependent. That is the one place this does not lift from 2D by inspection.
+
+layout(local_size_x = 4, local_size_y = 4, local_size_z = 4) in;
+
+layout(r32f, set = 0, binding = 0) uniform image3D spec;   // in-place: d̂ → p̂
+
+layout(push_constant, std430) uniform P {
+    vec4  size;
+    float knee;
+    float slope;
+    float notch_at;
+    float notch_width;
+    float notch_depth;
+    float bypass;      // != 0 → W ≡ 1, the EXACT projection (the reference A/B)
+    float tilt;        // 0 = lowpass (fine-scale compressible) · 1 = highpass (large-scale
+                       // compliant). Which way the shelf faces decides WHICH material you
+                       // get — see fs_spectral_project for the full argument.
+    float _p1;
+} pc;
+
+const float PI = 3.14159265358979;
+
+void main() {
+    ivec3 c = ivec3(gl_GlobalInvocationID.xyz);
+    ivec3 mx = ivec3(pc.size.xyz) - ivec3(1);
+    if (c.x > mx.x || c.y > mx.y || c.z > mx.z) { return; }
+
+    float lam = 2.0 * (cos(PI * float(c.x) / pc.size.x) - 1.0)
+              + 2.0 * (cos(PI * float(c.y) / pc.size.y) - 1.0)
+              + 2.0 * (cos(PI * float(c.z) / pc.size.z) - 1.0);
+
+    if (lam > -1.0e-12) {
+        imageStore(spec, c, vec4(0.0, 0.0, 0.0, 0.0));   // DC / null space
+        return;
+    }
+
+    float phat = imageLoad(spec, c).r / lam;
+
+    if (pc.bypass == 0.0) {
+        float kx = float(c.x) / pc.size.x;
+        float ky = float(c.y) / pc.size.y;
+        float kz = float(c.z) / pc.size.z;
+        float kappa = sqrt(kx * kx + ky * ky + kz * kz);
+
+        float lp = 1.0 / (1.0 + pow(max(kappa, 1.0e-6) / max(pc.knee, 1.0e-6), 2.0 * pc.slope));
+        lp = mix(lp, 1.0 - lp, clamp(pc.tilt, 0.0, 1.0));
+
+        float d = (kappa - pc.notch_at) / max(pc.notch_width, 1.0e-6);
+        float notch = 1.0 - pc.notch_depth * exp(-d * d);
+
+        phat *= clamp(lp * notch, 0.0, 1.0);
+    }
+
+    imageStore(spec, c, vec4(phat, 0.0, 0.0, 0.0));
+}

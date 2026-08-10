@@ -1,0 +1,97 @@
+#version 450
+// fs_pressure_adi — scene 255 grain. One ADI half-sweep: solve every LINE along one axis
+// EXACTLY as a tridiagonal system, holding the cross-axis neighbours fixed.
+//
+//   along x:   −p(i−1,j) + 4·p(i,j) − p(i+1,j)  =  −div(i,j) + p(i,j−1) + p(i,j+1)
+//
+// One thread per line, Thomas algorithm (forward elimination + back substitution). The
+// modified super-diagonal c' is written into a scratch texture because it cannot live in
+// registers for a line of 512 — that scratch is the only reason this needs a texture the
+// other solvers do not.
+//
+// WHY THIS PRODUCES A DIRECTIONAL ARTIFACT. Along the swept axis the solve is EXACT — the
+// line is solved to machine precision in one pass, so information crosses the whole domain
+// instantly. Across the other axis nothing has moved at all: those neighbours were frozen.
+// Alternate x and y and the two axes converge at completely different rates, and truncating
+// the alternation freezes that imbalance into the residual as STRIPES along whichever axis
+// was swept last. The material is stiffer along one direction than the other — anisotropy
+// produced purely by the order the solver visited things.
+//
+// ⚠ BUILT AS A FALSIFICATION TEST (docs/artifacts-log.md §1a). The law derived from 250 vs
+// 256 says a residual reads as a material only if it is low-frequency AND convects with the
+// fluid. Sweep-line stripes are grid-aligned and welded to the lattice — the same shape as
+// plaid, which lost to its own reference. The law therefore predicts THIS SCENE FAILS. If
+// it reads as a real anisotropic material anyway, the law is wrong, and that is the more
+// valuable outcome.
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+// PING-PONGED, not in-place. Parallel lines each read their cross-axis neighbours, which
+// belong to the lines beside them — updating in place would have thread j reading values
+// threads j±1 are concurrently writing. Reading the cross terms from the PREVIOUS iterate
+// is also what ADI actually specifies, so the fix and the correct scheme are the same thing.
+layout(r32f, set = 0, binding = 0) uniform image2D p_in;       // read-only: cross-axis terms
+layout(r32f, set = 1, binding = 0) uniform image2D div;
+layout(r32f, set = 2, binding = 0) uniform image2D cscratch;   // Thomas c' per cell
+layout(r32f, set = 3, binding = 0) uniform image2D p_out;      // this thread owns its line
+
+layout(push_constant, std430) uniform P {
+    vec2  size;
+    float omega;   // shared projection block — unused here
+    float mu;      // unused here
+} pc;
+
+// Neumann walls: a boundary cell has 3 neighbours, not 4, so its diagonal drops by one.
+// Getting this wrong is the classic tridiagonal-with-Neumann bug — the interior looks
+// perfect and the solve leans against the walls.
+void main() {
+    int line = int(gl_GlobalInvocationID.x);
+    int nx = int(pc.size.x);
+    int ny = int(pc.size.y);
+
+    int n = (AXIS == 0) ? nx : ny;          // length of the line being solved
+    int lines = (AXIS == 0) ? ny : nx;      // how many such lines exist
+    if (line >= lines) { return; }
+
+    // ---- forward elimination -------------------------------------------------------
+    float cprev = 0.0;
+    float dprev = 0.0;
+
+    for (int i = 0; i < n; i++) {
+        ivec2 c = (AXIS == 0) ? ivec2(i, line) : ivec2(line, i);
+
+        // cross-axis contribution is KNOWN this half-sweep — it moves to the rhs
+        ivec2 up = (AXIS == 0) ? ivec2(i, min(line + 1, ny - 1)) : ivec2(min(line + 1, nx - 1), i);
+        ivec2 dn = (AXIS == 0) ? ivec2(i, max(line - 1, 0)) : ivec2(max(line - 1, 0), i);
+        float rhs = -imageLoad(div, c).r + imageLoad(p_in, up).r + imageLoad(p_in, dn).r;
+
+        float diag = 4.0;
+        if (i == 0 || i == n - 1) { diag -= 1.0; }        // Neumann along the line
+        if (line == 0 || line == lines - 1) { diag -= 1.0; }  // Neumann across it
+
+        float lower = (i == 0) ? 0.0 : -1.0;
+        float upper = (i == n - 1) ? 0.0 : -1.0;
+
+        float denom = diag - lower * cprev;
+        float cp = upper / denom;
+        float dp = (rhs - lower * dprev) / denom;
+
+        imageStore(cscratch, c, vec4(cp, 0.0, 0.0, 0.0));
+        imageStore(p_out, c, vec4(dp, 0.0, 0.0, 0.0));   // parks d'; back-substitution fixes it
+        cprev = cp;
+        dprev = dp;
+    }
+
+    // ---- back substitution ---------------------------------------------------------
+    float next = dprev;
+    {
+        ivec2 c = (AXIS == 0) ? ivec2(n - 1, line) : ivec2(line, n - 1);
+        imageStore(p_out, c, vec4(next, 0.0, 0.0, 0.0));
+    }
+    for (int i = n - 2; i >= 0; i--) {
+        ivec2 c = (AXIS == 0) ? ivec2(i, line) : ivec2(line, i);
+        float val = imageLoad(p_out, c).r - imageLoad(cscratch, c).r * next;
+        imageStore(p_out, c, vec4(val, 0.0, 0.0, 0.0));
+        next = val;
+    }
+}

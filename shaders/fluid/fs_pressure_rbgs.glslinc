@@ -1,0 +1,58 @@
+#version 450
+// fs_pressure_rbgs — one red-black Gauss-Seidel HALF-sweep of ∇²p = div, with SOR
+// over-relaxation. The pressure solver behind scene 251 bounce, and the same kernel
+// scene 256 plaid wants (plaid is just this at ω = 1 and very few sweeps).
+//
+//     p_GS = (p_L + p_R + p_D + p_U − div) / 4
+//     p    = p_old + ω (p_GS − p_old)
+//
+// ω is the instrument:
+//   ω < 1   under-relaxed — the solve creeps toward the answer and never overshoots.
+//           Reads as a PILLOW: the fluid absorbs a push and settles into it.
+//   ω = 1   plain Gauss-Seidel — ~2× Jacobi's convergence for the same work.
+//   1 < ω < 2  over-relaxed — each update overshoots and is pulled back, leaving a
+//           spatially correlated over/under pattern. Reads as ELASTICITY / ringing.
+//   ω ≥ 2   divergent. The slider stops at 1.95 on purpose.
+//
+// PARITY is a compile-time define, not a push constant — two pipelines, exactly as
+// shaders/stamp/solve_rbgs.glslinc does it. That buys the thing that makes GS work on a
+// GPU at all: run red (0) then black (1), and the black pass reads the texture the red
+// pass just wrote, so it relaxes against FRESH neighbours. Ping-ponging (rather than
+// updating in place) is what removes the read/write hazard between a cell and the
+// neighbour being written beside it in the same dispatch; the off-colour is copied
+// through untouched so nothing is lost.
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+layout(r32f, set = 0, binding = 0) uniform image2D p_in;
+layout(r32f, set = 1, binding = 0) uniform image2D div;
+layout(r32f, set = 2, binding = 0) uniform image2D p_out;
+
+// Same 4-float block as the other projection passes: fs_divergence / fs_gradient_sub
+// declare it as { vec2 size; vec2 pad; } and simply ignore omega, so ONE simPc still
+// drives the whole projection stage and no host-side layout changes.
+layout(push_constant, std430) uniform P {
+    vec2  size;
+    float omega;
+    float _pad;
+} pc;
+
+void main() {
+    ivec2 c = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 mx = ivec2(pc.size) - ivec2(1);
+    if (c.x > mx.x || c.y > mx.y) { return; }
+
+    float pOld = imageLoad(p_in, c).r;
+    if (((c.x + c.y) & 1) != PARITY) {
+        imageStore(p_out, c, vec4(pOld, 0.0, 0.0, 0.0));   // other colour: copy through
+        return;
+    }
+
+    float pR = imageLoad(p_in, clamp(c + ivec2(1, 0), ivec2(0), mx)).r;
+    float pL = imageLoad(p_in, clamp(c + ivec2(-1, 0), ivec2(0), mx)).r;
+    float pU = imageLoad(p_in, clamp(c + ivec2(0, 1), ivec2(0), mx)).r;
+    float pD = imageLoad(p_in, clamp(c + ivec2(0, -1), ivec2(0), mx)).r;
+    float d = imageLoad(div, c).r;
+
+    float pGs = (pL + pR + pU + pD - d) * 0.25;
+    imageStore(p_out, c, vec4(pOld + pc.omega * (pGs - pOld), 0.0, 0.0, 0.0));
+}

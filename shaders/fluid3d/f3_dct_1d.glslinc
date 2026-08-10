@@ -1,0 +1,61 @@
+#version 450
+// f3_dct_1d — one separable 1D cosine transform along x, y or z, forward or inverse. Six
+// pipelines from one source via AXIS / INVERSE defines.
+//
+// Same argument as the 2D version, and it does not weaken in 3D: the fluid addresses
+// neighbours with clamp(c + off, 0, mx) on every axis — NEUMANN walls — and the cosine
+// basis diagonalises exactly that. A complex FFT diagonalises the periodic operator and
+// would wrap each of the SIX faces into its opposite.
+//
+//   DCT-II  (forward)  X_p = Σ_i x_i cos(π(i+½)p/N)
+//   DCT-III (inverse)  x_i = ( X_0 + 2 Σ_{p≥1} X_p cos(π(i+½)p/N) ) / N
+//
+// COST. Direct, O(N) per output. Per axis pass that is cells × axis-length reads:
+// ~15 M at 56×84×56 and ~127 M at 96×144×96. Seven passes a frame (3 forward, filter,
+// 3 inverse) ⇒ roughly 0.9 ms and 7.5 ms respectively — which is why 257b's ladder stops
+// at 96³ where 257's stops at 512². Note the y axis is 1.5N here, so its pass costs half
+// again as much as x or z.
+
+layout(local_size_x = 4, local_size_y = 4, local_size_z = 4) in;
+
+layout(r32f, set = 0, binding = 0) uniform image3D src;
+layout(r32f, set = 1, binding = 0) uniform image3D dst;
+
+layout(push_constant, std430) uniform P {
+    vec4 size;
+    vec4 pad;
+} pc;
+
+const float PI = 3.14159265358979;
+
+void main() {
+    ivec3 c = ivec3(gl_GlobalInvocationID.xyz);
+    ivec3 mx = ivec3(pc.size.xyz) - ivec3(1);
+    if (c.x > mx.x || c.y > mx.y || c.z > mx.z) { return; }
+
+    int n = (AXIS == 0) ? int(pc.size.x) : ((AXIS == 1) ? int(pc.size.y) : int(pc.size.z));
+    int p = (AXIS == 0) ? c.x : ((AXIS == 1) ? c.y : c.z);
+
+    float acc = 0.0;
+
+    if (INVERSE == 0) {
+        for (int i = 0; i < n; i++) {
+            ivec3 s = (AXIS == 0) ? ivec3(i, c.y, c.z)
+                    : ((AXIS == 1) ? ivec3(c.x, i, c.z) : ivec3(c.x, c.y, i));
+            acc += imageLoad(src, s).r * cos(PI * (float(i) + 0.5) * float(p) / float(n));
+        }
+    } else {
+        // `p` is the OUTPUT index here; the sum runs over the transform index k.
+        ivec3 s0 = (AXIS == 0) ? ivec3(0, c.y, c.z)
+                 : ((AXIS == 1) ? ivec3(c.x, 0, c.z) : ivec3(c.x, c.y, 0));
+        acc = imageLoad(src, s0).r;
+        for (int k = 1; k < n; k++) {
+            ivec3 s = (AXIS == 0) ? ivec3(k, c.y, c.z)
+                    : ((AXIS == 1) ? ivec3(c.x, k, c.z) : ivec3(c.x, c.y, k));
+            acc += 2.0 * imageLoad(src, s).r * cos(PI * (float(p) + 0.5) * float(k) / float(n));
+        }
+        acc /= float(n);
+    }
+
+    imageStore(dst, c, vec4(acc, 0.0, 0.0, 0.0));
+}

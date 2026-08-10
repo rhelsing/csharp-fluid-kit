@@ -1,0 +1,25 @@
+#version 450
+// stamp_grad — |∇f|, the gradient magnitude of a scalar field. Scene 260's artifact view.
+//
+// Advection error is not a residual either: semi-Lagrangian does not leave something
+// *behind*, it quietly removes something — the sharpness. So the honest readout is the one
+// quantity that decays as filaments smear. Bright = the field still has structure; dim =
+// the scheme has eaten it. Same input signature as stamp_energy so one host helper drives
+// both (in1 is unused here).
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+layout(r32f, set = 0, binding = 0) uniform image2D in0;
+layout(r32f, set = 1, binding = 0) uniform image2D in1;   // unused
+layout(r32f, set = 2, binding = 0) uniform image2D out_e;
+
+layout(push_constant, std430) uniform P { vec2 size; float gain; float _pad; } pc;
+
+void main() {
+    ivec2 c = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 mx = ivec2(pc.size) - ivec2(1);
+    if (c.x > mx.x || c.y > mx.y) { return; }
+    float r = imageLoad(in0, clamp(c + ivec2(1, 0), ivec2(0), mx)).r;
+    float l = imageLoad(in0, clamp(c + ivec2(-1, 0), ivec2(0), mx)).r;
+    float u = imageLoad(in0, clamp(c + ivec2(0, 1), ivec2(0), mx)).r;
+    float d = imageLoad(in0, clamp(c + ivec2(0, -1), ivec2(0), mx)).r;
+    imageStore(out_e, c, vec4(length(vec2(r - l, u - d)) * 0.5 * pc.gain, 0.0, 0.0, 0.0));
+}

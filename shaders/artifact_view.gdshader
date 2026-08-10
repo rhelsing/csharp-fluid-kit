@@ -63,6 +63,20 @@ uniform float ambient : hint_range(0.0, 1.0) = 0.32;
 
 uniform float texel = 0.001953125;   // 1 / grid — Scene250Base keeps this in sync
 
+// Sample cell-exactly (texelFetch) instead of through the linear filter. Mandatory for any
+// artifact whose structure is CELL-SCALED: scene 256 plaid's checkerboard is two cells wide,
+// and bilinear interpolation of a two-cell checkerboard is a flat grey — the artifact would
+// be invisible not because it isn't there, but because the sampler averaged it away.
+uniform bool pixel_exact = false;
+
+// Analytic overlay (scene 259 smear): a circle of this radius in UV, drawn in the artifact
+// colour. r = c·t is the EXACT wavefront position for an impulse on a uniform medium, so
+// this is not a guide line — it is the right answer, drawn on top of the computed one. The
+// gap between the ring and the simulated front IS the dispersion error, read directly.
+// 0 disables it.
+uniform float ring_radius = 0.0;
+uniform float ring_width = 0.0035;
+
 vec3 srgb_to_linear(vec3 c) {
 	// the exact piecewise sRGB transfer, not a pow(2.2) approximation: these are
 	// hand-picked palette colours and the toe matters on the dark ones (#171310).
@@ -71,7 +85,15 @@ vec3 srgb_to_linear(vec3 c) {
 
 void fragment() {
 	vec2 uv = UV;
-	float f = texture(field_tex, uv).r * field_gain;
+
+	// Cell index for pixel-exact mode, clamped — texelFetch out of range is undefined.
+	int gs = int(1.0 / texel);
+	ivec2 cell = clamp(ivec2(uv / texel), ivec2(0), ivec2(gs - 1));
+
+	float fRaw = pixel_exact ? texelFetch(field_tex, cell, 0).r : texture(field_tex, uv).r;
+	float aRaw = pixel_exact ? texelFetch(artifact_tex, cell, 0).r : texture(artifact_tex, uv).r;
+
+	float f = fRaw * field_gain;
 
 	// central differences, shared by mode 2's normal (cheap; only used there)
 	float gx = texture(field_tex, uv + vec2(texel, 0.0)).r - texture(field_tex, uv - vec2(texel, 0.0)).r;
@@ -87,8 +109,7 @@ void fragment() {
 		col = mix(PAPER, tint, pow(abs(s), field_gamma));
 	} else if (mode == 3) {
 		// artifact solo — deliberately NOT on paper: the residual owns the frame.
-		float a = artifact_signed ? texture(artifact_tex, uv).r : abs(texture(artifact_tex, uv).r);
-		col = mix(ROOM, ARTIFACT, clamp(abs(a) * max(artifact_gain, 1.0), 0.0, 1.0));
+		col = mix(ROOM, ARTIFACT, clamp(abs(aRaw) * max(artifact_gain, 1.0), 0.0, 1.0));
 	} else {
 		float v = pow(clamp(f, 0.0, 1.0), field_gamma);
 		col = mix(PAPER, INK, v);
@@ -103,7 +124,7 @@ void fragment() {
 	// ── the overlay: residual × #E23D6D, additive (base doc). Modes 0–2 only —
 	// mode 3 already IS the residual and would double-count it.
 	if (mode != 3 && artifact_gain > 0.0) {
-		float a = texture(artifact_tex, uv).r;
+		float a = aRaw;
 		if (artifact_signed) {
 			// keep the artifact colour for magnitude, lean the hue by sign so a
 			// signed residual is still unmistakably "the residual".
@@ -123,6 +144,11 @@ void fragment() {
 			vec3 mc = mix(ARTIFACT, d.g >= 0.0 ? PLUS : MINUS, defect_chirality);
 			col += mc * d.r * defect_gain;
 		}
+	}
+
+	if (ring_radius > 0.0) {
+		float rr = distance(uv, vec2(0.5));
+		col += ARTIFACT * (1.0 - smoothstep(0.0, ring_width, abs(rr - ring_radius)));
 	}
 
 	ALBEDO = srgb_to_linear(col);

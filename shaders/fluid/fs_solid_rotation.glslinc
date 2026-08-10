@@ -1,0 +1,27 @@
+#version 450
+// fs_solid_rotation — overwrite the velocity field with a rigid rotation about the centre.
+// Scene 260's whole setup, and the reason that scene can measure anything.
+//
+//     v = ω × r        (v.x = −ω·(y−cy),  v.y = +ω·(x−cx))
+//
+// This is PRESCRIBED, not solved. Solid-body rotation is exactly divergence-free, so there
+// is no pressure to project and nothing for a Poisson solve to do — which is the point:
+// with the flow imposed, the ONLY thing that can change the dye is the advection scheme.
+// No buoyancy, no projection residual, no wall effects to argue about. Any drift from the
+// initial condition after a full revolution is the scheme and nothing else.
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+layout(rg32f, set = 0, binding = 0) uniform image2D vel;
+
+layout(push_constant, std430) uniform P {
+    vec2  size;
+    float omega;   // radians per tick
+    float _pad;
+} pc;
+
+void main() {
+    ivec2 c = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 mx = ivec2(pc.size) - ivec2(1);
+    if (c.x > mx.x || c.y > mx.y) { return; }
+    vec2 r = vec2(c) - pc.size * 0.5;
+    imageStore(vel, c, vec4(-pc.omega * r.y, pc.omega * r.x, 0.0, 0.0));
+}

@@ -16,6 +16,12 @@ frozen base — 270 appends later phases (order of work steps 8–13) and modifi
 Same contract in both: one artifact per scene · knobs · reference A/B · artifact view in
 `#E23D6D`.
 
+**Results → [`artifacts-log.md`](artifacts-log.md)** — what building the scenes actually
+taught us, kept out of the frozen plans. Read §1 before designing a new artifact: a
+residual reads as a *material* only if it is low-frequency and convects with the fluid;
+grid-pinned residuals read as noise, and that has already decided one scene against its
+own artifact.
+
 ## Orientation — a fresh agent starts here
 
 Repo: `godot-csharp-experiments` (Godot 4.6.2 **.NET** — `/Applications/Godot-mono.app`,

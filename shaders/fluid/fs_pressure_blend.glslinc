@@ -1,0 +1,36 @@
+#version 450
+// fs_pressure_blend — scene 252 crossfade. One line, and it generalises the whole block.
+//
+//     p = α · p_second + (1 − α) · p_first
+//
+// The plan describes this as "dial between honest and squishy", α mixing multigrid with
+// Jacobi. With four pressure paths now living in FluidSim it is a crossfade between ANY
+// pair — and the pair actually used here is better than the one specified: the spectral
+// solve is EXACT, so the honest end is not a well-converged approximation of the answer,
+// it is the answer.
+//
+// Why a blend of two pressure fields is legitimate rather than a fudge: the projection is
+// linear in the divergence, so a convex combination of two valid pressure solutions is
+// itself the solution to the same Poisson problem with a blended right-hand side. α does
+// not interpolate between two pictures — it interpolates between two MATERIALS, and every
+// intermediate is a real solve of a real system.
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+layout(r32f, set = 0, binding = 0) uniform image2D p;      // in-place: the SECOND solve
+layout(r32f, set = 1, binding = 0) uniform image2D p_alt;  // the FIRST solve, held aside
+
+layout(push_constant, std430) uniform P {
+    vec2  size;
+    float alpha;   // 1 = all of the second solve · 0 = all of the first
+    float _pad;
+} pc;
+
+void main() {
+    ivec2 c = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 mx = ivec2(pc.size) - ivec2(1);
+    if (c.x > mx.x || c.y > mx.y) { return; }
+
+    float a = imageLoad(p_alt, c).r;
+    float b = imageLoad(p, c).r;
+    imageStore(p, c, vec4(mix(a, b, pc.alpha), 0.0, 0.0, 0.0));
+}

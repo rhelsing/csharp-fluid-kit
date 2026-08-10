@@ -17,6 +17,12 @@ residual you can render in `#E23D6D`. That is the series contract, unchanged:
 
 > one artifact per scene · knobs · **reference A/B** · **artifact view** in the signature color.
 
+Results from building the base series live in [`artifacts-log.md`](artifacts-log.md). Its §1
+bears directly on Block D: a detector's residual (spurious/missed defects) is **sparse and
+grid-pinned by construction**, which is the shape that has already read as noise once. 270
+flicker should expect that fight and lean on temporal coherence — the thing plaid had no
+way to offer.
+
 Everything else carries over verbatim: standard panel order, TIME scale, grid dropdown,
 Copy-values baked as defaults, README row per scene, and the verification rule —
 **agents never launch scenes**; build-clean + template-followed is the handoff, Ryan's eyes

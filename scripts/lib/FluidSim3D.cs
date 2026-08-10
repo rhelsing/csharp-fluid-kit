@@ -22,6 +22,25 @@ public sealed class FluidSim3D
 
     private Rid _add0, _add1, _advV0, _advV1, _div0, _div1;
     private Rid _jacAB0, _jacAB1, _jacAB2, _jacBA0, _jacBA1, _jacBA2;
+
+    // Red-black GS + SOR pressure path (optional, scene 251b). PARITY compiled in ⇒ two
+    // shaders; red pA→pB then black pB→pA, so a full sweep lands back in _pA.
+    private Rid _sSorR, _sSorB, _pSorR, _pSorB;
+    private Rid _sorR0, _sorR1, _sorR2, _sorB0, _sorB1, _sorB2;
+    private bool _sorReady;
+
+    // Warm-start scale p₀ ← μ·p_prev (optional): scene 253b.
+    private Rid _sWarm, _pWarm, _warm0;
+    private bool _warmReady;
+
+    // Spectral pressure path (optional): scene 257b. Three forward cosine transforms, one
+    // divide by the Poisson eigenvalue shaped by W(k), three inverse — no iteration at all.
+    private Rid _sDctF0, _sDctF1, _sDctF2, _sDctI0, _sDctI1, _sDctI2, _sSpec;
+    private Rid _pDctF0, _pDctF1, _pDctF2, _pDctI0, _pDctI1, _pDctI2, _pSpec;
+    private Rid _specA, _specB;
+    private Rid _f0a, _f0b, _f1a, _f1b, _f2a, _f2b;
+    private Rid _i2a, _i2b, _i1a, _i1b, _i0a, _i0b, _spec0;
+    private bool _spectralReady;
     private Rid _grad0, _grad1, _advD0, _advD1, _advD2;
 
     // optional extras (ctor extras: true): MacCormack dye advection + implicit viscosity
@@ -65,6 +84,28 @@ public sealed class FluidSim3D
     public bool MeasureDivergence { get; set; }
 
     /// <summary>
+    /// Red-black Gauss-Seidel + SOR instead of Jacobi (needs ctor sor: true). ω rides in
+    /// the sim push constant's pad.y. Ignored while UseMultigrid is on — MG is its own
+    /// smoother. Three solvers now live here and all three stay reachable.
+    /// </summary>
+    public bool UseSor { get; set; }
+
+    public bool SorReady => _sorReady;
+
+    /// <summary>Scale the warm-started pressure by μ (sim pc's pad.z) — scene 253b.</summary>
+    public bool UseWarmScale { get; set; }
+
+    public bool WarmReady => _warmReady;
+
+    /// <summary>
+    /// Solve the pressure spectrally — scene 257b. Replaces the iteration loop entirely, so
+    /// `iters` is ignored while on, and takes precedence over UseSor / UseMultigrid.
+    /// </summary>
+    public bool UseSpectral { get; set; }
+
+    public bool SpectralReady => _spectralReady;
+
+    /// <summary>
     /// Build the multigrid pressure path over the EXISTING pressure/divergence textures —
     /// external-state mode, so p is warm-started from last frame and the solution lands back
     /// in _pA where f3_gradient_sub already reads it. betaExp 2, not the wave stamp's 3: here
@@ -78,7 +119,8 @@ public sealed class FluidSim3D
         if (!_mg.Ready) { GD.PushError("[FluidSim3D] multigrid pressure path failed to init"); }
     }
 
-    public FluidSim3D(RenderingDevice rd, Vector3I grid, bool extras = false)
+    public FluidSim3D(RenderingDevice rd, Vector3I grid, bool extras = false, bool sor = false,
+        bool warm = false, bool spectral = false)
     {
         _rd = rd;
         _grid = grid;
@@ -109,6 +151,65 @@ public sealed class FluidSim3D
         _jacBA0 = Set(_pB, _sJac, 0); _jacBA1 = Set(_div, _sJac, 1); _jacBA2 = Set(_pA, _sJac, 2);
         _grad0 = Set(_velA, _sGrad, 0); _grad1 = Set(_pA, _sGrad, 1);
         _advD0 = Set(_dyeA, _sAdvD, 0); _advD1 = Set(_velA, _sAdvD, 1); _advD2 = Set(_dyeB, _sAdvD, 2);
+
+        if (sor)
+        {
+            _sSorR = Compile("f3_pressure_rbgs", "#define PARITY 0");
+            _sSorB = Compile("f3_pressure_rbgs", "#define PARITY 1");
+            if (_sSorR.IsValid && _sSorB.IsValid)
+            {
+                _pSorR = _rd.ComputePipelineCreate(_sSorR);
+                _pSorB = _rd.ComputePipelineCreate(_sSorB);
+                _sorR0 = Set(_pA, _sSorR, 0); _sorR1 = Set(_div, _sSorR, 1); _sorR2 = Set(_pB, _sSorR, 2);
+                _sorB0 = Set(_pB, _sSorB, 0); _sorB1 = Set(_div, _sSorB, 1); _sorB2 = Set(_pA, _sSorB, 2);
+                _sorReady = true;
+            }
+        }
+
+        if (warm)
+        {
+            _sWarm = Compile("f3_pressure_warm");
+            if (_sWarm.IsValid)
+            {
+                _pWarm = _rd.ComputePipelineCreate(_sWarm);
+                _warm0 = Set(_pA, _sWarm, 0);
+                _warmReady = true;
+            }
+        }
+
+        if (spectral)
+        {
+            // Six transform pipelines. The chain ping-pongs two scratch volumes:
+            //   _div -F0-> A -F1-> B -F2-> A -filter-> A -I2-> B -I1-> A -I0-> _pA
+            // landing the pressure where f3_gradient_sub already reads it.
+            _sDctF0 = Compile("f3_dct_1d", "#define AXIS 0\n#define INVERSE 0");
+            _sDctF1 = Compile("f3_dct_1d", "#define AXIS 1\n#define INVERSE 0");
+            _sDctF2 = Compile("f3_dct_1d", "#define AXIS 2\n#define INVERSE 0");
+            _sDctI2 = Compile("f3_dct_1d", "#define AXIS 2\n#define INVERSE 1");
+            _sDctI1 = Compile("f3_dct_1d", "#define AXIS 1\n#define INVERSE 1");
+            _sDctI0 = Compile("f3_dct_1d", "#define AXIS 0\n#define INVERSE 1");
+            _sSpec = Compile("f3_spectral_project");
+            if (_sDctF0.IsValid && _sDctF1.IsValid && _sDctF2.IsValid
+                && _sDctI0.IsValid && _sDctI1.IsValid && _sDctI2.IsValid && _sSpec.IsValid)
+            {
+                _pDctF0 = _rd.ComputePipelineCreate(_sDctF0);
+                _pDctF1 = _rd.ComputePipelineCreate(_sDctF1);
+                _pDctF2 = _rd.ComputePipelineCreate(_sDctF2);
+                _pDctI2 = _rd.ComputePipelineCreate(_sDctI2);
+                _pDctI1 = _rd.ComputePipelineCreate(_sDctI1);
+                _pDctI0 = _rd.ComputePipelineCreate(_sDctI0);
+                _pSpec = _rd.ComputePipelineCreate(_sSpec);
+                _specA = MakeTex(r); _specB = MakeTex(r);
+                _f0a = Set(_div, _sDctF0, 0); _f0b = Set(_specA, _sDctF0, 1);
+                _f1a = Set(_specA, _sDctF1, 0); _f1b = Set(_specB, _sDctF1, 1);
+                _f2a = Set(_specB, _sDctF2, 0); _f2b = Set(_specA, _sDctF2, 1);
+                _spec0 = Set(_specA, _sSpec, 0);
+                _i2a = Set(_specA, _sDctI2, 0); _i2b = Set(_specB, _sDctI2, 1);
+                _i1a = Set(_specB, _sDctI1, 0); _i1b = Set(_specA, _sDctI1, 1);
+                _i0a = Set(_specA, _sDctI0, 0); _i0b = Set(_pA, _sDctI0, 1);
+                _spectralReady = true;
+            }
+        }
 
         if (extras)
         {
@@ -149,7 +250,7 @@ public sealed class FluidSim3D
     public void Step(byte[] addPc, byte[] advVPc, byte[] simPc, byte[] advDPc, int iters,
         bool measureResidual = false,
         int viscIters = 0, byte[]? viscPc = null, bool macCormack = false, byte[]? mcPc = null,
-        byte[][]? extraAdds = null, byte[]? confinePc = null)
+        byte[][]? extraAdds = null, byte[]? confinePc = null, byte[]? specPc = null)
     {
         if (!Ready) { return; }
         if ((iters & 1) == 1) { iters++; }
@@ -180,7 +281,36 @@ public sealed class FluidSim3D
             _rd.ComputeListEnd();
         }
 
-        if (UseMultigrid && _mg is { Ready: true })
+        if (_spectralReady && UseSpectral && specPc != null)
+        {
+            // Exact solve, no iteration. Seven dispatches: 3 forward, filter, 3 inverse.
+            long scl = _rd.ComputeListBegin();
+            Bind(scl, _pDiv, simPc, (_div0, 0u), (_div1, 1u));
+            _rd.ComputeListAddBarrier(scl);
+            if (_warmReady && UseWarmScale)
+            {
+                Bind(scl, _pWarm, simPc, (_warm0, 0u));
+                _rd.ComputeListAddBarrier(scl);
+            }
+            Bind(scl, _pDctF0, simPc, (_f0a, 0u), (_f0b, 1u));
+            _rd.ComputeListAddBarrier(scl);
+            Bind(scl, _pDctF1, simPc, (_f1a, 0u), (_f1b, 1u));
+            _rd.ComputeListAddBarrier(scl);
+            Bind(scl, _pDctF2, simPc, (_f2a, 0u), (_f2b, 1u));
+            _rd.ComputeListAddBarrier(scl);
+            Bind(scl, _pSpec, specPc, (_spec0, 0u));
+            _rd.ComputeListAddBarrier(scl);
+            Bind(scl, _pDctI2, simPc, (_i2a, 0u), (_i2b, 1u));
+            _rd.ComputeListAddBarrier(scl);
+            Bind(scl, _pDctI1, simPc, (_i1a, 0u), (_i1b, 1u));
+            _rd.ComputeListAddBarrier(scl);
+            Bind(scl, _pDctI0, simPc, (_i0a, 0u), (_i0b, 1u));
+            _rd.ComputeListAddBarrier(scl);
+            Bind(scl, _pGrad, simPc, (_grad0, 0u), (_grad1, 1u));
+            _rd.ComputeListAddBarrier(scl);
+            _rd.ComputeListEnd();
+        }
+        else if (UseMultigrid && _mg is { Ready: true })
         {
             // MgDeepSolver3D opens its own compute lists, so the projection splits into three
             // submissions instead of one. Same three stages, same textures, same order.
@@ -193,11 +323,31 @@ public sealed class FluidSim3D
             long cl = _rd.ComputeListBegin();
             Bind(cl, _pDiv, simPc, (_div0, 0u), (_div1, 1u));
             _rd.ComputeListAddBarrier(cl);
-            for (int k = 0; k < iters; k++)
+            // p₀ ← μ·p_prev on the warm-started iterate, before any relaxation.
+            if (_warmReady && UseWarmScale)
             {
-                if (k % 2 == 0) { Bind(cl, _pJac, simPc, (_jacAB0, 0u), (_jacAB1, 1u), (_jacAB2, 2u)); }
-                else { Bind(cl, _pJac, simPc, (_jacBA0, 0u), (_jacBA1, 1u), (_jacBA2, 2u)); }
+                Bind(cl, _pWarm, simPc, (_warm0, 0u));
                 _rd.ComputeListAddBarrier(cl);
+            }
+            if (_sorReady && UseSor)
+            {
+                // iters = FULL sweeps: red + black, 2 dispatches each, always ending in _pA.
+                for (int k = 0; k < iters; k++)
+                {
+                    Bind(cl, _pSorR, simPc, (_sorR0, 0u), (_sorR1, 1u), (_sorR2, 2u));
+                    _rd.ComputeListAddBarrier(cl);
+                    Bind(cl, _pSorB, simPc, (_sorB0, 0u), (_sorB1, 1u), (_sorB2, 2u));
+                    _rd.ComputeListAddBarrier(cl);
+                }
+            }
+            else
+            {
+                for (int k = 0; k < iters; k++)
+                {
+                    if (k % 2 == 0) { Bind(cl, _pJac, simPc, (_jacAB0, 0u), (_jacAB1, 1u), (_jacAB2, 2u)); }
+                    else { Bind(cl, _pJac, simPc, (_jacBA0, 0u), (_jacBA1, 1u), (_jacBA2, 2u)); }
+                    _rd.ComputeListAddBarrier(cl);
+                }
             }
             Bind(cl, _pGrad, simPc, (_grad0, 0u), (_grad1, 1u));
             _rd.ComputeListAddBarrier(cl);
@@ -305,25 +455,30 @@ public sealed class FluidSim3D
         {
             _add0, _add1, _advV0, _advV1, _div0, _div1,
             _jacAB0, _jacAB1, _jacAB2, _jacBA0, _jacBA1, _jacBA2, _grad0, _grad1, _advD0, _advD1, _advD2,
+            _sorR0, _sorR1, _sorR2, _sorB0, _sorB1, _sorB2, _warm0,
+            _f0a, _f0b, _f1a, _f1b, _f2a, _f2b, _i2a, _i2b, _i1a, _i1b, _i0a, _i0b, _spec0,
             _mc0, _mc1, _mc2, _mc3, _visc0, _viscAB1, _viscAB2, _viscBA1, _viscBA2, _conf0, _conf1,
         })
         {
             if (s.IsValid) { _rd.FreeRid(s); }
         }
-        foreach (var t in new[] { _velA, _velB, _dyeA, _dyeB, _pA, _pB, _div, _dyeC, _velC })
+        foreach (var t in new[] { _velA, _velB, _dyeA, _dyeB, _pA, _pB, _div, _dyeC, _velC, _specA, _specB })
         {
             if (t.IsValid) { _rd.FreeRid(t); }
         }
-        foreach (var sh in new[] { _sAdd, _sAdvV, _sDiv, _sJac, _sGrad, _sAdvD, _sMc, _sVisc, _sConf })
+        foreach (var sh in new[] { _sAdd, _sAdvV, _sDiv, _sJac, _sGrad, _sAdvD, _sMc, _sVisc, _sConf, _sSorR, _sSorB, _sWarm,
+            _sDctF0, _sDctF1, _sDctF2, _sDctI0, _sDctI1, _sDctI2, _sSpec })
         {
             if (sh.IsValid) { _rd.FreeRid(sh); }
         }
     }
 
     // ── helpers ──────────────────────────────────────────────────────────────
-    private Rid Compile(string name)
+    // define lets one source compile to several pipelines (PARITY for red-black).
+    private Rid Compile(string name, string? define = null)
     {
         string src = FileAccess.GetFileAsString(Dir + name + ".glslinc");
+        if (define != null) { src = src.Replace("#version 450", "#version 450\n" + define); }
         if (string.IsNullOrEmpty(src)) { GD.PushError($"[FluidSim3D] could not read {name}"); return default; }
         var rdSrc = new RDShaderSource { Language = RenderingDevice.ShaderLanguage.Glsl, SourceCompute = src };
         var spirv = _rd.ShaderCompileSpirVFromSource(rdSrc);

@@ -5,27 +5,27 @@ using GodotCsharpExperiments.Lib;
 
 namespace GodotCsharpExperiments;
 
-// Scene 250b — SQUISH IN 3D (docs/artifacts-250.md, the other half of the proof of concept).
+// Scene 257b — EQ IN 3D. The equalizer on incompressibility, in a volume.
 //
-// The lift is literal, not a re-skin. 250 is a vertical slice with buoyancy along its y axis
-// (fs_add_milk: v.y += dt·drift·dye); this is scene 32's box with the SAME term in the same
-// place (f3_add_source: v.y += dt·buoy·dye). Same up, same material, one more axis. That is
-// what makes 250/250b a template: everything above the solver — palette, panel, TIME scale,
-// similarity table, artifact view — crossed dimensions unchanged.
+// The base plan defers this ("257 eq needs a 3D FFT — defer; 2D is the lab"), on the
+// assumption that the transform would be the obstacle. It is not: the cosine transform is
+// SEPARABLE, so three axes is three passes rather than a new algorithm — six pipelines from
+// the same source, seven dispatches a frame. The real limit is cost, and it is bounded:
+// ~0.9 ms at 56³ and ~7.5 ms at 96³, which is why the ladder stops at 96 where 257's stops
+// at 512².
 //
-// THE A/B IS STRONGER HERE, and it is worth being precise about why. 250's reference is more
-// Jacobi, which is under-converged either way and had to be capped to stay interactive. This
-// one toggles the deep multigrid path that FluidSim3D already carries, and multigrid's
-// iteration count is grid-INDEPENDENT by construction — so the honest solve costs the same at
-// every resolution and needs no cap at all. 250's weak reference is a 2D-only problem.
+// ONE THING GENUINELY DOES NOT LIFT BY INSPECTION. The box is N × 1.5N × N, not a cube, so
+// each axis must be normalised by ITS OWN length when forming κ. Use a single N and the
+// filter tilts: a mode of the same physical wavelength lands at a different κ depending on
+// which way it runs, and the "knee" becomes direction-dependent — an anisotropic material
+// by accident rather than by design. (255 grain wants that anisotropy deliberately; this
+// scene does not.)
 //
-// It is also the experiment that started the series: scene 32's own comment records the
-// verdict that Jacobi WINS aesthetically — under-converged projection reads as soft billowy
-// cushioning, multigrid's accuracy reads harsher. This scene is that A/B, named.
-//
-//   artifact  Jacobi K, truncated        reference  deep multigrid (grid-independent)
-//   field     dye, ink raymarched        artifact view  |∇·v| volume, second channel
-public partial class Squish3D : Scene250Base
+// The reference is EXACT here too — W(k) = 1 IS the true projection, because the DCT-II /
+// DCT-III pair is exactly invertible. 250b's reference is a multigrid V-cycle and 251b's is
+// the same; this is the only 3D scene in the series whose accurate side is not an
+// approximation of anything.
+public partial class Eq3D : Scene250Base
 {
     private static readonly Vector3 BoxExtents = new(1.4f, 2.1f, 1.4f);
     private const string VolumeShader = "res://shaders/artifact_volume.gdshader";
@@ -36,96 +36,73 @@ public partial class Squish3D : Scene250Base
     private float _demoT;
     private float _stirPhase;
 
-    // A glass is taller than it is wide: the box is N × 1.5N × N, so at the reference grid
-    // this is scene 32's 56×84×56 exactly.
     private Vector3I Grid3 => new(N, N * 3 / 2, N);
 
-    // ── defaults: scene 32's tuned values, which are already authored at 56³ — this
-    // scene's reference grid — so they carry over verbatim and the Scale* helpers take
-    // them from there. Every one is in world units; the dropdown re-derives cells.
-    private float _dt = 1.3175f;        // a bigger step leaves MORE for the projection to fix
-    // Tuned to ~zero: buoyancy is essentially OFF here. What moves the dye is the downward
-    // pour injection and the stir, not density. (250 sits at +0.3 and rises — the two
-    // scenes share the term, not the taste.)
+    private float _dt = 1.3175f;
     private float _drift = -0.0125f;
     private float _pourAmt = 0.306f;
     private float _pourRadius = 2.755f;
-    private float _pourSpeed = 1.5f;    // downward injection velocity
+    private float _pourSpeed = 1.5f;
     private float _viscosity = 0.5475f;
-    // CORRECTION to the note 250 carries: viscosity sweeps are only N-independent at FIXED
-    // a. The similarity table scales a = ν·dt by (N/Ref)², and Jacobi's rate for (I − a∇²)
-    // is ρ = 4a/(1+4a), which climbs toward 1 as a grows — at 128 that is a ≈ 2.9, ρ ≈ 0.92
-    // against 0.69 at 56, so matched convergence would want ~4.5× the sweeps.
-    // Settled at 10 after a live A/B at 96³: pushed to 113 it was the single most expensive
-    // thing in the scene, and dropping it — not the grid — is what bought the tier. Under-
-    // converged diffusion reads as slightly-less-viscous, which is a cheap price. This knob
-    // is the first place to look whenever a grid tier stops being interactive.
     private int _viscIters = 10;
     private bool _macCormack = true;
     private float _dissipD = 0.9904f;
     private float _dissipV = 0.999f;
     private bool _autoDemo = true;
-    private bool _freeSlip = true;      // walls slide, don't stick — lets the mushroom roll up
-    private float _curlEps = 0.6375f;   // vorticity confinement
+    private bool _freeSlip = true;
+    private float _curlEps = 0.6375f;
 
     private bool _stirOn = true;
     private float _stirStrength = 0.6f;
-    private float _stirOrbit = 0.704f;  // orbit radius, fraction of box radius
+    private float _stirOrbit = 0.704f;
     private float _stirHeight = 0.1445f;
-    private float _stirSpeed = 2.13f;   // orbit rad/s
+    private float _stirSpeed = 2.13f;
     private float _stirRadius = 4.0f;
-    private float _jostle = 0.0f;       // tuned off: the stir alone carries it
 
     private float _camYaw;
     private float _camPitch = 11.95f;
     private float _camDist = 7.805f;
 
-    // Render, same tuned run. One source for both the material push and the slider, so
-    // what the scene opens with and what the slider reads can't drift apart.
     private const float DyeDensity = 8.0f;
     private const float DiluteKnee = 0.03f;
-    private const float DepthAbsorb = 0.22f;   // was 0.45 — less murk through the depth
-    private const float Shade = 0.185f;        // was 0.4 — flatter, lets the palette read
-    private const float MarchSteps = 96.0f;    // was 56 — worth it at this density
+    private const float DepthAbsorb = 0.22f;
+    private const float Shade = 0.185f;
+    private const float MarchSteps = 96.0f;
 
-    // ── THE ARTIFACT ──────────────────────────────────────────────────────────────
-    private int _k = 53;   // truncated Jacobi sweeps — the dial
+    // ── THE ARTIFACT: the curve ───────────────────────────────────────────────────
+    private float _kneeWavelength = 1.6f;   // world metres — grid-proof
+    private float _slope = 2.0f;
+    private float _notchWavelength = 0.4f;
+    private float _notchWidth = 0.06f;
+    private float _notchDepth = 0.0f;
+    private float _tilt = 1.0f;   // highpass by default — see Eq.cs
 
-    // The reference path. MgDeepSolver3D reads this as sweeps and runs iters/12 V-cycles,
-    // so 24 is scene 32's proven 2 cycles. NO cap needed and none wanted: multigrid's cost
-    // per cycle scales with the grid but its cycle COUNT does not.
-    private const int ReferenceSweeps = 24;
-
-    protected override string SceneTitle => "250b · squish 3D — the same artifact, one axis up";
+    protected override string SceneTitle => "257b · eq 3D — a designed residual spectrum, in a volume";
 
     protected override string SceneHint =>
-        "250's vertical slice, lifted. The buoyancy term is identical (v.y += dt·drift·dye), so "
-        + "this is the same material in a box. Reference here is the DEEP MULTIGRID path, not "
-        + "more Jacobi — a genuinely converged solve whose cost per frame doesn't blow up with "
-        + "the grid. Toggle it against low K and judge which one you'd rather have: scene 32's "
-        + "verdict was that Jacobi's under-converged squish looks better than the honest answer. "
-        + "Artifact view marches the |∇·v| volume as a second channel.";
+        "The equalizer on incompressibility, lifted. The cosine transform is separable, so "
+        + "three axes is three passes and not a new algorithm — the base plan deferred this "
+        + "expecting an FFT to be the obstacle. p̂(k) = W(k)·p̂_exact(k): pull the knee down "
+        + "and — at tilt 1 — long structures go compliant while short ones stay rigid. The "
+        + "reference is "
+        + "EXACT (W=1 is the true projection), the only 3D scene in the series whose accurate "
+        + "side is not an approximation. Knee is a world wavelength, so it means the same "
+        + "thing at 56³ and 96³ — and each axis is normalised by its own length, because the "
+        + "box is not a cube.";
 
-    protected override string ArtifactName => "squish (Jacobi K vs multigrid)";
+    protected override string ArtifactName => "eq (spectral W(k))";
 
-    protected override bool UsesFlatPlane => false;   // volume raymarch, not a plane
+    protected override bool UsesFlatPlane => false;
 
-    // RefGrid stays 56 — that is where the values below were tuned, so the similarity table
-    // scales them UP from there and the fluid keeps its world meaning at any of these.
-    // Memory is 72 B/cell (3× RGBA32F velocity + 6× R32F scalars), so the ladder costs
-    // 19 MB · 96 MB · 226 MB · 442 MB · 764 MB — none of which is the limit on a unified-
-    // memory Mac. The pressure and viscosity sweeps are what cost, not the storage.
+    // Direct O(N)-per-output transform: ~0.9 ms at 56³, ~7.5 ms at 96³, ~24 ms at 128³.
     protected override int RefGrid => 56;
-    protected override int[] GridOptions => new[] { 56, 96, 128, 160, 192 };
+    protected override int[] GridOptions => new[] { 56, 96, 128 };
     protected override string GridLabel(int n) => $"{n}×{n * 3 / 2}×{n}";
-    // One tier up from the tuning grid. 128 was unworkable; 96 is 5× the cells of 56.
     protected override int GridDefault => 96;
 
     protected override float TimeScaleDefault => 0.514f;
-    // 33.6, tuned — and 250 landed on 32.6 independently. My 6.0 guess was an order out in
-    // both dimensions, so ~33 is the real scale for a divergence field in this palette.
     protected override float ArtifactGainDefault => 33.6f;
-    protected override bool ArtifactViewDefault => true;   // tuned on — the residual is the scene
+    protected override bool ArtifactViewDefault => true;
 
     protected override float BaseDt => _dt;
 
@@ -134,15 +111,25 @@ public partial class Squish3D : Scene250Base
 
     protected override void BuildSim()
     {
-        _fluid = new FluidSim3D(RenderingServer.GetRenderingDevice(), Grid3, extras: true);
-        _fluid.EnableMultigrid();              // the reference path — free, already built
-        _fluid.MeasureDivergence = true;       // DivRid = the residual, not the solve's rhs
+        _fluid = new FluidSim3D(RenderingServer.GetRenderingDevice(), Grid3,
+            extras: true, spectral: true);
+        _fluid.MeasureDivergence = true;
+        _fluid.UseSpectral = true;
+        if (!_fluid.SpectralReady) { GD.PushError("[257b] spectral path failed to compile"); }
     }
 
     protected override void FreeSim()
     {
         _fluid?.Free();
         _fluid = null;
+    }
+
+    // World wavelength → normalised κ along the SHORTEST axis (x/z). A cosine mode of index
+    // p has wavelength 2·extent/p in world units, so p = 2·extent/λ and κ = p/N.
+    private float KappaFor(float worldWavelength)
+    {
+        float extent = BoxExtents.X * 2.0f;
+        return Mathf.Clamp(2.0f * extent / Mathf.Max(worldWavelength, 1e-4f) / N, 1e-5f, 2.0f);
     }
 
     protected override void BuildDisplay()
@@ -155,8 +142,6 @@ public partial class Squish3D : Scene250Base
         };
         _dyeTex = new Texture3Drd();
         _divTex = new Texture3Drd();
-        // Assigning the base's Mat is what wires the artifact toggle + intensity slider to
-        // this shader — the panel needs no 3D special case at all.
         Mat = new ShaderMaterial { Shader = GD.Load<Shader>(VolumeShader) };
         Mat.SetShaderParameter("dye_tex", _dyeTex);
         Mat.SetShaderParameter("artifact_tex", _divTex);
@@ -168,11 +153,9 @@ public partial class Squish3D : Scene250Base
         Mat.SetShaderParameter("steps", MarchSteps);
         vol.MaterialOverride = Mat;
         AddChild(vol);
-
         UpdateCamera();
     }
 
-    // The orbit rig and the fly cam both want to own the transform, so the orbit yields.
     private void UpdateCamera()
     {
         if (FlyMode) { return; }
@@ -186,10 +169,18 @@ public partial class Squish3D : Scene250Base
         Cam.LookAt(target, Vector3.Up);
     }
 
-    protected override string ReadoutText() =>
-        $"squish 3D · {Grid3.X}×{Grid3.Y}×{Grid3.Z} · "
-        + $"{(ReferenceOn ? "deep MG (REFERENCE)" : $"Jacobi {_k}")} · t×{TimeScale:0.00} "
-        + $"· {Engine.GetFramesPerSecond():0}fps";
+    protected override string ReadoutText()
+    {
+        if (ReferenceOn)
+        {
+            return $"eq 3D · {Grid3.X}×{Grid3.Y}×{Grid3.Z} · W(k) = 1 — EXACT projection "
+                + $"· t×{TimeScale:0.00} · {Engine.GetFramesPerSecond():0}fps";
+        }
+        return $"eq 3D · {Grid3.X}×{Grid3.Y}×{Grid3.Z} · knee {_kneeWavelength:0.00} m "
+            + $"(κ {KappaFor(_kneeWavelength):0.000}) · slope {_slope:0.0}"
+            + $"{(_notchDepth > 0.01f ? $" · notch {_notchWavelength:0.00} m ×{_notchDepth:0.00}" : "")} "
+            + $"· t×{TimeScale:0.00} · {Engine.GetFramesPerSecond():0}fps";
+    }
 
     protected override void SimTick(double delta)
     {
@@ -198,8 +189,6 @@ public partial class Squish3D : Scene250Base
         _divTex.TextureRdRid = ArtifactRid;
 
         var g = Grid3;
-
-        // pour source this tick (amt 0 = none) — from the TOP, pushing down
         Vector3 src = Vector3.Zero;
         float amt = 0f;
         if (Input.IsMouseButtonPressed(MouseButton.Left) && MouseXz() is Vector2 mxz)
@@ -212,8 +201,6 @@ public partial class Squish3D : Scene250Base
         }
         else if (_autoDemo)
         {
-            // sparse bursts on SIM time (scene 32's 30-in-600 ticks = 0.5 s in 10 s):
-            // the structure needs clear space around it to read
             _demoT += (float)delta * TimeScale;
             if (Mathf.PosMod(_demoT, 10.0f) < 0.5f)
             {
@@ -241,10 +228,18 @@ public partial class Squish3D : Scene250Base
         float[] visc = { g.X, g.Y, g.Z, 0f, ScaleVisc(_viscosity) * TimeScale, 0f, 0f, 0f };
         float[] mc = { g.X, g.Y, g.Z, 0f, dt, fadeD, 0f, 0f };
 
-        byte[] addB = ToBytes(add), advVB = ToBytes(advV), simB = ToBytes(sim), advDB = ToBytes(advD);
-        byte[] viscB = ToBytes(visc), mcB = ToBytes(mc);
+        // THE A/B: bypass = W(k) ≡ 1, the exact projection.
+        float[] spec =
+        {
+            g.X, g.Y, g.Z, 0f,
+            KappaFor(_kneeWavelength), _slope,
+            KappaFor(_notchWavelength), _notchWidth, _notchDepth,
+            ReferenceOn ? 1f : 0f, _tilt, 0f,
+        };
 
-        // extra source passes: orbiting stir + wandering jostle (dye 0 — velocity only)
+        byte[] addB = ToBytes(add), advVB = ToBytes(advV), simB = ToBytes(sim), advDB = ToBytes(advD);
+        byte[] viscB = ToBytes(visc), mcB = ToBytes(mc), specB = ToBytes(spec);
+
         var extras = new List<byte[]>();
         if (_stirOn && _stirStrength > 0.01f)
         {
@@ -260,36 +255,18 @@ public partial class Squish3D : Scene250Base
                 sx, sy, sz, ScaleRadius(_stirRadius), tang.X, 0f, tang.Y, 0f, 0f, 0f,
             }));
         }
-        if (_jostle > 0.005f)
-        {
-            var jv = new Vector2(Mathf.Sin(_demoT * 1.7f), Mathf.Cos(_demoT * 1.3f))
-                * ScaleVel(_jostle * 0.12f);
-            extras.Add(ToBytes(new[]
-            {
-                g.X, g.Y, g.Z, 0f, dt, 0f,
-                g.X * 0.5f, g.Y * 0.5f, g.Z * 0.5f, g.X * 1.0f, jv.X, 0f, jv.Y, 0f, 0f, 0f,
-            }));
-        }
         byte[][]? extraArr = extras.Count > 0 ? extras.ToArray() : null;
         byte[]? confB = _curlEps > 0.01f
             ? ToBytes(new[] { g.X, g.Y, g.Z, 0f, dt, ScaleConfine(_curlEps), 0f, 0f })
             : null;
 
-        // THE A/B: the artifact is truncated Jacobi, the reference is the multigrid path.
-        bool useMg = ReferenceOn;
-        int iters = useMg ? ReferenceSweeps : _k;
         int viscIters = _viscosity > 0.0005f ? _viscIters : 0;
         bool mcOn = _macCormack;
         RenderingServer.CallOnRenderThread(Callable.From(() =>
-        {
-            if (_fluid == null) { return; }
-            _fluid.UseMultigrid = useMg;
-            _fluid.Step(addB, advVB, simB, advDB, iters, false,
-                viscIters, viscB, mcOn, mcB, extraArr, confB);
-        }));
+            _fluid?.Step(addB, advVB, simB, advDB, 0, false,
+                viscIters, viscB, mcOn, mcB, extraArr, confB, specB)));
     }
 
-    // Mouse ray against the horizontal plane at the box's top — where a pour lands.
     private Vector2? MouseXz()
     {
         var mp = GetViewport().GetMousePosition();
@@ -318,14 +295,21 @@ public partial class Squish3D : Scene250Base
         ui.AddSlider("Stir · height (frac)", 0.05f, 0.95f, _stirHeight, v => _stirHeight = v);
         ui.AddSlider("Stir · speed (rad/s)", 0.0f, 6.0f, _stirSpeed, v => _stirSpeed = v);
         ui.AddSlider("Stir · radius (cells)", 1.0f, 12.0f, _stirRadius, v => _stirRadius = v);
-        ui.AddSlider("Jostle (nudge the box)", 0.0f, 1.0f, _jostle, v => _jostle = v);
         ui.AddSlider("Viscosity iters (the cost at high grids)", 4, 120, _viscIters, v => _viscIters = (int)v);
         ui.AddSlider("Dye fade", 0.99f, 1.0f, _dissipD, v => _dissipD = v);
     }
 
     protected override void BuildArtifactKnobs(DemoUI ui)
     {
-        AddCellLockedSlider(ui, "Jacobi K (truncation)", 4, 200, _k, v => _k = (int)v);
+        ui.AddSlider("Knee — wavelength (m) above which the fluid is soft", 0.08f, 6.0f,
+            _kneeWavelength, v => _kneeWavelength = v);
+        ui.AddSlider("Slope (1 gentle · 8 near-brick)", 0.5f, 8.0f, _slope, v => _slope = v);
+        ui.AddSlider("Tilt — 0 lowpass (fine-scale soft) · 1 highpass (large-scale soft)",
+            0.0f, 1.0f, _tilt, v => _tilt = v);
+        ui.AddSlider("Notch — centre wavelength (m)", 0.08f, 6.0f, _notchWavelength,
+            v => _notchWavelength = v);
+        ui.AddSlider("Notch — width (κ)", 0.005f, 0.4f, _notchWidth, v => _notchWidth = v);
+        ui.AddSlider("Notch — depth (0 = off)", 0.0f, 1.0f, _notchDepth, v => _notchDepth = v);
         ui.AddSlider("dt (bigger step = more to fix per tick)", 0.25f, 2.0f, _dt, v => _dt = v);
     }
 

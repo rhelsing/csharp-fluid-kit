@@ -1,0 +1,33 @@
+#version 450
+// f3_pressure_warm — the 3D twin of fs_pressure_warm. Scale the warm-started pressure
+// volume by μ before the solve; scene 253b's whole mechanism.
+//
+//     p₀ ← μ · p_prev
+//
+// μ = 0 forgets each frame · μ ≈ 1 is the status quo every Stam solver already runs ·
+// μ > 1 re-amplifies what the last frame left and a truncated solve cannot keep up.
+//
+// In-place is safe because there are no neighbour reads — each cell scales only itself.
+// That is the same reason the 2D version needs no ping-pong and f3_pressure_rbgs does.
+
+layout(local_size_x = 4, local_size_y = 4, local_size_z = 4) in;
+layout(r32f, set = 0, binding = 0) uniform image3D p;   // in-place
+
+// The 8-float block every 3D projection pass takes. pad.x = free-slip, pad.y = ω, pad.z = μ.
+layout(push_constant, std430) uniform P {
+    vec4 size;
+    vec4 pad;
+} pc;
+
+// Magnitude rail — μ > 1 is genuine positive feedback, and without this the volume reaches
+// inf and the scene has to be relaunched. Keeps the self-exciting range explorable.
+const float P_RAIL = 1.0e4;
+
+void main() {
+    ivec3 c = ivec3(gl_GlobalInvocationID.xyz);
+    ivec3 mx = ivec3(pc.size.xyz) - ivec3(1);
+    if (c.x > mx.x || c.y > mx.y || c.z > mx.z) { return; }
+
+    float v = imageLoad(p, c).r * pc.pad.z;
+    imageStore(p, c, vec4(clamp(v, -P_RAIL, P_RAIL), 0.0, 0.0, 0.0));
+}

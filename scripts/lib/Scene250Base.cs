@@ -93,6 +93,12 @@ public abstract partial class Scene250Base : Node3D
     protected virtual float FieldGammaDefault => 1.0f;
 
     /// <summary>
+    /// Sample the display cell-exactly instead of through the linear filter. True for any
+    /// scene whose artifact is CELL-scaled — bilinear averaging erases a two-cell pattern.
+    /// </summary>
+    protected virtual bool PixelExactDefault => false;
+
+    /// <summary>
     /// Fly camera active: the scene must stop driving the camera while this is true.
     /// A scene with its own camera rig (250b's orbit) checks this before overriding.
     /// </summary>
@@ -311,6 +317,7 @@ public abstract partial class Scene250Base : Node3D
         Mat.SetShaderParameter("artifact_gain", 0.0f);
         Mat.SetShaderParameter("field_gain", FieldGainDefault);
         Mat.SetShaderParameter("field_gamma", FieldGammaDefault);
+        Mat.SetShaderParameter("pixel_exact", PixelExactDefault);
         Plane.MaterialOverride = Mat;
         AddChild(Plane);
     }
@@ -381,6 +388,8 @@ public abstract partial class Scene250Base : Node3D
             Ui.AddSlider("Field gamma", 0.15f, 4.0f, FieldGammaDefault, v => Mat.SetShaderParameter("field_gamma", v));
             Ui.AddSlider("Height relief (lit mode)", 0.0f, 200.0f, 40.0f,
                 v => Mat.SetShaderParameter("height_scale", v));
+            Ui.AddToggle("Pixel-exact sampling (cell-scaled artifacts)", PixelExactDefault,
+                on => Mat.SetShaderParameter("pixel_exact", on));
         }
         BuildRenderKnobs(Ui);
     }
