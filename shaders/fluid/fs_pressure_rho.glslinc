@@ -1,0 +1,104 @@
+#version 450
+// fs_pressure_rho — VARIABLE-DENSITY pressure projection, red-black Gauss-Seidel.
+// The stamp contract (st_diag / st_conductance / st_rhs) applied to two-phase flow, written
+// out explicitly so the physics is one readable line rather than an inlined blur.
+//
+// Constant-density projection solves ∇²p = ∇·v/dt. That is only correct when every cell
+// weighs the same. Water against air is ~100:1 here (and ~800:1 in nature), and with a
+// constant-coefficient Laplacian the solve pushes air around as though it were water — the
+// interface shreds and the air drags the surface with it. The correct operator is
+//
+//     ∇·( (1/ρ) ∇p ) = ∇·v / dt
+//
+// which is a WEIGHTED Laplacian: conductance per face instead of a flat 1. That is exactly
+// the shape `stamp_wave_batty.glslinc` already uses for sub-grid solid fractions — so this
+// is a stamp swap, not a new solver, and the same face can eventually carry BOTH weights
+// (open_fraction × 1/ρ) when bathymetry arrives.
+//
+//     st_conductance(c,n) = 1 / ρ_face      ρ_face = ½(ρ_c + ρ_n)
+//     st_diag(c)          = Σ conductances
+//     st_rhs(c)           = ∇·v / dt
+//
+// ⚠ THE CONDUCTANCE RANGE IS THE COST. 1/ρ_air is ~100× 1/ρ_water, so the system is far
+// worse conditioned than the constant-density one and needs many more sweeps for the same
+// convergence. That is not a bug to fix, it is the price of the physics, and scene 291's
+// density-ratio dial is where it becomes visible.
+//
+// PARITY compiled in (two pipelines, ping-ponged, off-colour copied through) — the same
+// pattern as fs_pressure_rbgs, for the same read/write-hazard reason.
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+layout(r32f, set = 0, binding = 0) uniform image2D p_in;
+layout(r32f, set = 1, binding = 0) uniform image2D div;
+layout(r32f, set = 2, binding = 0) uniform image2D p_out;
+layout(r32f, set = 3, binding = 0) uniform image2D rho;
+
+layout(push_constant, std430) uniform P {
+    vec2  size;
+    float omega;
+    float rho_min;
+    float open_top;    // != 0 → pressure Dirichlet p=0 on the top row, air free to move
+    float free_slip;   // != 0 → walls kill only the NORMAL velocity, not the tangential
+    float bed_y0;      // seabed height in cells at x = 0
+    float bed_slope;   // cells of rise per cell of run — this is tanβ
+    float _p0;
+    float _p1;
+    float _p2;
+    float _p3;
+} pc;
+
+// Shared boundary description. MUST come after the pc block — it reads pc directly, and
+// the host-side include is a plain text splice with no forward declarations.
+#include "fs_shore_common.glslinc"
+
+// One face, TWO weights. 1/ρ_face is the two-phase part; the open fraction is the solid
+// part. They simply multiply, which is what lets a sloping bed and a density jump live in
+// the same operator without either knowing about the other.
+float st_conductance(ivec2 c, ivec2 n) {
+    float rc = max(imageLoad(rho, c).r, pc.rho_min);
+    float rn = max(imageLoad(rho, n).r, pc.rho_min);
+    return sh_face_open(c, n) * 2.0 / (rc + rn);
+}
+
+void main() {
+    ivec2 c = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 mx = ivec2(pc.size) - ivec2(1);
+    if (c.x > mx.x || c.y > mx.y) { return; }
+
+    float pOld = imageLoad(p_in, c).r;
+    if (((c.x + c.y) & 1) != PARITY) {
+        imageStore(p_out, c, vec4(pOld, 0.0, 0.0, 0.0));
+        return;
+    }
+
+    ivec2 nR = clamp(c + ivec2(1, 0), ivec2(0), mx);
+    ivec2 nL = clamp(c + ivec2(-1, 0), ivec2(0), mx);
+    ivec2 nU = clamp(c + ivec2(0, 1), ivec2(0), mx);
+    ivec2 nD = clamp(c + ivec2(0, -1), ivec2(0), mx);
+
+    float gR = st_conductance(c, nR);
+    float gL = st_conductance(c, nL);
+    float gU = st_conductance(c, nU);
+    float gD = st_conductance(c, nD);
+
+    float acc = gR * imageLoad(p_in, nR).r + gL * imageLoad(p_in, nL).r
+              + gU * imageLoad(p_in, nU).r + gD * imageLoad(p_in, nD).r;
+
+    float st_diag = gR + gL + gU + gD;
+
+    // OPEN TOP: a Dirichlet ghost at p = 0 above the last row. It contributes to the
+    // DIAGONAL but not to acc (its value is zero) — which is exactly what pins the pressure
+    // level and lets the atmosphere move. It also makes the system non-singular, so the
+    // compatibility condition that plagued the sealed box stops applying at all.
+    if (SH_OPEN_TOP && c.y == mx.y) {
+        float rc = max(imageLoad(rho, c).r, pc.rho_min);
+        st_diag += sh_open(c) / rc;
+    }
+
+    // A fully solid cell has no equation to solve; leave it alone.
+    if (sh_open(c) < 0.001) { imageStore(p_out, c, vec4(pOld, 0.0, 0.0, 0.0)); return; }
+    float st_rhs = imageLoad(div, c).r;
+
+    float pGs = (acc - st_rhs) / max(st_diag, 1.0e-8);
+    imageStore(p_out, c, vec4(pOld + pc.omega * (pGs - pOld), 0.0, 0.0, 0.0));
+}

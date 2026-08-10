@@ -70,7 +70,19 @@ public abstract partial class Scene250Base : Node3D
 
     // ── live state the panel owns ─────────────────────────────────────────────────
     public int N { get; private set; } = 512;   // _Ready overwrites from GridDefault
-    protected Vector2I Grid => new(N, N);
+
+    /// <summary>
+    /// Domain width ÷ height. 1 = the square box every artifact scene uses. The shore slice
+    /// needs ~8, because a beach cross-section is long and shallow and a square box has no
+    /// room for a wave to shoal — it is deep water in a bathtub, which breaks by steepness
+    /// and never plunges. N counts cells along the LONG axis.
+    /// </summary>
+    protected virtual float DomainAspect => 1.0f;
+
+    protected Vector2I Grid => new(N, Mathf.Max(8, Mathf.RoundToInt(N / DomainAspect)));
+
+    /// <summary>Display plane size in world units, matching the domain's aspect.</summary>
+    protected Vector2 PlaneSize => new(WorldSize, WorldSize / DomainAspect);
 
     /// <summary>Multiplies dt in every pass. Fades must go through <see cref="Fade"/>.</summary>
     public float TimeScale { get; private set; } = 1.0f;
@@ -130,9 +142,10 @@ public abstract partial class Scene250Base : Node3D
     protected virtual Rid DefectRid => default;
 
     /// <summary>
-    /// Build the display when UsesFlatPlane is false (a volume raymarch, say). Runs where
-    /// BuildPlane would, i.e. BEFORE the panel — assign <see cref="Mat"/> here and the
-    /// artifact toggle + intensity wire themselves up exactly as they do in 2D.
+    /// Extra display construction, always called, right after BuildPlane and BEFORE the
+    /// panel. A 3D scene builds its whole raymarch here (UsesFlatPlane false); a 2D scene
+    /// can add furniture to the plane it just got — scene 290's seabed, say. Assign
+    /// <see cref="Mat"/> here and the artifact toggle + intensity wire up as they do in 2D.
     /// </summary>
     protected virtual void BuildDisplay() { }
 
@@ -212,8 +225,8 @@ public abstract partial class Scene250Base : Node3D
             return new Vector2(-1, -1);
         }
         var uv = SideView
-            ? new Vector2(hit.X / WorldSize + 0.5f, hit.Y / WorldSize + 0.5f)
-            : new Vector2(hit.X / WorldSize + 0.5f, hit.Z / WorldSize + 0.5f);
+            ? new Vector2(hit.X / PlaneSize.X + 0.5f, hit.Y / PlaneSize.Y + 0.5f)
+            : new Vector2(hit.X / PlaneSize.X + 0.5f, hit.Z / PlaneSize.Y + 0.5f);
         return uv.X < 0 || uv.X > 1 || uv.Y < 0 || uv.Y > 1 ? new Vector2(-1, -1) : uv;
     }
 
@@ -223,7 +236,8 @@ public abstract partial class Scene250Base : Node3D
         N = GridDefault;
         TimeScale = TimeScaleDefault;
         BuildEnvironment();
-        if (UsesFlatPlane) { BuildPlane(); } else { BuildDisplay(); }
+        if (UsesFlatPlane) { BuildPlane(); }
+        BuildDisplay();   // extra display bits either way — a bed, a vessel, a raymarch
         RenderingServer.CallOnRenderThread(Callable.From(BuildSim));
         BuildUi();
     }
@@ -295,7 +309,7 @@ public abstract partial class Scene250Base : Node3D
     {
         Plane = new MeshInstance3D
         {
-            Mesh = new PlaneMesh { Size = new Vector2(WorldSize, WorldSize) },
+            Mesh = new PlaneMesh { Size = PlaneSize },
             CastShadow = GeometryInstance3D.ShadowCastingSetting.Off,
             ExtraCullMargin = 4.0f,
         };

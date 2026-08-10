@@ -96,7 +96,7 @@ public partial class Eq : Scene250Base
     protected override string ArtifactName => "eq (spectral W(k))";
 
     protected override bool SideView => true;
-    protected override bool ArtifactViewDefault => true;
+    protected override bool ArtifactViewDefault => false;
     protected override float ArtifactGainDefault => 32.6f;
     protected override float TimeScaleDefault => 0.34f;
     protected override float FieldGainDefault => 0.8052f;

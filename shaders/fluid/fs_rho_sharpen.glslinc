@@ -1,0 +1,57 @@
+#version 450
+// fs_rho_sharpen — push the interface back toward a step. Scene 291's whole mechanism.
+//
+// THE PROBLEM. Semi-Lagrangian advection is stable because it interpolates, and every
+// interpolation is a low-pass filter. Nothing in the two-phase pipeline opposes it, so a
+// one-cell density step becomes a twenty-cell ramp after a few hundred frames and ρ stops
+// describing two phases at all — it becomes a concentration. On screen that reads exactly
+// as what it has become: dye in water, or heavy fog.
+//
+// MacCormack halves the rate. It does not change the direction.
+//
+// THE FIX. Work in phase fraction φ = (ρ − ρ_air)/(ρ_water − ρ_air) ∈ [0,1] and steepen it
+// about φ = 0.5:
+//
+//     φ' = φ^a / (φ^a + (1−φ)^a)
+//
+// Monotone, fixes φ = 0, 0.5 and 1 exactly, and pulls everything else toward the nearer
+// phase. a = 1 is a no-op; larger a is a harder edge. Applied a little each frame it
+// balances against advective diffusion and the interface settles at a stable width instead
+// of growing without bound.
+//
+// ⚠ NOT CONSERVATIVE, and that matters enough to say twice. This remap does not preserve
+// ∫ρ — it moves mass across the interface to buy sharpness, so a long run slowly gains or
+// loses water depending on interface curvature. The conservative version is Olsson–Kreiss
+// compression, ∂φ/∂τ = ∇·(ε∇φ − φ(1−φ)n̂), which transports the same steepening as a FLUX
+// and therefore conserves exactly. That is the upgrade; this is the cheap version that
+// makes the problem visible and dialable first.
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+layout(r32f, set = 0, binding = 0) uniform image2D rho;   // in-place, per-cell, no hazard
+
+layout(push_constant, std430) uniform P {
+    vec2  size;
+    float strength;    // 0 = off; blends the remap in, so it can be dialed to balance
+    float power;       // a in the formula above
+    float rho_water;
+    float rho_air;
+    float _p0;
+    float _p1;
+} pc;
+
+void main() {
+    ivec2 c = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 mx = ivec2(pc.size) - ivec2(1);
+    if (c.x > mx.x || c.y > mx.y) { return; }
+    if (pc.strength <= 0.0) { return; }
+
+    float span = max(pc.rho_water - pc.rho_air, 1.0e-6);
+    float phi = clamp((imageLoad(rho, c).r - pc.rho_air) / span, 0.0, 1.0);
+
+    float a = max(pc.power, 1.0);
+    float pa = pow(phi, a);
+    float pb = pow(1.0 - phi, a);
+    float sharp = pa / max(pa + pb, 1.0e-8);
+
+    phi = mix(phi, sharp, clamp(pc.strength, 0.0, 1.0));
+    imageStore(rho, c, vec4(pc.rho_air + phi * span, 0.0, 0.0, 0.0));
+}

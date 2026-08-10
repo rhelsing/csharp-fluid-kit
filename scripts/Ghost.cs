@@ -199,17 +199,10 @@ public partial class Ghost : Scene250Base
 
     protected override void BuildSimKnobs(DemoUI ui)
     {
-        ui.AddToggle("Auto-demo (pour + spiral stir)", _autoDemo, on => _autoDemo = on);
-        ui.AddToggle("MacCormack advection (sharp filaments)", _macCormack, on => _macCormack = on);
-        ui.AddSlider("Viscosity ν·dt (0 = watery)", 0.0f, 3.0f, _viscosity, v => _viscosity = v);
-        ui.AddSlider("Density drift (− sinks, + rises)", -6.0f, 6.0f, _drift, v => _drift = v);
-        ui.AddSlider("Pour amount", 0.0f, 1.5f, _pourAmt, v => _pourAmt = v);
-        ui.AddSlider("Pour radius", 4.0f, 32.0f, _pourRadius, v => _pourRadius = v);
-        ui.AddSlider("Pour splash (radial)", 0.0f, 6.0f, _pourPush, v => _pourPush = v);
-        ui.AddSlider("Stir strength (auto-demo)", 0.0f, 20.0f, _stirStrength, v => _stirStrength = v);
-        ui.AddSlider("Stir radius", 6.0f, 48.0f, _stirRadius, v => _stirRadius = v);
-        ui.AddSlider("Viscosity iters", 4, 40, _viscIters, v => _viscIters = (int)v);
-        ui.AddSlider("Dye fade", 0.99f, 1.0f, _dissipD, v => _dissipD = v);
+        // Deliberately short. There is no pressure solve, no viscosity and no buoyancy in
+        // this harness — every one of those would be another suspect when the field drifts,
+        // and the whole design is to leave the advection scheme as the only one.
+        ui.AddSlider("Blob radius", 4.0f, 40.0f, _pourRadius, v => _pourRadius = v);
     }
 
     protected override void BuildArtifactKnobs(DemoUI ui)

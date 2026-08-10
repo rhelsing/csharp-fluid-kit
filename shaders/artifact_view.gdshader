@@ -77,6 +77,22 @@ uniform bool pixel_exact = false;
 uniform float ring_radius = 0.0;
 uniform float ring_width = 0.0035;
 
+// SURFACE mode (scene 290/291): render the field as a PHASE with a boundary, not as a
+// concentration. Mapping ρ continuously to paper→ink is right for dye and wrong for water:
+// any smearing at all reads as fog, and a two-phase field that is 90% water still shows as
+// a mid grey. Thresholding at `surface_level` with a narrow band shows where the interface
+// IS. It does not fix smearing — 291's sharpening does that — but it stops the display from
+// exaggerating it, and it makes the remaining smear legible as a band of a measurable width
+// rather than an ambiguous haze.
+uniform float surface_level = 0.0;    // 0 disables; typical 0.5
+uniform float surface_soft : hint_range(0.001, 0.5) = 0.06;
+
+// The seabed, in UV. Drawn rather than merely simulated: the solid region is invisible in ρ
+// (it is filled with water that never moves), and without it on screen a shoaling wave has
+// nothing to visibly shoal against.
+uniform float bed_y0 = 0.0;
+uniform float bed_slope = 0.0;
+
 vec3 srgb_to_linear(vec3 c) {
 	// the exact piecewise sRGB transfer, not a pow(2.2) approximation: these are
 	// hand-picked palette colours and the toe matters on the dark ones (#171310).
@@ -112,6 +128,9 @@ void fragment() {
 		col = mix(ROOM, ARTIFACT, clamp(abs(aRaw) * max(artifact_gain, 1.0), 0.0, 1.0));
 	} else {
 		float v = pow(clamp(f, 0.0, 1.0), field_gamma);
+		if (surface_level > 0.0) {
+			v = smoothstep(surface_level - surface_soft, surface_level + surface_soft, fRaw);
+		}
 		col = mix(PAPER, INK, v);
 		if (mode == 2) {
 			// height plane: UV → XZ, so the gradient tilts the up-normal directly.
@@ -144,6 +163,11 @@ void fragment() {
 			vec3 mc = mix(ARTIFACT, d.g >= 0.0 ? PLUS : MINUS, defect_chirality);
 			col += mc * d.r * defect_gain;
 		}
+	}
+
+	if (bed_y0 > 0.0 || bed_slope != 0.0) {
+		float bed = bed_y0 + bed_slope * uv.x;
+		col = mix(col, ROOM, smoothstep(bed + 0.004, bed - 0.004, uv.y));
 	}
 
 	if (ring_radius > 0.0) {

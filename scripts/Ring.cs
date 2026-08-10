@@ -71,7 +71,7 @@ public partial class Ring : Scene250Base
     // A height field, so unlike every Block A scene this is TOP-DOWN and wants the lit
     // relief mode — the base's SideView exists for exactly this split.
     protected override bool SideView => false;
-    protected override bool ArtifactViewDefault => true;
+    protected override bool ArtifactViewDefault => false;
     protected override float ArtifactGainDefault => 8.0f;
     protected override float TimeScaleDefault => 1.0f;
     protected override int[] GridOptions => new[] { 256, 512 };

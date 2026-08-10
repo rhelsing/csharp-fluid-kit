@@ -1,0 +1,105 @@
+#version 450
+// fs_gradient_rho — subtract the DENSITY-WEIGHTED pressure gradient:
+//
+//     v -= (1/ρ_face) ∇p
+//
+// This must use the SAME face weights as fs_pressure_rho. If the projection solves
+// ∇·((1/ρ)∇p) = ∇·v and then a constant-coefficient gradient is subtracted, the two
+// operators disagree and the result is not divergence-free — the solve would be correct and
+// the answer still wrong, which is the most expensive kind of mistake to debug. Keeping the
+// pair matched is the whole reason this is a separate kernel from fs_gradient_sub rather
+// than a flag on it.
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+layout(rg32f, set = 0, binding = 0) uniform image2D vel;   // in-place
+layout(r32f,  set = 1, binding = 0) uniform image2D pres;
+layout(r32f,  set = 2, binding = 0) uniform image2D rho;
+
+layout(push_constant, std430) uniform P {
+    vec2  size;
+    float omega;
+    float rho_min;
+    float open_top;    // != 0 → pressure Dirichlet p=0 on the top row, air free to move
+    float free_slip;   // != 0 → walls kill only the NORMAL velocity, not the tangential
+    float bed_y0;      // seabed height in cells at x = 0
+    float bed_slope;   // cells of rise per cell of run — this is tanβ
+    float _p0;
+    float _p1;
+    float _p2;
+    float _p3;
+} pc;
+
+// Shared boundary description. MUST come after the pc block — it reads pc directly, and
+// the host-side include is a plain text splice with no forward declarations.
+#include "fs_shore_common.glslinc"
+
+float wface(ivec2 a, ivec2 b) {
+    float ra = max(imageLoad(rho, a).r, pc.rho_min);
+    float rb = max(imageLoad(rho, b).r, pc.rho_min);
+    return sh_face_open(a, b) * 2.0 / (ra + rb);
+}
+
+// ⚠ A FIRST DIFFERENCE, NOT A SECOND ONE. The projection's left-hand side is ∇·((1/ρ)∇p) —
+// a Laplacian — and it is very easy to reach for the same expression here. It is the wrong
+// operator: the velocity correction is the GRADIENT, v −= (1/ρ)∇p. Subtracting a second
+// difference from velocity does not gently misbehave, it throws the fluid apart, which is
+// exactly what the first run of scene 290 did.
+//
+// On a collocated grid the cell-centred 1/ρ here is not the exact adjoint of the
+// face-weighted Laplacian in fs_pressure_rho, so the pair is consistent to first order and
+// no better. That mismatch is a real source of the spurious hydrostatic currents scene 290
+// renders — which makes it part of the artifact rather than a defect hiding behind it. A
+// staggered (MAC) velocity would remove it, and that is the honest upgrade path.
+void main() {
+    ivec2 c = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 mx = ivec2(pc.size) - ivec2(1);
+    if (c.x > mx.x || c.y > mx.y) { return; }
+
+    ivec2 nR = clamp(c + ivec2(1, 0), ivec2(0), mx);
+    ivec2 nL = clamp(c + ivec2(-1, 0), ivec2(0), mx);
+    ivec2 nU = clamp(c + ivec2(0, 1), ivec2(0), mx);
+    ivec2 nD = clamp(c + ivec2(0, -1), ivec2(0), mx);
+
+    // FACE weights, the same ones fs_pressure_rho uses — not the cell's own 1/ρ.
+    //
+    // Why this is not a refinement. Take an air cell one above the interface: its cell
+    // density gives 1/ρ = 100, while the pressure difference across its lower face belongs
+    // to the WATER below and is ~100× steeper than any air-scale gradient. Multiply the two
+    // and the correction is ~-3.5 cells/tick where gravity contributed -0.07 — a 50×
+    // spurious kick, on the interface, every single frame. Measured consequence: |v|max
+    // 6 M within one second and rising. At a 100:1 density ratio this is not first-order
+    // error, it is a detonator.
+    //
+    // Averaging the two one-sided FACE gradients keeps every pressure difference paired
+    // with the density of the face it crosses, which is also what makes this the adjoint of
+    // the projection's operator rather than merely similar to it.
+    float pcv = imageLoad(pres, c).r;
+    float gx = 0.5 * (wface(c, nR) * (imageLoad(pres, nR).r - pcv)
+                    + wface(c, nL) * (pcv - imageLoad(pres, nL).r));
+    float gy = 0.5 * (wface(c, nU) * (imageLoad(pres, nU).r - pcv)
+                    + wface(c, nD) * (pcv - imageLoad(pres, nD).r));
+
+    vec2 v = imageLoad(vel, c).rg;
+    v -= vec2(gx, gy);
+
+    // Inside the bed there is no fluid to move.
+    if (sh_open(c) < 0.001) { imageStore(vel, c, vec4(0.0)); return; }
+
+    // FREE-SLIP kills only the NORMAL component. No-slip zeroes the whole vector, which
+    // pins the free surface wherever it touches a wall and drags a circulation off it — one
+    // of the things making the sealed box drift toward its centre. A beach wants water to
+    // slide along its boundaries, not stick to them.
+    if (SH_FREE_SLIP) {
+        if (c.x == 0 || c.x == mx.x) { v.x = 0.0; }
+        if (c.y == 0) { v.y = 0.0; }
+        if (c.y == mx.y && !SH_OPEN_TOP) { v.y = 0.0; }
+    } else if (c.x == 0 || c.y == 0 || c.x == mx.x || (c.y == mx.y && !SH_OPEN_TOP)) {
+        v = vec2(0.0);
+    }
+    // The bed is a solid the flow must slide along: kill the component through its face.
+    if (sh_open(c) < 0.999 && pc.bed_slope != 0.0) {
+        vec2 nrm = normalize(vec2(-pc.bed_slope, 1.0));
+        float vn = dot(v, nrm);
+        if (vn < 0.0) { v -= vn * nrm; }
+    }
+    imageStore(vel, c, vec4(v, 0.0, 0.0));
+}

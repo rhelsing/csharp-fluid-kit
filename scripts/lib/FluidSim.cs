@@ -56,6 +56,16 @@ public sealed class FluidSim
     private Rid _sBlend, _pBlend, _pC, _blend0, _blend1;
     private bool _blendReady;
 
+    // Two-phase / variable-density path (optional): the shore-slice series. The dye field
+    // is reinterpreted as ρ, and the projection becomes a WEIGHTED Laplacian — same stamp
+    // contract, conductance 1/ρ_face instead of a flat 1.
+    private Rid _sRhoR, _sRhoB, _pRhoR, _pRhoB, _sGradRho, _pGradRho, _sTwoAdd, _pTwoAdd;
+    private Rid _sDivSolid, _pDivSolid, _divS0, _divS1;
+    private Rid _sSharp, _pSharp, _sharp0;
+    private Rid _rhoR0, _rhoR1, _rhoR2, _rhoR3, _rhoB0, _rhoB1, _rhoB2, _rhoB3;
+    private Rid _gradRho0, _gradRho1, _gradRho2, _twoAdd0, _twoAdd1, _twoAdd2;
+    private bool _twoPhaseReady;
+
     // Prescribed solid-body rotation (optional): scene 260's advection-only harness.
     private Rid _sRot, _pRot, _rot0;
     private bool _rotReady;
@@ -135,6 +145,84 @@ public sealed class FluidSim
 
     public bool RotationReady => _rotReady;
 
+    public bool TwoPhaseReady => _twoPhaseReady;
+
+    /// <summary>
+    /// Pull a field back to the CPU. Slow (a full stall) and meant for DIAGNOSIS ONLY —
+    /// call it at ~1 Hz from a debug readout, never per frame. Exists because two-phase
+    /// went wrong twice in ways that looked identical on screen and were not.
+    /// </summary>
+    public float[] ReadField(Rid tex, int components = 1)
+    {
+        var bytes = _rd.TextureGetData(tex, 0);
+        var outv = new float[bytes.Length / 4];
+        Buffer.BlockCopy(bytes, 0, outv, 0, bytes.Length);
+        return outv;
+    }
+
+    public Rid PressureRid => _pA;
+
+    /// <summary>
+    /// Treat the domain border as SOLID (v·n = 0) inside the projection rather than
+    /// zero-gradient. Correct — without it uniform gravity yields a divergence-free field,
+    /// the solve returns p = const and nothing balances gravity — but not sufficient on its
+    /// own, so it stays selectable. See fs_divergence_solid.
+    /// </summary>
+    public bool UseSolidDivergence { get; set; }
+
+    /// <summary>
+    /// One two-phase tick: uniform gravity → advect velocity → variable-density projection
+    /// → ρ-weighted gradient subtract → advect ρ. Deliberately its own method rather than a
+    /// flag on Step: the operator pair (fs_pressure_rho + fs_gradient_rho) must ALWAYS be
+    /// used together — projecting with one and subtracting with the other leaves a field
+    /// that is not divergence-free while every individual solve looks converged.
+    /// </summary>
+    public void StepTwoPhase(byte[] addPc, byte[] advVPc, byte[] rhoPc, byte[] advDPc,
+        int iters, bool macCormack, byte[]? mcPc, byte[]? sharpenPc = null)
+    {
+        if (!Ready || !_twoPhaseReady) { return; }
+        var size = new Vector3(_grid.X, _grid.Y, 1);
+
+        RunOne(_pTwoAdd, addPc, (_twoAdd0, 0u), (_twoAdd1, 1u), (_twoAdd2, 2u));
+        RunOne(_pAdvV, advVPc, (_advV0, 0u), (_advV1, 1u));
+        _rd.TextureCopy(_velB, _velA, Vector3.Zero, Vector3.Zero, size, 0, 0, 0, 0);
+
+        long cl = _rd.ComputeListBegin();
+        // SOLID-wall divergence, not the clamped one — see fs_divergence_solid. Without it
+        // the projection cannot produce hydrostatic pressure at all.
+        if (UseSolidDivergence) { Bind(cl, _pDivSolid, rhoPc, (_divS0, 0u), (_divS1, 1u)); }
+        else { Bind(cl, _pDiv, rhoPc, (_div0, 0u), (_div1, 1u)); }
+        _rd.ComputeListAddBarrier(cl);
+        for (int k = 0; k < iters; k++)
+        {
+            Bind(cl, _pRhoR, rhoPc, (_rhoR0, 0u), (_rhoR1, 1u), (_rhoR2, 2u), (_rhoR3, 3u));
+            _rd.ComputeListAddBarrier(cl);
+            Bind(cl, _pRhoB, rhoPc, (_rhoB0, 0u), (_rhoB1, 1u), (_rhoB2, 2u), (_rhoB3, 3u));
+            _rd.ComputeListAddBarrier(cl);
+        }
+        Bind(cl, _pGradRho, rhoPc, (_gradRho0, 0u), (_gradRho1, 1u), (_gradRho2, 2u));
+        _rd.ComputeListAddBarrier(cl);
+        if (MeasureResidual)
+        {
+            if (UseSolidDivergence) { Bind(cl, _pDivSolid, rhoPc, (_divS0, 0u), (_divS1, 1u)); }
+            else { Bind(cl, _pDiv, rhoPc, (_div0, 0u), (_div1, 1u)); }
+            _rd.ComputeListAddBarrier(cl);
+        }
+        _rd.ComputeListEnd();
+
+        if (_mcReady && macCormack && mcPc != null)
+        {
+            RunOne(_pAdvD, advDPc, (_advD0, 0u), (_advD1, 1u), (_advD2, 2u));
+            RunOne(_pMc, mcPc, (_mc0, 0u), (_mc1, 1u), (_mc2, 2u), (_mc3, 3u));
+            _rd.TextureCopy(_dyeC, _dyeA, Vector3.Zero, Vector3.Zero, size, 0, 0, 0, 0);
+        }
+        else
+        {
+            RunOne(_pAdvD, advDPc, (_advD0, 0u), (_advD1, 1u), (_advD2, 2u));
+            _rd.TextureCopy(_dyeB, _dyeA, Vector3.Zero, Vector3.Zero, size, 0, 0, 0, 0);
+        }
+    }
+
     /// <summary>
     /// Advection-only tick for scene 260: impose a rigid rotation on the velocity field and
     /// advect the dye through it. No forces, no projection — solid-body rotation is exactly
@@ -167,7 +255,7 @@ public sealed class FluidSim
     // + viscosity stages; default false = the original pipeline, byte-identical.
     public FluidSim(RenderingDevice rd, Vector2I grid, string addKernel = "fs_add_source",
         bool extras = false, bool sor = false, bool warm = false, bool spectral = false,
-        bool crossfade = false, bool adi = false, bool rotation = false)
+        bool crossfade = false, bool adi = false, bool rotation = false, bool twoPhase = false)
     {
         _rd = rd;
         _grid = grid;
@@ -257,6 +345,37 @@ public sealed class FluidSim
                 _dctIy0 = Set(_specB, _sDctIy, 0); _dctIy1 = Set(_specA, _sDctIy, 1);
                 _dctIx0 = Set(_specA, _sDctIx, 0); _dctIx1 = Set(_pA, _sDctIx, 1);
                 _spectralReady = true;
+            }
+        }
+
+        if (twoPhase)
+        {
+            _sRhoR = Compile("fs_pressure_rho", "#define PARITY 0");
+            _sRhoB = Compile("fs_pressure_rho", "#define PARITY 1");
+            _sGradRho = Compile("fs_gradient_rho");
+            _sTwoAdd = Compile("fs_two_phase_add");
+            _sDivSolid = Compile("fs_divergence_solid");
+            _sSharp = Compile("fs_rho_sharpen");
+            if (_sRhoR.IsValid && _sRhoB.IsValid && _sGradRho.IsValid && _sTwoAdd.IsValid
+                && _sDivSolid.IsValid)
+            {
+                _pDivSolid = _rd.ComputePipelineCreate(_sDivSolid);
+                if (_sSharp.IsValid) { _pSharp = _rd.ComputePipelineCreate(_sSharp); _sharp0 = Set(_dyeA, _sSharp, 0); }
+                _divS0 = Set(_velA, _sDivSolid, 0); _divS1 = Set(_div, _sDivSolid, 1);
+                _pRhoR = _rd.ComputePipelineCreate(_sRhoR);
+                _pRhoB = _rd.ComputePipelineCreate(_sRhoB);
+                _pGradRho = _rd.ComputePipelineCreate(_sGradRho);
+                _pTwoAdd = _rd.ComputePipelineCreate(_sTwoAdd);
+                // _dyeA IS ρ in this mode — the dye field reinterpreted, not a new texture.
+                _rhoR0 = Set(_pA, _sRhoR, 0); _rhoR1 = Set(_div, _sRhoR, 1);
+                _rhoR2 = Set(_pB, _sRhoR, 2); _rhoR3 = Set(_dyeA, _sRhoR, 3);
+                _rhoB0 = Set(_pB, _sRhoB, 0); _rhoB1 = Set(_div, _sRhoB, 1);
+                _rhoB2 = Set(_pA, _sRhoB, 2); _rhoB3 = Set(_dyeA, _sRhoB, 3);
+                _gradRho0 = Set(_velA, _sGradRho, 0); _gradRho1 = Set(_pA, _sGradRho, 1);
+                _gradRho2 = Set(_dyeA, _sGradRho, 2);
+                _twoAdd0 = Set(_velA, _sTwoAdd, 0); _twoAdd1 = Set(_dyeA, _sTwoAdd, 1);
+                _twoAdd2 = Set(_pA, _sTwoAdd, 2);   // the seed writes hydrostatic p directly
+                _twoPhaseReady = true;
             }
         }
 
@@ -537,6 +656,8 @@ public sealed class FluidSim
             _dctFx0, _dctFx1, _dctFy0, _dctFy1, _dctIy0, _dctIy1, _dctIx0, _dctIx1, _spec0,
             _blend0, _blend1,
             _adiX0, _adiX1, _adiX2, _adiX3, _adiY1, _adiYb0, _adiYb2, _adiYb3, _rot0,
+            _rhoR0, _rhoR1, _rhoR2, _rhoR3, _rhoB0, _rhoB1, _rhoB2, _rhoB3,
+            _gradRho0, _gradRho1, _gradRho2, _twoAdd0, _twoAdd1, _twoAdd2, _divS0, _divS1, _sharp0,
         })
         {
             if (s.IsValid) { _rd.FreeRid(s); }
@@ -546,7 +667,8 @@ public sealed class FluidSim
             if (t.IsValid) { _rd.FreeRid(t); }
         }
         foreach (var sh in new[] { _sAdd, _sAdvV, _sDiv, _sJac, _sGrad, _sAdvD, _sMc, _sVisc, _sSorR, _sSorB, _sWarm,
-            _sDctFx, _sDctFy, _sDctIy, _sDctIx, _sSpec, _sBlend, _sAdiX, _sAdiY, _sRot })
+            _sDctFx, _sDctFy, _sDctIy, _sDctIx, _sSpec, _sBlend, _sAdiX, _sAdiY, _sRot,
+            _sRhoR, _sRhoB, _sGradRho, _sTwoAdd, _sDivSolid, _sSharp })
         {
             if (sh.IsValid) { _rd.FreeRid(sh); }
         }
@@ -560,6 +682,20 @@ public sealed class FluidSim
         string src = FileAccess.GetFileAsString(Dir + name + ".glslinc");
         if (string.IsNullOrEmpty(src)) { GD.PushError($"[FluidSim] could not read {name}"); return default; }
         if (define != null) { src = src.Replace("#version 450", "#version 450\n" + define); }
+        // Host-side #include. Godot's ShaderCompileSpirVFromSource has no includer, so the
+        // text is spliced here — the same "assemble the shader in C#" approach the stamp
+        // solvers use, and what lets the shore kernels share one boundary description
+        // instead of three copies that can silently disagree.
+        for (int guard = 0; guard < 8 && src.Contains("#include \""); guard++)
+        {
+            int a = src.IndexOf("#include \"", System.StringComparison.Ordinal);
+            int b = src.IndexOf('"', a + 10);
+            string inc = src.Substring(a + 10, b - a - 10);
+            string body = FileAccess.GetFileAsString(Dir + inc);
+            if (string.IsNullOrEmpty(body)) { GD.PushError($"[FluidSim] {name}: cannot include {inc}"); return default; }
+            int lineEnd = src.IndexOf('\n', b);
+            src = src.Substring(0, a) + body + src.Substring(lineEnd < 0 ? src.Length : lineEnd);
+        }
         var rdSrc = new RDShaderSource { Language = RenderingDevice.ShaderLanguage.Glsl, SourceCompute = src };
         var spirv = _rd.ShaderCompileSpirVFromSource(rdSrc);
         string err = spirv.GetStageCompileError(RenderingDevice.ShaderStage.Compute);

@@ -76,7 +76,7 @@ public partial class Bounce : Scene250Base
     protected override string ArtifactName => "bounce (SOR ω)";
 
     protected override bool SideView => true;          // same vertical slice as 250
-    protected override bool ArtifactViewDefault => true;
+    protected override bool ArtifactViewDefault => false;
     protected override float ArtifactGainDefault => 32.6f;   // 250/250b both landed near 33
     protected override float TimeScaleDefault => 0.34f;
     protected override float FieldGainDefault => 0.8052f;

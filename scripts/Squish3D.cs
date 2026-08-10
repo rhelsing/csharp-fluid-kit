@@ -125,7 +125,7 @@ public partial class Squish3D : Scene250Base
     // 33.6, tuned — and 250 landed on 32.6 independently. My 6.0 guess was an order out in
     // both dimensions, so ~33 is the real scale for a divergence field in this palette.
     protected override float ArtifactGainDefault => 33.6f;
-    protected override bool ArtifactViewDefault => true;   // tuned on — the residual is the scene
+    protected override bool ArtifactViewDefault => false;
 
     protected override float BaseDt => _dt;
 

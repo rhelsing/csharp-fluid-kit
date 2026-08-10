@@ -1,0 +1,78 @@
+#version 450
+// fs_divergence_solid — ∇·v with the domain border treated as a SOLID WALL (v·n = 0),
+// instead of the zero-gradient clamp fs_divergence uses.
+//
+// THIS IS WHAT MAKES HYDROSTATIC PRESSURE EXIST. It is worth spelling out, because the
+// failure it fixes looks like a stability problem and is not one.
+//
+// Gravity is uniform, so after adding it the velocity field is uniform too — and a uniform
+// field has ZERO divergence. Feed that to the projection with homogeneous Neumann
+// boundaries everywhere and the only solution to ∇·((1/ρ)∇p) = 0 is p = const: the solve
+// returns no pressure whatsoever, nothing balances gravity, and water and air free-fall
+// together until they hit the floor. What then arrives at the bottom is a violent,
+// endlessly-repeating collision that shreds the interface into froth — which is exactly
+// what scene 290 showed: water everywhere, air in fragments, "boiling".
+//
+// The pressure has to come from the WALL. A solid floor imposes v·n = 0, so a falling
+// column next to it genuinely IS divergent, and that divergence is the source term whose
+// solution is the hydrostatic ramp. Clamping (v_outside = v_inside) instead says the
+// border is open and the fluid may pour straight through it, so no such source exists.
+//
+// Zeroing the wall velocity AFTER the projection — which fs_gradient_rho does — is not a
+// substitute. It makes the velocity obey the wall while the pressure never learns the wall
+// is there. The constraint has to be inside the solve.
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+layout(rg32f, set = 0, binding = 0) uniform image2D vel;
+layout(r32f,  set = 1, binding = 0) uniform image2D div;
+
+layout(push_constant, std430) uniform P {
+    vec2  size;
+    float omega;
+    float rho_min;
+    float open_top;    // != 0 → pressure Dirichlet p=0 on the top row, air free to move
+    float free_slip;   // != 0 → walls kill only the NORMAL velocity, not the tangential
+    float bed_y0;      // seabed height in cells at x = 0
+    float bed_slope;   // cells of rise per cell of run — this is tanβ
+    float _p0;
+    float _p1;
+    float _p2;
+    float _p3;
+} pc;
+
+// Shared boundary description. MUST come after the pc block — it reads pc directly, and
+// the host-side include is a plain text splice with no forward declarations.
+#include "fs_shore_common.glslinc"
+
+void main() {
+    ivec2 c = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 mx = ivec2(pc.size) - ivec2(1);
+    if (c.x > mx.x || c.y > mx.y) { return; }
+
+    // FLUX FORM, and this is not a detail. With Neumann boundaries all round, the Poisson
+    // problem only HAS a solution if Σ div = 0 over the domain — the compatibility
+    // condition. A centred difference 0.5·(v[i+1] − v[i−1]) with zeros outside does not
+    // telescope to boundary fluxes, so its sum is some arbitrary non-zero number, no
+    // solution exists, and the solver does not converge slowly — it RUNS AWAY. Measured:
+    // |v|max 16 k → 5.7 M → 65 M within seconds, with p_top reaching −44,000.
+    //
+    // Face-centred differences telescope exactly: every interior face appears once with
+    // each sign and cancels, leaving only boundary faces — which are zero, because the wall
+    // is solid. Σ div = 0 by construction, and the problem is solvable.
+    //
+    // Small domains hid this. The incompatibility scales with the forcing, so at one twelfth
+    // the gravity it was too slow to see over the seconds anyone watched — the same way the
+    // free-fall was.
+    if (sh_open(c) < 0.001) { imageStore(div, c, vec4(0.0)); return; }
+
+    vec2 vc = imageLoad(vel, c).rg;
+    float fR = (c.x == mx.x) ? 0.0 : sh_face_open(c, c + ivec2(1, 0))  * 0.5 * (vc.x + imageLoad(vel, c + ivec2(1, 0)).r);
+    float fL = (c.x == 0)    ? 0.0 : sh_face_open(c, c + ivec2(-1, 0)) * 0.5 * (vc.x + imageLoad(vel, c + ivec2(-1, 0)).r);
+    float fD = (c.y == 0)    ? 0.0 : sh_face_open(c, c + ivec2(0, -1)) * 0.5 * (vc.y + imageLoad(vel, c + ivec2(0, -1)).g);
+    // An OPEN top passes flow: the face carries the cell's own velocity rather than zero,
+    // so the atmosphere is free to leave. Closed, it is a wall like any other.
+    float fU = (c.y == mx.y)
+        ? (SH_OPEN_TOP ? vc.y : 0.0)
+        : sh_face_open(c, c + ivec2(0, 1)) * 0.5 * (vc.y + imageLoad(vel, c + ivec2(0, 1)).g);
+
+    imageStore(div, c, vec4((fR - fL) + (fU - fD), 0.0, 0.0, 0.0));
+}

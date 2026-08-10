@@ -1,0 +1,36 @@
+// fs_shore_common — shared boundary description for the shore slice. Included by the
+// projection, the gradient subtract and the divergence so all three agree, because the one
+// way to lose days here is to have them disagree about where the domain ends.
+//
+// TWO BOUNDARY IDEAS, and they are not the same thing:
+//
+//   OPEN TOP. A sealed box is not an ocean. With solid walls all round, both fluids are
+//   incompressible and total volume is fixed, so the interface cannot rise anywhere without
+//   falling somewhere else — every disturbance is forced into a circulation, and a
+//   wavemaker pushing into it produces recirculation rather than waves. The atmosphere must
+//   be able to leave and enter, which is a pressure DIRICHLET p = 0 on the top row and an
+//   open (non-zero) face velocity there.
+//
+//   THE BED. A sloping seabed is a solid region inside the domain, not at its border, and
+//   it is what supplies tanβ in the Iribarren number ξ = tanβ/√(H/L₀) — the thing that
+//   decides whether a wave spills, plunges or surges. It enters as a sub-grid OPEN FRACTION
+//   on each face, multiplying the conductance exactly the way stamp_wave_batty.glslinc
+//   weights faces by the island waterline. One face, two weights: open_fraction × 1/ρ_face.
+
+#define SH_OPEN_TOP  (pc.open_top != 0.0)
+#define SH_FREE_SLIP (pc.free_slip != 0.0)
+
+// Bed height in cells at a given x. Flat when slope is 0, so the same kernels serve 290.
+float sh_bed_y(float x) { return pc.bed_y0 + pc.bed_slope * x; }
+
+// Fraction of a cell that is FLUID: 1 well above the bed, 0 well below, ramped over one
+// cell so the boundary moves smoothly as the slope passes through it rather than jumping a
+// whole cell at a time — the sub-grid part of "sub-grid open fraction".
+float sh_open(ivec2 c) {
+    return clamp((float(c.y) + 0.5) - sh_bed_y(float(c.x) + 0.5), 0.0, 1.0);
+}
+
+// Open fraction of the FACE between two cells: the smaller of the two, so a face touching
+// solid is closed. min rather than average — an average would leak flow through a face that
+// is blocked on one side.
+float sh_face_open(ivec2 a, ivec2 b) { return min(sh_open(a), sh_open(b)); }

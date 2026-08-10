@@ -78,7 +78,7 @@ public partial class PressureMemory : Scene250Base
     protected override string ArtifactName => "memory (warm-start μ)";
 
     protected override bool SideView => true;
-    protected override bool ArtifactViewDefault => true;
+    protected override bool ArtifactViewDefault => false;
     protected override float ArtifactGainDefault => 32.6f;
     protected override float TimeScaleDefault => 0.34f;
     protected override float FieldGainDefault => 0.8052f;

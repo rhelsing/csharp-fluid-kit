@@ -73,7 +73,7 @@ public partial class Plaid : Scene250Base
     protected override string ArtifactName => "plaid (RBGS sweeps)";
 
     protected override bool SideView => true;              // same vertical slice as 250/251
-    protected override bool ArtifactViewDefault => true;
+    protected override bool ArtifactViewDefault => false;
     protected override float ArtifactGainDefault => 32.6f;
     protected override float TimeScaleDefault => 0.34f;
     protected override float FieldGainDefault => 0.8052f;

@@ -1,0 +1,17 @@
+#version 450
+// stamp_speed — |v| from a velocity field, for the artifact view. Same (in0, in1, out)
+// signature as stamp_energy/stamp_grad so FieldProbe drives it unchanged; in0 is rg32f here,
+// which the host does not care about because only the kernel declares the format.
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+layout(rg32f, set = 0, binding = 0) uniform image2D in0;
+layout(r32f,  set = 1, binding = 0) uniform image2D in1;   // unused
+layout(r32f,  set = 2, binding = 0) uniform image2D out_e;
+
+layout(push_constant, std430) uniform P { vec2 size; float gain; float _pad; } pc;
+
+void main() {
+    ivec2 c = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 mx = ivec2(pc.size) - ivec2(1);
+    if (c.x > mx.x || c.y > mx.y) { return; }
+    imageStore(out_e, c, vec4(length(imageLoad(in0, c).rg) * pc.gain, 0.0, 0.0, 0.0));
+}

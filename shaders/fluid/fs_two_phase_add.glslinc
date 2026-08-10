@@ -1,0 +1,143 @@
+#version 450
+// fs_two_phase_add — the source pass for the shore slice: UNIFORM gravity, plus optional
+// seeding of the water body.
+//
+// Gravity is uniform on every cell, air included, and that is not an approximation. The
+// variable-density momentum equation is
+//
+//     ∂v/∂t + v·∇v = −(1/ρ)∇p + g
+//
+// so g appears with no density factor at all — the density difference enters through the
+// 1/ρ on the pressure gradient, which is precisely what fs_pressure_rho and fs_gradient_rho
+// implement. Weighting gravity by ρ here as well (the Boussinesq habit, and what
+// fs_add_milk does with its drift term) would double-count it.
+//
+// The hydrostatic balance this sets up is the scene's whole test: with still water under
+// still air, ∇p must come out exactly equal to ρg and every velocity must stay zero.
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+layout(rg32f, set = 0, binding = 0) uniform image2D vel;
+layout(r32f,  set = 1, binding = 0) uniform image2D rho;
+layout(r32f,  set = 2, binding = 0) uniform image2D pres;
+
+layout(push_constant, std430) uniform P {
+    vec2  size;
+    float dt;
+    float gravity;      // cells/tick², negative = down
+    float seed;         // != 0 → (re)lay the water body this tick
+    float fill;         // waterline height, fraction of the domain
+    float rho_water;
+    float rho_air;
+    float stir;         // small solenoidal nudge, for shaking the equilibrium deliberately
+    float paddle_amp;   // piston wavemaker: horizontal velocity amplitude (cells/tick)
+    float paddle_freq;  // rad per tick
+    float paddle_t;     // accumulated sim ticks
+    float drag;         // bottom friction, fraction of velocity removed per tick near the bed
+    float bed_y0;
+    float bed_slope;
+    float drag_depth;   // thickness of the frictional layer above the bed, in cells
+    float sponge;       // offshore absorber strength, 0 = off
+    // 20 floats = 80 B exactly. tools/pc_audit.py checks this; the trap cost four separate
+    // debugging passes before it existed.
+    float _p0;
+    float _p1;
+    float _p2;
+} pc;
+
+void main() {
+    ivec2 c = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 mx = ivec2(pc.size) - ivec2(1);
+    if (c.x > mx.x || c.y > mx.y) { return; }
+
+    if (pc.seed != 0.0) {
+        // A sharp waterline, deliberately: a pre-smoothed interface would hide exactly the
+        // sharpening problem scene 291 exists to measure.
+        float y = float(c.y) / pc.size.y;
+        // Below the bed is filled with water too — it is solid and never moves, and the
+        // display paints the bed over it, so this only avoids a strip of trapped air.
+        float bedY = (pc.bed_y0 + pc.bed_slope * (float(c.x) + 0.5)) / pc.size.y;
+        bool wet = y < pc.fill || y < bedY;
+        imageStore(rho, c, vec4(wet ? pc.rho_water : pc.rho_air, 0.0, 0.0, 0.0));
+        imageStore(vel, c, vec4(0.0));
+
+        // ── SEED THE PRESSURE HYDROSTATICALLY ────────────────────────────────────────
+        // The hydrostatic ramp is a DOMAIN-SCALE mode, and relaxation converges those
+        // slowest — K ∝ N², landing on the one mode that has to be right. Starting the
+        // solve at p = 0 means it must build that ramp from the walls inward, cell by
+        // cell, and it cannot get there before the interface has been shredded by the
+        // free-fall in the meantime. But the answer is KNOWN in closed form at seed time,
+        // so there is no reason to make the solver discover it: seed it, and the solve is
+        // only ever asked to handle deviations from equilibrium.
+        //
+        // THE SCALING MUST MATCH THE CODE, not the textbook. fs_gradient_rho subtracts
+        // 0.5·(1/ρ)·(p[U] − p[D]), which has to cancel dt·g, so dp/dy = −ρ·dt·|g| — dt
+        // belongs INSIDE the seeded pressure. Get that wrong and the ramp is a plausible
+        // constant factor off, which looks like "nearly balanced" and drifts forever.
+        float gmag = abs(pc.gravity) * pc.dt;
+        float ys = pc.fill * pc.size.y;
+        float yc = float(c.y);
+        float ph;
+        if (yc >= ys) {
+            ph = pc.rho_air * gmag * (pc.size.y - yc);                      // in the air
+        } else {
+            ph = pc.rho_air * gmag * (pc.size.y - ys)                       // air above
+               + pc.rho_water * gmag * (ys - yc);                           // water below
+        }
+        imageStore(pres, c, vec4(ph, 0.0, 0.0, 0.0));
+        return;
+    }
+
+    vec2 v = imageLoad(vel, c).rg;
+    v.y += pc.dt * pc.gravity;
+
+    if (pc.stir != 0.0) {
+        vec2 r = (vec2(c) / pc.size) - 0.5;
+        v += pc.stir * vec2(-r.y, r.x);
+    }
+
+    float bed = pc.bed_y0 + pc.bed_slope * (float(c.x) + 0.5);
+
+    // ── PISTON WAVEMAKER. A column near the offshore wall driven sinusoidally in x, applied
+    // only BELOW the waterline: a real paddle pushes water, not air. Swinging the whole
+    // column including the atmosphere would pump the air phase and generate a pressure wave
+    // rather than a gravity wave.
+    // A piston imposes a VELOCITY, not a force. The first version did `v.x += amp·sin(ωt)`
+    // every tick, which INTEGRATES: at 60 ticks a second an amplitude meant to be an orbital
+    // velocity accumulates to roughly a hundred times itself within a second, and the
+    // wavemaker becomes a firehose. Blending the cell velocity toward the paddle velocity
+    // makes it a soft boundary condition — the paddle pushes water at its own speed and no
+    // faster, however long it runs.
+    if (pc.paddle_amp != 0.0) {
+        float band = smoothstep(0.10, 0.03, float(c.x) / pc.size.x);   // strongest at the wall
+        // Dense side only. (Written plainly: the previous step()-inside-a-comparison form
+        // was correct but unreadable enough that I misread it as inverted and said so.)
+        float wet = imageLoad(rho, c).r > 0.5 * (pc.rho_water + pc.rho_air) ? 1.0 : 0.0;
+        float up = pc.paddle_amp * sin(pc.paddle_freq * pc.paddle_t);
+        v.x = mix(v.x, up, clamp(band * wet, 0.0, 1.0));
+    }
+
+    // ── BOTTOM FRICTION. Without it a shoaling wave steepens indefinitely and never breaks:
+    // drag is what removes energy from the base of the wave while the crest keeps its
+    // momentum, tipping the crest forward over the trough. Confined to a few cells above
+    // the bed, which is where a real boundary layer lives.
+    if (pc.drag != 0.0) {
+        // The frictional layer is a DEPTH, not four cells. In deep water the bed barely
+        // matters; in the surf zone the whole column feels it, which is exactly why waves
+        // dissipate as they shoal. A fixed 4-cell band is ~5% of an 84-cell column and
+        // removes almost nothing — so the paddle pumps energy in faster than the domain can
+        // shed it, and with closed walls it accumulates until the water throws itself out.
+        float d = max(pc.drag_depth, 1.0);
+        float h = (float(c.y) + 0.5) - bed;
+        if (h > 0.0 && h < d) { v *= 1.0 - pc.drag * (1.0 - h / d); }
+    }
+
+    // ── OFFSHORE SPONGE. Without an absorber the left wall reflects everything the paddle
+    // sends, the reflection meets the incoming swell, and crests overturn toward the paddle
+    // instead of toward the beach — waves curling backwards. A real flume has an absorbing
+    // beach behind the wavemaker for the same reason. The beach itself absorbs on the right.
+    if (pc.sponge != 0.0) {
+        float s = smoothstep(0.045, 0.0, float(c.x) / pc.size.x);
+        v *= 1.0 - pc.sponge * s;
+    }
+
+    imageStore(vel, c, vec4(v, 0.0, 0.0));
+}

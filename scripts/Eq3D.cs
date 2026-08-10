@@ -102,7 +102,7 @@ public partial class Eq3D : Scene250Base
 
     protected override float TimeScaleDefault => 0.514f;
     protected override float ArtifactGainDefault => 33.6f;
-    protected override bool ArtifactViewDefault => true;
+    protected override bool ArtifactViewDefault => false;
 
     protected override float BaseDt => _dt;
 
