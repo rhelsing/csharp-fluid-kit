@@ -119,15 +119,47 @@ void main() {
     // drag is what removes energy from the base of the wave while the crest keeps its
     // momentum, tipping the crest forward over the trough. Confined to a few cells above
     // the bed, which is where a real boundary layer lives.
+    // ── BOTTOM FRICTION, RELATIVE TO LOCAL DEPTH.
+    //
+    // A fixed cell count is wrong in both directions and I got it wrong both ways. Four
+    // cells is ~5% of an 84-cell offshore column and dissipates nothing, so the paddle
+    // outpaces the domain's ability to shed energy and the water eventually throws itself
+    // out. Forty cells is HALF that column, dragging deep water where the bed should barely
+    // register — which bleeds momentum out of every wave across the whole run-in, so they
+    // arrive at the beach weaker than they left instead of shoaling taller.
+    //
+    // The physics is a fraction of the LOCAL DEPTH. A boundary layer is thin compared to
+    // deep water and comparable to the column in shallow water, which is precisely why
+    // waves propagate almost losslessly offshore and dissipate in the surf zone. Making the
+    // layer proportional to depth reproduces that for free: offshore the fraction covers
+    // little of the column, and as the bed rises the same fraction becomes most of it.
+    //
+    // Green's law is the check — shoaling waves should GAIN height as h^(-1/4). If they are
+    // losing it, friction is reaching too far up the column.
+    // QUADRATIC, τ = ρ·C_f·|u|·u, and that is the part that matters more than the profile.
+    //
+    // Linear drag cannot be right at both ends of this domain, and no value of it is: weak
+    // enough to let waves cross 80 m of deep water without bleeding out is too weak to stop
+    // energy accumulating in the surf zone, and strong enough to bound the surf zone flattens
+    // every wave before it arrives. I found both failures by turning the same knob in
+    // opposite directions.
+    //
+    // Real bottom friction is quadratic in velocity, which is SELF-LIMITING: it scales as
+    // |u|² so it barely touches a gentle swell and bites hard the moment flow accelerates —
+    // exactly the behaviour needed at both ends, from one coefficient. The linear term stays
+    // as a small floor for creeping flow, where quadratic drag vanishes and a boundary layer
+    // still exists.
     if (pc.drag != 0.0) {
-        // The frictional layer is a DEPTH, not four cells. In deep water the bed barely
-        // matters; in the surf zone the whole column feels it, which is exactly why waves
-        // dissipate as they shoal. A fixed 4-cell band is ~5% of an 84-cell column and
-        // removes almost nothing — so the paddle pumps energy in faster than the domain can
-        // shed it, and with closed walls it accumulates until the water throws itself out.
-        float d = max(pc.drag_depth, 1.0);
         float h = (float(c.y) + 0.5) - bed;
-        if (h > 0.0 && h < d) { v *= 1.0 - pc.drag * (1.0 - h / d); }
+        if (h > 0.0) {
+            float depth = max(pc.fill * pc.size.y - bed, 1.0);
+            float layer = max(pc.drag_depth, 0.01) * depth;   // fraction of LOCAL depth
+            if (h < layer) {
+                float prof = 1.0 - h / layer;                 // strongest at the bed
+                float cf = pc.drag * prof;
+                v *= 1.0 - clamp(cf * (0.15 + length(v)), 0.0, 0.5);
+            }
+        }
     }
 
     // ── OFFSHORE SPONGE. Without an absorber the left wall reflects everything the paddle

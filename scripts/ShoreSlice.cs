@@ -94,8 +94,19 @@ public partial class ShoreSlice : Scene250Base
     protected float _paddleFreq = 0.06f;
     protected float _paddleT;
     protected float _drag;
-    protected float _dragDepth = 24f;
+    protected float _dragDepth = 0.12f;   // FRACTION of local depth, not a cell count
     protected float _sponge;
+
+    // ── SUBSTEPS: the CFL fix, and the reason energetic runs destroyed the interface.
+    // Semi-Lagrangian is unconditionally STABLE but only accurate near CFL ≈ 1. At |v|max
+    // 8–12 cells/tick with dt = 1 the fluid crosses ten cells per step, the backtrace lands
+    // nowhere near where it started, and the density interface is shredded in a few steps —
+    // measured as 76% of the domain going mid-phase and ρ_min climbing from 0.0012 to 0.25,
+    // i.e. no cell left pure air. Sharpening cannot keep up with that and was never the
+    // problem. Lowering dt alone does not work either: TimeScale multiplies it straight
+    // back. Splitting the tick into N steps of dt/N keeps sim-time per frame the same and
+    // brings CFL back to ~1, which is the only thing that preserves an interface.
+    protected int _substeps = 4;
     private float _statT;
     private string _lastStat = "";
     protected float _speedGain = 240.0f;  // spurious currents are TINY; this is why
@@ -178,8 +189,12 @@ public partial class ShoreSlice : Scene250Base
         bool seed = !_seeded || Input.IsKeyPressed(Key.Space);
         if (seed) { _seeded = true; _t = 0f; }
 
-        float dt = Dt;
-        int iters = ReferenceOn ? ReferenceSweeps : _k;
+        int sub = Mathf.Max(1, _substeps);
+        float dt = Dt / sub;
+        // Each substep warm-starts from the last, so the solve does not need K sweeps from
+        // scratch every time — fewer sweeps × more steps costs about the same and converges
+        // better, because the pressure is never far from where it was.
+        int iters = ReferenceOn ? ReferenceSweeps : Mathf.Max(20, _k / sub);
 
         // EVERY push constant takes the REAL grid, not (N, N). With a non-square domain the
         // two differ by the aspect, and the failure is silent and total: the seed kernel
@@ -214,11 +229,22 @@ public partial class ShoreSlice : Scene250Base
         bool mcOn = _macCormack;
         bool solidW = _solidWalls;
 
+        // The seed must happen ONCE, not on every substep.
+        byte[] addQuiet = addB;
+        if (seed)
+        {
+            var quiet = (float[])add.Clone();
+            quiet[4] = 0f;
+            addQuiet = ToBytes(quiet);
+        }
         RenderingServer.CallOnRenderThread(Callable.From(() =>
         {
             if (_fluid == null) { return; }
             _fluid.UseSolidDivergence = solidW;
-            _fluid.StepTwoPhase(addB, advVB, rhoB, advDB, iters, mcOn, mcB, shB);
+            for (int i = 0; i < sub; i++)
+            {
+                _fluid.StepTwoPhase(i == 0 ? addB : addQuiet, advVB, rhoB, advDB, iters, mcOn, mcB, shB);
+            }
             _speed?.Run(spB);
         }));
 
@@ -249,6 +275,8 @@ public partial class ShoreSlice : Scene250Base
         ui.AddSlider("Deliberate stir (0 = leave it alone)", 0.0f, 0.05f, _stir, v => _stir = v);
         ui.AddSlider("|v| readout gain (currents are tiny)", 10.0f, 2000.0f, _speedGain,
             v => _speedGain = v);
+        ui.AddSlider("Substeps (CFL — raise until the interface stops shredding)", 1, 12,
+            _substeps, v => _substeps = (int)v);
         ui.AddSlider("Interface sharpening (0 = off, and it WILL fog)", 0.0f, 1.0f, _sharpen,
             v => _sharpen = v);
         ui.AddSlider("Sharpening power (harder edge)", 1.0f, 8.0f, _sharpPower,

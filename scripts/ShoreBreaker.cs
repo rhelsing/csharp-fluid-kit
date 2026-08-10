@@ -35,16 +35,24 @@ public partial class ShoreBreaker : ShoreSlice
     public ShoreBreaker()
     {
         _fill = 0.33f;
+        // Beach-scale gravity. These extend ShoreSlice (the 6 m control), not
+        // ShoreSliceBig, so without this they silently inherit -0.012 — a third of real g
+        // once the grid ratio is applied. Wave speed is √(gh), so everything runs sluggish
+        // and shoals weakly, and nothing on screen says why.
+        _gravity = -0.035f;
         _k = 90;
-        _paddleAmp = 0.10f;    // ≈ 0.47 m/s orbital, now that it is a velocity BC
+        _paddleAmp = 0.30f;    // ≈ 1.4 m/s orbital — a swell with something to give
         // Derived rather than dialled. Cell 0.078 m, 60 ticks/s, offshore depth 0.33×20 m
         // = 6.6 m. A 4.5 s period gives L₀ = gT²/2π ≈ 32 m, so ~2.5 wavelengths fit the 80 m
         // domain and kh ≈ 1.3 — intermediate water, which is where shoaling actually acts.
         // The previous 0.045 rad/tick was a 2.3 s period, L₀ ≈ 8 m, kh ≈ 5: deep-water chop
         // that never feels the bed at all.
         _paddleFreq = 0.023f;  // 2π / (4.5 s × 60 ticks)
-        _drag = 0.035f;        // the knob that converts steepening into breaking
-        _dragDepth = 40f;      // a real surf-zone boundary layer, not a 4-cell sliver
+        _drag = 0.09f;         // quadratic C_f — self-limiting, so it can be firm
+        // 12% of the LOCAL depth. Offshore that is ~10 cells of an 84-cell column, so
+        // waves propagate nearly losslessly; as the bed rises the same fraction becomes most
+        // of the column and the surf zone dissipates — which is where dissipation belongs.
+        _dragDepth = 0.22f;
         _sponge = 0.06f;       // absorb at the offshore wall so nothing reflects back
         // 0.30 flooded the domain to all-water. The sharpening remap is NOT conservative —
         // under violent mixing, cells hovering near φ = 0.5 get snapped to whichever phase
@@ -81,10 +89,10 @@ public partial class ShoreBreaker : ShoreSlice
         base.BuildSimKnobs(ui);
         ui.AddSlider("Paddle · stroke (cells/tick)", 0.0f, 2.0f, _paddleAmp, v => _paddleAmp = v);
         ui.AddSlider("Paddle · frequency (rad/tick)", 0.005f, 0.2f, _paddleFreq, v => _paddleFreq = v);
-        ui.AddSlider("Bottom friction (0 = steepens forever, never breaks)", 0.0f, 0.15f,
+        ui.AddSlider("Bottom friction C_f (quadratic — self-limiting)", 0.0f, 0.4f,
             _drag, v => _drag = v);
-        ui.AddSlider("Friction depth (cells above bed — 4 is a sliver, 40 is a surf zone)",
-            2f, 90f, _dragDepth, v => _dragDepth = v);
+        ui.AddSlider("Friction layer (FRACTION of local depth — 1.0 drags the whole column)",
+            0.01f, 1.0f, _dragDepth, v => _dragDepth = v);
         ui.AddSlider("Offshore sponge (0 = walls reflect, waves curl backwards)", 0.0f, 0.3f,
             _sponge, v => _sponge = v);
     }

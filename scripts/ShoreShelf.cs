@@ -33,6 +33,11 @@ public partial class ShoreShelf : ShoreSlice
     public ShoreShelf()
     {
         _fill = 0.33f;
+        // Beach-scale gravity. These extend ShoreSlice (the 6 m control), not
+        // ShoreSliceBig, so without this they silently inherit -0.012 — a third of real g
+        // once the grid ratio is applied. Wave speed is √(gh), so everything runs sluggish
+        // and shoals weakly, and nothing on screen says why.
+        _gravity = -0.035f;
         _k = 90;
         _drag = 0f;        // no friction yet — 293 is shoaling ALONE, cleanly
         _paddleAmp = 0f;   // and no waves yet either: prove the still bed first

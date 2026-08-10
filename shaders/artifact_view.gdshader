@@ -165,9 +165,12 @@ void fragment() {
 		}
 	}
 
+	// The seabed in MINUS — sand. It was ROOM, which is within a few percent of INK, so
+	// sea and seabed were both "nearly black" and the waterline could not be read at all.
+	// A beach needs the bed to be a different MATERIAL on screen, not a darker dark.
 	if (bed_y0 > 0.0 || bed_slope != 0.0) {
 		float bed = bed_y0 + bed_slope * uv.x;
-		col = mix(col, ROOM, smoothstep(bed + 0.004, bed - 0.004, uv.y));
+		col = mix(col, MINUS * 0.55, smoothstep(bed + 0.004, bed - 0.004, uv.y));
 	}
 
 	if (ring_radius > 0.0) {
