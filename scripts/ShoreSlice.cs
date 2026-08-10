@@ -86,8 +86,19 @@ public partial class ShoreSlice : Scene250Base
 
     // Seabed: height in cells at x=0, and rise per cell of run — bed_slope IS tanβ, the
     // numerator of the Iribarren number that decides spilling vs plunging vs surging.
-    protected virtual float BedY0 => 0f;
     protected virtual float BedSlope => 0f;
+
+    /// <summary>
+    /// Where the still waterline meets the bed, as a fraction of domain length. Derived
+    /// rather than set, because bed height and slope are NOT independent: raising the slope
+    /// while holding the intercept drags the shoreline offshore and shrinks the sea to a
+    /// corner. My first Iribarren sweep did exactly that, so it varied tanβ AND the surf-zone
+    /// length together and could not be read. Holding the shoreline fixed makes slope the
+    /// only variable, which is what the sweep is for.
+    /// </summary>
+    protected virtual float ShoreAt => 0.75f;
+
+    protected float BedY0 => _fill * Grid.Y - BedSlope * (ShoreAt * Grid.X);
 
     // Piston wavemaker + bottom friction (294).
     protected float _paddleAmp;
@@ -107,6 +118,15 @@ public partial class ShoreSlice : Scene250Base
     // back. Splitting the tick into N steps of dt/N keeps sim-time per frame the same and
     // brings CFL back to ~1, which is the only thing that preserves an interface.
     protected int _substeps = 4;
+
+    /// <summary>
+    /// Substeps needed at the CURRENT grid. CFL is |v|·dt in CELLS, so halving the cell size
+    /// doubles the Courant number for the same physical speed — a substep count tuned at
+    /// 1024 is half what 2048 needs, and the interface shreds for a reason that has nothing
+    /// to do with the physics. Scaling with the grid keeps the accuracy constant and makes
+    /// the resolution dropdown safe to touch.
+    /// </summary>
+    protected int SubstepsForGrid => Mathf.Max(1, Mathf.RoundToInt(_substeps * (N / 1024f)));
     private float _statT;
     private string _lastStat = "";
     protected float _speedGain = 240.0f;  // spurious currents are TINY; this is why
@@ -189,7 +209,7 @@ public partial class ShoreSlice : Scene250Base
         bool seed = !_seeded || Input.IsKeyPressed(Key.Space);
         if (seed) { _seeded = true; _t = 0f; }
 
-        int sub = Mathf.Max(1, _substeps);
+        int sub = SubstepsForGrid;
         float dt = Dt / sub;
         // Each substep warm-starts from the last, so the solve does not need K sweeps from
         // scratch every time — fewer sweeps × more steps costs about the same and converges
@@ -364,7 +384,31 @@ public partial class ShoreSlice : Scene250Base
         float midPct = 100f * mid / rho.Length;
         float idealPct = 100f * g.X / rho.Length;   // one cell thick everywhere along x
 
-        string stat = $"[290] interface {midPct:0.00}% mid-phase (1-cell ideal {idealPct:0.00}%) · "
+        // ── BREAKER INDEX γ = H/h. For each column: the highest cell that is still water
+        // is the surface; H is its rise above the still-water line and h is the still depth
+        // over the bed there. A wave breaks at γ ≈ 0.78, so the MAXIMUM of H/h across the
+        // profile — and where it occurs — says whether this is a real breaker or a picture.
+        float still = _fill * g.Y;
+        float gMax = 0f; int gx = 0; float hAtMax = 0f, HAtMax = 0f;
+        for (int x = 0; x < g.X; x++)
+        {
+            int top = -1;
+            for (int y = g.Y - 1; y >= 0; y--)
+            {
+                if (rho[y * g.X + x] > 0.5f) { top = y; break; }
+            }
+            if (top < 0) { continue; }
+            float bedY = BedY0 + BedSlope * (x + 0.5f);
+            float h = still - bedY;
+            if (h < 4f) { continue; }                 // inside the swash, γ is meaningless
+            float H = top - still;
+            if (H <= 0f) { continue; }
+            float r = H / h;
+            if (r > gMax) { gMax = r; gx = x; hAtMax = h; HAtMax = H; }
+        }
+
+        string stat = $"[290] γ {gMax:0.00} @x{gx} (H {HAtMax * (PlaneSize.Y / g.Y):0.00}m / "
+            + $"h {hAtMax * (PlaneSize.Y / g.Y):0.00}m) · interface {midPct:0.00}% mid-phase (1-cell ideal {idealPct:0.00}%) · "
             + $"|v|max {vmax:0.0000} · |div|max {dmax:0.0000} · "
             + $"rho [{rmin:0.000}..{rmax:0.000}] · p bot/mid/top {pBot:0.000}/{pMid:0.000}/{pTop:0.000}";
         if (stat != _lastStat) { GD.Print(stat); _lastStat = stat; }

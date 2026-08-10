@@ -59,7 +59,6 @@ public partial class ShoreShelf : ShoreSlice
 
     // 1:10 — steep enough to plunge rather than spill. ξ ≈ 1 at typical swell steepness,
     // which is the middle of the plunging band.
-    protected override float BedY0 => 6f;
     protected override float BedSlope => 0.10f;
 
     protected override float DomainAspect => 4.0f;

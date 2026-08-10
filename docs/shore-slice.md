@@ -160,6 +160,36 @@ the same steepening as a FLUX. That is the real 291; this is the dialable versio
 the problem visible. Also watch `|v|max`: it crept 0.17 → 1.04 where it previously plateaued
 at 0.6, which is plausibly energy injected at the interface by the remap.
 
+### §294 · the sweep that found the break — and the confound in the first one
+
+Breadth-first across bed slope, with γ = H/h measured per frame rather than judged by eye.
+
+**The first sweep was unreadable and I built the fault in.** Raising the slope while holding
+the bed intercept drags the SHORELINE offshore too, so tanβ and surf-zone length varied
+together and the runs could not be compared — at 1:5 the domain was mostly dry sand with the
+sea squeezed into a corner. `BedY0` is now DERIVED from slope and a fixed shoreline fraction,
+which makes slope the only variable.
+
+| slope | ξ band | γ measured | reading |
+|---|---|---|---|
+| 1:20 | spilling | 0.55 | steepens, slumps |
+| 1:10 | plunging edge | **0.85** | closest to the 0.78 breaking index |
+| 1:5 | plunging | 1.59 | breaks too early, in water too shallow to resolve |
+
+**1:10 lands at γ = 0.85 against a theoretical 0.78** — the first quantitative sign the break
+is physical rather than decorative.
+
+**Resolution was the other half, and it was decisive.** At 1024 (0.078 m/cell) the crest
+steepens and slumps. At 2048 (0.039 m/cell) it throws: a curling front with detached spray.
+An overturning lip is a thin, fast, small-scale structure — at 0.078 m/cell it is simply
+below the grid, and no amount of solver work recovers a feature the mesh cannot hold.
+
+⚠ **The pinned configuration is running hot.** At 2048, |v|max 72 and |div|max 5 mean the
+Courant number is far above 1 even with substepping, so some of that spray is numerical
+rather than physical. CFL is |v|·dt in CELLS, so halving the cell size doubles the Courant
+number for the same physical speed — substeps now scale with the grid for that reason. The
+picture is the best so far and the numbers say it is not yet trustworthy; both are true.
+
 ### What is still missing for curl
 
 - **291** a sharp interface that survives advection. Without it everything downstream is fog.

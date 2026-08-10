@@ -48,6 +48,7 @@ public partial class ShoreBreaker : ShoreSlice
         // The previous 0.045 rad/tick was a 2.3 s period, L₀ ≈ 8 m, kh ≈ 5: deep-water chop
         // that never feels the bed at all.
         _paddleFreq = 0.023f;  // 2π / (4.5 s × 60 ticks)
+        _substeps = 5;    // ×2 at 2048 ⇒ 10 — see SubstepsForGrid
         _drag = 0.09f;         // quadratic C_f — self-limiting, so it can be firm
         // 12% of the LOCAL depth. Offshore that is ~10 cells of an 84-cell column, so
         // waves propagate nearly losslessly; as the bed rises the same fraction becomes most
@@ -76,13 +77,12 @@ public partial class ShoreBreaker : ShoreSlice
 
     protected override string ArtifactName => "the break (γ = H/h ≈ 0.78)";
 
-    protected override float BedY0 => 6f;
     protected override float BedSlope => 0.10f;
 
     protected override float DomainAspect => 4.0f;
     protected override float WorldSize => 80.0f;
     protected override int[] GridOptions => new[] { 512, 1024, 2048 };
-    protected override int GridDefault => 1024;
+    protected override int GridDefault => 2048;
 
     protected override void BuildSimKnobs(DemoUI ui)
     {
