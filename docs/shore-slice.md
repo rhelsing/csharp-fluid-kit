@@ -190,6 +190,54 @@ rather than physical. CFL is |v|·dt in CELLS, so halving the cell size doubles 
 number for the same physical speed — substeps now scale with the grid for that reason. The
 picture is the best so far and the numbers say it is not yet trustworthy; both are true.
 
+### §294 · THE OPEN FAILURE — breaking destroys the interface, irreversibly
+
+**Status: 294 is not a working scene.** It produces a convincing breaker for roughly thirty
+to sixty seconds and then dissolves into uniform mush. This is the honest state and it is
+not close to fixed.
+
+Ninety-second run at 1:5 / 1024, sampled every six seconds:
+
+```
+interface   0.4% → 1.7 → 2.9 → 3.9 → 13.5 → 20.7 → 37.1 → 73.9 → 75%  (saturates)
+|v|max      4.2 → 2.7 → 5.6 → 7.4 → 11.5 ← spike → 6.3 → 4.1 → 2.4 → 1.3 → 1.1
+```
+
+Note what this is NOT. Velocities do not run away — they **peak and then decay**. Nothing
+diverges, no pressure blows up, no NaN. The failure is quieter and worse:
+
+1. A wave **breaks**, and `|v|max` spikes from ~4 to 11.5 for a few frames.
+2. At 5 substeps that is **CFL ≈ 2.3**, well over 1, so semi-Lagrangian advection is far
+   outside its accurate range for exactly those frames.
+3. The density interface is **shredded** during the spike.
+4. It never comes back. The sharpening remap MAINTAINS an interface; it cannot RECONSTRUCT
+   one that has been mixed away — it is a local monotone remap, not a reinitialisation.
+5. With no density contrast there is no buoyancy, so velocities decay to ~1.1 and the domain
+   settles into a homogeneous mixture at 75% mid-phase.
+
+**The breaking event destroys the thing that makes breaking possible.** That is why it looks
+right and then quietly stops being water.
+
+A fixed substep count cannot fix this: at rest the domain needs ~5, during a break it needs
+12 or more, and paying the break's cost continuously is unaffordable. Candidate fixes, none
+implemented:
+
+- **Adaptive substepping** from measured peak velocity, so CFL stays ~1 only while it must.
+  Cheapest, targets the mechanism directly, but the feedback is a frame late.
+- **Conservative compression (Olsson–Kreiss)** — reconstructs rather than maintains, so a
+  partially mixed interface can recover instead of being lost.
+- **MAC staggered velocity** — removes the collocated inconsistency that makes the interface
+  noisy in the first place, so there is less to lose during a spike.
+- **Lower density ratio** — 833:1 gives air a mobility of 833 against water's 1, so the same
+  pressure error moves air far harder. Cheap to test, and worth ruling in or out first.
+
+### Also unresolved
+
+- The 2048 configuration that threw the best spray runs `|v|max` 72 / `|div|max` 5, so a
+  good part of that spray is Courant noise rather than water.
+- γ oscillates 0.56–0.99 around the theoretical 0.78, which is encouraging but is measured
+  on an interface that is already degrading.
+
 ### What is still missing for curl
 
 - **291** a sharp interface that survives advection. Without it everything downstream is fog.

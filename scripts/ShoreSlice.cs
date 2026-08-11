@@ -127,6 +127,34 @@ public partial class ShoreSlice : Scene250Base
     /// the resolution dropdown safe to touch.
     /// </summary>
     protected int SubstepsForGrid => Mathf.Max(1, Mathf.RoundToInt(_substeps * (N / 1024f)));
+
+    // Measured peak speed, fed back from the readback. Drives adaptive substepping.
+    private float _vPeak;
+
+    /// <summary>
+    /// Substeps chosen from the MEASURED peak velocity so that CFL stays near 1.
+    ///
+    /// A fixed count cannot work here, and the time series shows exactly why: at rest the
+    /// domain needs ~5, but a breaking wave spikes |v|max from 4 to 11.5 for a few frames.
+    /// Those few frames run at CFL > 2, the density interface is shredded, and it never
+    /// comes back — the sharpening remap MAINTAINS an interface, it cannot reconstruct one
+    /// that has been mixed away. With no density contrast there is no buoyancy, velocities
+    /// decay, and the whole domain settles into uniform mush. Measured: interface 0.4% →
+    /// 75% over ninety seconds, with |v|max peaking at 11.5 and then falling to 1.1.
+    ///
+    /// So the breaking event destroys the very thing that makes breaking possible. Spending
+    /// the substeps only when the wave is actually breaking is both cheaper and the only
+    /// thing that survives one.
+    /// </summary>
+    protected int AdaptiveSubsteps()
+    {
+        int floorN = SubstepsForGrid;
+        if (_vPeak <= 0f) { return floorN; }
+        int need = Mathf.CeilToInt(_vPeak * Dt / Mathf.Max(_targetCfl, 0.05f));
+        return Mathf.Clamp(Mathf.Max(floorN, need), 1, 48);
+    }
+
+    protected float _targetCfl = 0.9f;
     private float _statT;
     private string _lastStat = "";
     protected float _speedGain = 240.0f;  // spurious currents are TINY; this is why
@@ -209,7 +237,7 @@ public partial class ShoreSlice : Scene250Base
         bool seed = !_seeded || Input.IsKeyPressed(Key.Space);
         if (seed) { _seeded = true; _t = 0f; }
 
-        int sub = SubstepsForGrid;
+        int sub = AdaptiveSubsteps();
         float dt = Dt / sub;
         // Each substep warm-starts from the last, so the solve does not need K sweeps from
         // scratch every time — fewer sweeps × more steps costs about the same and converges
@@ -295,8 +323,9 @@ public partial class ShoreSlice : Scene250Base
         ui.AddSlider("Deliberate stir (0 = leave it alone)", 0.0f, 0.05f, _stir, v => _stir = v);
         ui.AddSlider("|v| readout gain (currents are tiny)", 10.0f, 2000.0f, _speedGain,
             v => _speedGain = v);
-        ui.AddSlider("Substeps (CFL — raise until the interface stops shredding)", 1, 12,
-            _substeps, v => _substeps = (int)v);
+        ui.AddSlider("Substeps floor (adaptive above this)", 1, 12, _substeps, v => _substeps = (int)v);
+        ui.AddSlider("Target CFL (lower = safer through a break, slower)", 0.2f, 2.0f,
+            _targetCfl, v => _targetCfl = v);
         ui.AddSlider("Interface sharpening (0 = off, and it WILL fog)", 0.0f, 1.0f, _sharpen,
             v => _sharpen = v);
         ui.AddSlider("Sharpening power (harder edge)", 1.0f, 8.0f, _sharpPower,
@@ -358,11 +387,19 @@ public partial class ShoreSlice : Scene250Base
         var prs = _fluid.ReadField(_fluid.PressureRid);
         var dvg = _fluid.ReadField(_fluid.DivRid);
 
-        float vmax = 0f, dmax = 0f, rmin = 1e9f, rmax = -1e9f;
+        // SPLIT BY PHASE. The projection gives air a mobility of 1/ρ_air ≈ 833 against
+        // water's 1, so the same pressure error moves air ~833× harder. If |v|max is being
+        // set by the air phase then the CFL limit is the air's, substeps tuned on water are
+        // far too few, and the density ratio is buying realism at the cost of a timestep
+        // nobody can afford. One number cannot tell those apart; two can.
+        float vmax = 0f, vAir = 0f, vWat = 0f, dmax = 0f, rmin = 1e9f, rmax = -1e9f;
+        float phaseMid = 0.5f * (_rhoWater + _rhoAir);
         for (int i = 0; i + 1 < vel.Length; i += 2)
         {
             float sp = Mathf.Sqrt(vel[i] * vel[i] + vel[i + 1] * vel[i + 1]);
             if (sp > vmax) { vmax = sp; }
+            if (rho[i / 2] > phaseMid) { if (sp > vWat) { vWat = sp; } }
+            else if (sp > vAir) { vAir = sp; }
         }
         foreach (var d in dvg) { float a = Mathf.Abs(d); if (a > dmax) { dmax = a; } }
         foreach (var r in rho) { if (r < rmin) { rmin = r; } if (r > rmax) { rmax = r; } }
@@ -409,8 +446,9 @@ public partial class ShoreSlice : Scene250Base
 
         string stat = $"[290] γ {gMax:0.00} @x{gx} (H {HAtMax * (PlaneSize.Y / g.Y):0.00}m / "
             + $"h {hAtMax * (PlaneSize.Y / g.Y):0.00}m) · interface {midPct:0.00}% mid-phase (1-cell ideal {idealPct:0.00}%) · "
-            + $"|v|max {vmax:0.0000} · |div|max {dmax:0.0000} · "
+            + $"|v| air {vAir:0.0}/water {vWat:0.0} · |v|max {vmax:0.0000} · |div|max {dmax:0.0000} · "
             + $"rho [{rmin:0.000}..{rmax:0.000}] · p bot/mid/top {pBot:0.000}/{pMid:0.000}/{pTop:0.000}";
+        _vPeak = vmax;   // feeds AdaptiveSubsteps on the next tick
         if (stat != _lastStat) { GD.Print(stat); _lastStat = stat; }
     }
 

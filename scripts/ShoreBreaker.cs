@@ -77,12 +77,12 @@ public partial class ShoreBreaker : ShoreSlice
 
     protected override string ArtifactName => "the break (γ = H/h ≈ 0.78)";
 
-    protected override float BedSlope => 0.10f;
+    protected override float BedSlope => 0.20f;
 
     protected override float DomainAspect => 4.0f;
     protected override float WorldSize => 80.0f;
     protected override int[] GridOptions => new[] { 512, 1024, 2048 };
-    protected override int GridDefault => 2048;
+    protected override int GridDefault => 1024;
 
     protected override void BuildSimKnobs(DemoUI ui)
     {
