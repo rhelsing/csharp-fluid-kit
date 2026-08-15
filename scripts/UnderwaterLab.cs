@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using Godot;
 using GodotCsharpExperiments.Lib;
 
@@ -14,11 +15,10 @@ using GodotCsharpExperiments.Lib;
 // camera exactly at the waterline and hold it there, which a bobbing boat can never do.
 // Nothing here is about boats, so the boat is noise.
 //
-// WHY THE WAVES START FLAT. `Wave amplitude x` defaults to 0, so the surface is a plane
-// until you deliberately raise it. A flat sea makes the boundary verifiable by eye — but a
-// flat sea would also let a hardcoded `y = const` pass every test, which is the exact bug
-// the height-provider contract exists to design out. So: prove it flat, then raise the
-// swell and prove it again.
+// WAVES. `Wave amplitude x` is a MULTIPLIER over every band's steepness, so at 0 the six
+// per-band sliders are all multiplied by zero and appear broken. It shipped at 0 during
+// proof 1 (a flat sea makes a boundary verifiable by eye); it is 1 now that the composite
+// is the thing being looked at.
 //
 // PORT EDITS from 50, all forced by removing the boat:
 //   · the toroidal MNA window follows the CAMERA. 50 calls it a "camera-following window"
@@ -31,7 +31,9 @@ using GodotCsharpExperiments.Lib;
 // See it: tools/godot-mono.sh --path . res://scenes/53_underwater_lab.tscn
 public partial class UnderwaterLab : Node3D
 {
-    private const string WaterShader = "res://shaders/ameye_water_mna.gdshader";
+    // PORT EDIT: scene-53 fork, so scene 50 keeps its shader byte-for-byte. The fork adds
+    // only what the uwkit underside chunk requires.
+    private const string WaterShader = "res://shaders/ameye_water_uw.gdshader";
     private const string FloorShader = "res://shaders/caustics_floor.gdshader";
     private const string FoamTex = "res://textures/ameye/Foam 5.png";
     private const string NormalTex = "res://textures/ameye/Normals 1.png";
@@ -46,7 +48,7 @@ public partial class UnderwaterLab : Node3D
     private const int WaterPlaneSubdiv = 400;
 
     // Composite bands: [wavelength, steepness, speed, direction(0..1)] — swell -> chop.
-    private static readonly float[][] Bands =
+    private static readonly float[][] BandDefaults =
     {
         new[] { 34f, 0.13f, 1.10f, 0.12f },
         new[] { 26f, 0.10f, 1.00f, 0.28f },
@@ -55,6 +57,11 @@ public partial class UnderwaterLab : Node3D
         new[] { 5f, 0.07f, 1.35f, 0.82f },
         new[] { 3f, 0.05f, 1.60f, 0.40f },
     };
+
+    // Live, editable copy of the composite. Scene 50 bakes these as constants because its
+    // sea is a fixed look; this is a LAB, so every band is a slider — and the kit reads the
+    // same numbers, so the fog and the waterline follow whatever you dial.
+    private readonly float[][] _bands = BandDefaults.Select(b => (float[])b.Clone()).ToArray();
 
     private SumField _field = new();
     private ShaderMaterial _mat = null!;
@@ -65,11 +72,41 @@ public partial class UnderwaterLab : Node3D
     private Vector3 _camAnchor = Vector3.Zero;
     private bool _parkY;
     private float _camParkY = 0.0f;
+    private int _uwProvider;
+
+    // ---- uwkit: the modular underwater kit under test ----------------------
+    // The effect is GDSCRIPT living in res://uwkit/, deliberately: it has to drop into
+    // water-kit (GDScript) unchanged, and the proof that it is modular is that the file is
+    // byte-identical in both repos. Only this host scene is C#.
+    //
+    // Instantiating it from C# is itself part of proof 1 — GDScript is proven to RUN in this
+    // .NET project (tools/shoot.gd), but a GDScript CompositorEffect attached to a C#
+    // scene's camera was not, and that is the load-bearing unknown.
+    // ---- MASK VOLUME (the construction proven in water-kit scene 213) ----
+    // A SubViewport renders a box whose top face is displaced by uw53_displace() — the SAME
+    // include the water shader uses — and a 2D overlay paints where its back faces are.
+    // Four invariants, and breaking any one makes the mask silently stop matching:
+    //   1. one wave function (the shared include)
+    //   2. one data push (SyncMask below feeds both materials)
+    //   3. matching vertex grids (same footprint AND subdivisions as the water plane)
+    //   4. same clock, same frame
+    private SubViewport _maskVp = null!;
+    private Camera3D _maskCam = null!;
+    private ShaderMaterial _maskMat = null!;
+    private ColorRect _overlay = null!;
+    private float _underFade = 0.35f;   // metres over which the underside look eases in
+    private ShaderMaterial _overlayMat = null!;
+
+    private GodotObject? _uwBoundary;
+    private const string UwBoundaryPath = "res://uwkit/uw_boundary_effect.gd";
     private FreeCam _cam = null!;
     private DirectionalLight3D _sun = null!;
 
     // Ryan's live-tuned preset (Copy values, baked): calmer sea, faster phase.
-    private float _waveAmp = 0f;   // PORT EDIT: flat until you raise it — see the header
+    // WAS 0 ("flat until you raise it") which was right for proof 1 and wrong now: every
+    // band's steepness is multiplied by this, so at 0 the whole per-band panel is dead
+    // controls multiplied by zero. Proof 1 is done; the composite should be visible.
+    private float _waveAmp = 1f;
     private float _waveSpeedScale = 1.5375f;
 
     // Chase-camera smoothing (from scene 15): snappy XZ, damped Y so it doesn't pop.
@@ -208,12 +245,159 @@ public partial class UnderwaterLab : Node3D
         BuildSeabed();
         BuildWater();
         BuildIslands();
+        BuildTestCube();
         RenderingServer.CallOnRenderThread(Callable.From(InitMnaSolver));
         // Ryan's preset: MetalFX spatial at 0.4 render scale (sim cost is resolution-
         // independent — fullscreen fps is pure per-pixel work, so scale exactly that).
         GetViewport().Scaling3DScale = 0.4f;
         GetViewport().Scaling3DMode = (Viewport.Scaling3DModeEnum)3;   // MetalFX spatial
+        BuildUwKit();
+        BuildMaskVolume();
         BuildUi();
+    }
+
+    private void BuildMaskVolume()
+    {
+        _maskVp = new SubViewport
+        {
+            Size = (Vector2I)GetViewport().GetVisibleRect().Size,
+            RenderTargetUpdateMode = SubViewport.UpdateMode.Always,
+            OwnWorld3D = true,
+            World3D = new World3D(),
+        };
+        AddChild(_maskVp);
+
+        // No interpolation: this camera must be byte-identical to the main one, and an
+        // interpolated one is smoothed toward a DIFFERENT transform.
+        _maskCam = new Camera3D { Current = true, PhysicsInterpolationMode = PhysicsInterpolationModeEnum.Off };
+        _maskVp.AddChild(_maskCam);
+
+        // A fresh World3D has no Environment, so the viewport would clear to the project
+        // default — and a non-black clear reads as "masked everywhere".
+        _maskVp.AddChild(new WorldEnvironment
+        {
+            Environment = new Godot.Environment
+            {
+                BackgroundMode = Godot.Environment.BGMode.Color,
+                BackgroundColor = Colors.Black,
+            },
+        });
+
+        // SAME footprint and SAME subdivisions as the water plane. A coarser mask
+        // straight-lines across short waves; that error grows with every band.
+        const float depth = 400f;
+        var mi = new MeshInstance3D
+        {
+            Mesh = new BoxMesh
+            {
+                Size = new Vector3(WaterPlaneSize, depth, WaterPlaneSize),
+                SubdivideWidth = WaterPlaneSubdiv,
+                SubdivideDepth = WaterPlaneSubdiv,
+            },
+            Position = new Vector3(0f, -depth * 0.5f, 0f),
+            ExtraCullMargin = 40f,
+        };
+        _maskMat = new ShaderMaterial { Shader = GD.Load<Shader>("res://shaders/uwkit_mask_53.gdshader") };
+        _maskMat.SetShaderParameter("box_top", depth * 0.5f);
+        mi.MaterialOverride = _maskMat;
+        _maskVp.AddChild(mi);
+
+        var layer = new CanvasLayer { Layer = 10 };
+        AddChild(layer);
+        _overlay = new ColorRect { MouseFilter = Control.MouseFilterEnum.Ignore };
+        _overlay.SetAnchorsPreset(Control.LayoutPreset.FullRect);
+        _overlayMat = new ShaderMaterial { Shader = GD.Load<Shader>("res://shaders/uwkit_overlay.gdshader") };
+        _overlayMat.SetShaderParameter("mask_tex", _maskVp.GetTexture());
+        _overlayMat.SetShaderParameter("fill_color", new Color(1f, 1f, 1f, 0.5f));
+        _overlay.Material = _overlayMat;
+        // The overlay stays VISIBLE — it now carries the meniscus. The white debug fill
+        // inside it is what defaults off.
+        _overlayMat.SetShaderParameter("fill_enabled", false);
+        layer.AddChild(_overlay);
+        GD.Print("[mask] volume + overlay built");
+    }
+
+    // ONE data push, every frame, to BOTH materials. If this ever feeds only one of them the
+    // mask stops matching the water in a way that looks like a tuning problem and is not.
+    // Analytic surface height at the camera, from the same composite the field uses.
+    private float SeaLevelAtCamera()
+    {
+        var p = _cam.GlobalPosition;
+        return _field.Height(p.X, p.Z);
+    }
+
+    private void SyncMask()
+    {
+        if (_maskMat == null) return;
+        _maskVp.Size = (Vector2I)GetViewport().GetVisibleRect().Size;
+        _maskCam.GlobalTransform = _cam.GlobalTransform;
+        _maskCam.Fov = _cam.Fov;
+        _maskCam.Near = _cam.Near;
+        _maskCam.Far = _cam.Far;
+
+        // The water material samples the mask directly — nothing is gated, the mask decides
+        // per pixel how much underside shows.
+        _mat.SetShaderParameter("uw_mask_tex", _maskVp.GetTexture());
+
+        foreach (string k in new[]
+        {
+            "wave_time", "wave_count", "wavelengths", "steepnesses", "speeds", "dirs",
+            "mna_tex", "mna_origin", "mna_tex_offset", "mna_window", "mna_displacement",
+            "mna_edge_fade", "foam2_enabled", "mna_foam2_tex", "foam2_puff",
+        })
+        {
+            _maskMat.SetShaderParameter(k, _mat.GetShaderParameter(k));
+        }
+
+        // THE MASK DRIVES THE FOG. Hand the mask viewport to the compositor as an RD texture
+        // and switch it off the analytic eye-height fade entirely. That fade was an estimate
+        // of where the water is; this is where the water actually IS, rasterised from the
+        // same geometry, so `above_fade`, `sample_offset`, `sample_amplitude`, `mask_bias`
+        // and `mask_gain` all stop mattering — they only ever compensated for the estimate.
+        if (_uwBoundary != null)
+        {
+            _uwBoundary.Set("mask_texture", RenderingServer.TextureGetRdTexture(_maskVp.GetTexture().GetRid()));
+            _uwBoundary.Set("use_mask", true);
+        }
+    }
+
+    // Attach the GDScript boundary effect to this camera's compositor.
+    private void BuildUwKit()
+    {
+        var script = GD.Load<GDScript>(UwBoundaryPath);
+        if (script == null)
+        {
+            GD.PushError($"[uwkit] could not load {UwBoundaryPath}");
+            return;
+        }
+        _uwBoundary = script.New().AsGodotObject();
+        if (_uwBoundary is not CompositorEffect fx)
+        {
+            GD.PushError("[uwkit] script did not instantiate as a CompositorEffect");
+            return;
+        }
+        fx.Set("sea_level", 0.0f);
+        fx.Set("test_amplitude", 0.0f);   // flat first — see the shader header
+        fx.Set("debug_mode", 0);   // FOG — the mask view is opt-in from the dropdown
+        // ONE source of truth for the water's colour: the kit owns it and the underside
+        // material is told, so the surface and the volume can no longer disagree. This is
+        // what the UBO bought — the value used to be copy-pasted into both shaders.
+        var near = (Color)fx.Get("fog_near_color");
+        _mat.SetShaderParameter("uw_tir_color", near);
+
+        // The panel's provider dropdown defaults to index 0 (composite gerstner) but its
+        // callback only fires on CHANGE, and the kit's own default is the generic flat
+        // plane. Say it out loud, or the scene opens claiming gerstner while running flat —
+        // which it did.
+        fx.Call("set_provider", "res://uwkit/providers/uw_gerstner.glslinc");
+        // RebuildField ran during _Ready, before the effect existed, so its push was a
+        // no-op. Push again now that there is something to push to.
+        PushBandsToKit();
+
+        var comp = new Compositor();
+        comp.CompositorEffects = new Godot.Collections.Array<CompositorEffect> { fx };
+        _cam.Compositor = comp;
+        GD.Print("[uwkit] boundary effect attached to the camera compositor");
     }
 
     // PORT EDIT: 50 ate the arrow keys so the boat owned them. Nothing is driven here, so
@@ -802,6 +986,19 @@ public partial class UnderwaterLab : Node3D
 
     public override void _ExitTree()
     {
+        // uwkit: the boundary effect is a GDScript-created RefCounted held from C#. Left to
+        // the GC it is finalized on a BACKGROUND thread after the engine has torn down, and
+        // Variant's finalizer then calls into the node tree — "the caller thread can't call
+        // propagate_notification()", then SIGSEGV on exit. Release it here, on the main
+        // thread, while there is still an engine to release it into.
+        if (_cam != null)
+        {
+            _cam.Compositor = null;
+        }
+        _uwBoundary?.Call("cleanup");   // frees the compute shader; Dispose() alone leaks it
+        _uwBoundary?.Dispose();
+        _uwBoundary = null;
+
         if (_mnaTex != null)
         {
             _mnaTex.TextureRdRid = default;
@@ -847,6 +1044,7 @@ public partial class UnderwaterLab : Node3D
         // fps that isn't a clean multiple of 60 (the 55 fps fullscreen stutter).
         _field.Time += (float)delta;
         _mat.SetShaderParameter("wave_time", _field.Time);
+        SyncMask();   // same clock, same frame
         UpdateCamera((float)delta);
         _fpsT += (float)delta;
         if (_fpsT >= 0.25f)
@@ -877,18 +1075,38 @@ public partial class UnderwaterLab : Node3D
     private void RebuildField()
     {
         _field.ClearWaves();
-        foreach (var b in Bands)
+        foreach (var b in _bands)
         {
             _field.AddWave(b[0], b[1] * _waveAmp, b[2] * _waveSpeedScale, b[3]);
         }
-        _field.Wavelength = Bands[0][0];
-        _field.Steepness = Bands[0][1] * _waveAmp;
-        _field.Speed = Bands[0][2] * _waveSpeedScale;
-        _field.Directions = new[] { Bands[0][3], Bands[1][3], Bands[2][3], Bands[3][3] };
+        _field.Wavelength = _bands[0][0];
+        _field.Steepness = _bands[0][1] * _waveAmp;
+        _field.Speed = _bands[0][2] * _waveSpeedScale;
+        _field.Directions = new[] { _bands[0][3], _bands[1][3], _bands[2][3], _bands[3][3] };
         if (_mat != null)
         {
             SyncShaderWaves();
         }
+        PushBandsToKit();
+    }
+
+    // The kit sums these itself in uw_gerstner.glslinc, so the boundary and the fog see the
+    // SAME sea the vertex shader displaces. Amplitude and speed multipliers are folded in
+    // here rather than passed separately — the kit should receive the final waves, not the
+    // recipe for them.
+    private void PushBandsToKit()
+    {
+        if (_uwBoundary == null) return;
+        var flat = new float[32];
+        int n = Math.Min(_bands.Length, 8);
+        for (int i = 0; i < n; i++)
+        {
+            flat[i * 4 + 0] = _bands[i][0];
+            flat[i * 4 + 1] = _bands[i][1] * _waveAmp;
+            flat[i * 4 + 2] = _bands[i][2] * _waveSpeedScale;
+            flat[i * 4 + 3] = _bands[i][3];
+        }
+        _uwBoundary.Call("set_bands", flat, n);
     }
 
     private void SyncShaderWaves()
@@ -1009,6 +1227,7 @@ public partial class UnderwaterLab : Node3D
         _mat.SetShaderParameter("depth_fade_distance", 11.0f);
         _mat.SetShaderParameter("water_color", new Color(0.09f, 0.52f, 0.62f));
         _mat.SetShaderParameter("shallow_color", new Color(0.46f, 0.82f, 0.80f));
+        _mat.SetShaderParameter("uw_underside_on", true);   // the lab exists to look at it
         SyncShaderWaves();
         _mat.SetShaderParameter("foam_tex", GD.Load<Texture2D>(FoamTex));
         _mat.SetShaderParameter("normal_tex", GD.Load<Texture2D>(NormalTex));
@@ -1036,6 +1255,31 @@ public partial class UnderwaterLab : Node3D
 
         mi.MaterialOverride = _mat;
         AddChild(mi);
+    }
+
+    // A big, solid, unmistakable object ABOVE the water — the test target for looking up
+    // from below. Snell's window is hard to judge against empty sky: you cannot tell a
+    // window that is working from one that is simply showing you nothing. A saturated cube
+    // directly overhead makes it obvious — it should be visible through the cone straight
+    // up, and gone once you pan past the critical angle.
+    //
+    // It also gives the depth buffer and the fog something with a KNOWN size and position
+    // to be checked against, which the water-column bands need.
+    private MeshInstance3D _testCube = null!;
+
+    private void BuildTestCube()
+    {
+        _testCube = new MeshInstance3D
+        {
+            Mesh = new BoxMesh { Size = new Vector3(24f, 24f, 24f) },
+            MaterialOverride = new StandardMaterial3D
+            {
+                AlbedoColor = new Color(0.95f, 0.42f, 0.08f),
+                Roughness = 0.55f,
+            },
+            Position = new Vector3(0f, 20f, 0f),
+        };
+        AddChild(_testCube);
     }
 
     // PORT EDIT: BuildBoat deleted — see the header. Nothing else referenced it.
@@ -1099,6 +1343,15 @@ public partial class UnderwaterLab : Node3D
     private void UpdateCamera(float delta)
     {
         _camAnchor = _cam.GlobalPosition;
+
+        // Publish the MNA window to the kit. This is the whole integration surface for a
+        // texture-backed water: a height RID, a world origin and a window size.
+        if (_uwBoundary != null && _uwProvider == 2)
+        {
+            _uwBoundary.Set("height_texture", _mnaSolver?.HeightRid ?? default);
+            _uwBoundary.Set("window_origin", _mnaOrigin);
+            _uwBoundary.Set("window_size", MnaWindow);
+        }
         if (_parkY)
         {
             var p = _cam.GlobalPosition;
@@ -1112,6 +1365,23 @@ public partial class UnderwaterLab : Node3D
     {
         var ui = new DemoUI(this, "50 · Boat + MNA reactive window",
             "Arrow keys: throttle + steer. Scene 16's composite Gerstner sea (all its knobs kept), plus a 48 m CN-MNA sim window riding the swell — h = gerstner + mna. The wake is two steerable pokes (bow ridge + stern trough), each with angle / distance / strength knobs. MNA knobs at the bottom.");
+
+        // THE COMPOSITE, band by band. This is what "composite Gerstner" actually means —
+        // six independent waves — and until now only their global amplitude and speed were
+        // reachable. The kit reads the same array, so moving any of these moves the fog and
+        // the waterline with the water.
+        for (int bi = 0; bi < _bands.Length; bi++)
+        {
+            int b = bi;   // capture
+            ui.AddSlider($"B{b} wavelength (m)", 1f, 60f, _bands[b][0],
+                v => { _bands[b][0] = v; RebuildField(); });
+            ui.AddSlider($"B{b} steepness", 0f, 0.35f, _bands[b][1],
+                v => { _bands[b][1] = v; RebuildField(); });
+            ui.AddSlider($"B{b} speed", 0f, 3f, _bands[b][2],
+                v => { _bands[b][2] = v; RebuildField(); });
+            ui.AddSlider($"B{b} direction (0-1)", 0f, 1f, _bands[b][3],
+                v => { _bands[b][3] = v; RebuildField(); });
+        }
 
         ui.AddSlider("Wave amplitude x", 0f, 2f, _waveAmp, v =>
         {
@@ -1127,6 +1397,95 @@ public partial class UnderwaterLab : Node3D
         // boundary case is a camera that is PARTLY under, and you cannot hold that by hand.
         ui.AddToggle("Park camera Y (hold it on the waterline)", false, on => _parkY = on);
         ui.AddSlider("Camera Y", -6f, 6f, 0f, v => _camParkY = v);
+
+        // PROOF 1 controls. The test ripple is NOT the real wave field on purpose —
+        // see the shader header. Flat must give a straight line; raising the ripple
+        // must bend it, and that is the whole pass criterion.
+        ui.AddToggle("uwkit: show per-pixel boundary (red under / blue above)", true,
+            on => _uwBoundary?.Set("show_boundary", on));
+        ui.AddSlider("uwkit: sea level", -3f, 3f, 0f,
+            v => _uwBoundary?.Set("sea_level", v));
+        ui.AddSlider("uwkit: TEST ripple amplitude (0 = flat)", 0f, 2f, 0f,
+            v => _uwBoundary?.Set("test_amplitude", v));
+        ui.AddSlider("uwkit: TEST ripple frequency", 0.05f, 2f, 0.35f,
+            v => _uwBoundary?.Set("test_frequency", v));
+
+        // PROOF 3 — the modularity claim, reduced to one control. Swapping the
+        // provider is the ONLY edit: the kit's template, effect and host wiring are
+        // identical across all three. FLAT must give a straight line, RIPPLE must bend
+        // it analytically, and MNA TEXTURE must bend it to the actual sim.
+        ui.AddOptions("uwkit: view", new[] { "FOG", "depth probe", "water column (5 m bands)", "MASK + line" }, 0,
+            i => _uwBoundary?.Set("debug_mode", i));
+        // Two brightnesses because they are two different sets of pixels: the SURFACE
+        // seen from below (the chunk) and the fogged VOLUME at distance (the
+        // compositor). The volume one is scaled by water column, so it is inert when
+        // you are looking up from just under the surface — which is why it is not the
+        // one you want there.
+        ui.AddSlider("uwkit: FOG brightness (distance)", 0.2f, 3f, 0.97f,
+            v => _uwBoundary?.Set("underwater_brightness", v));
+        ui.AddSlider("uwkit: fog fades above surface (m)", 0.05f, 8f, 0.129f,
+            v => _uwBoundary?.Set("above_fade", v));
+        // The mask is provider-agnostic: uw_signed_at() calls uw_surface_height(), which IS
+        // whatever provider is loaded. Same two controls here on composite Gerstner as on
+        // water-kit's FFT cascades — that is the contract doing its job, not a coincidence.
+        ui.AddSlider("uwkit: LENS span (m, vertical reach)", 0.05f, 20f, 2f,
+            v => _uwBoundary?.Set("line_distance", v));
+        ui.AddSlider("uwkit: SAMPLE offset (m, phase)", -20f, 20f, 0f,
+            v => _uwBoundary?.Set("sample_offset", v));
+        ui.AddSlider("uwkit: SAMPLE amplitude x", 0f, 4f, 1f,
+            v => _uwBoundary?.Set("sample_amplitude", v));
+        ui.AddSlider("uwkit: MASK bias (m, aligns the line)", -3f, 3f, 0f,
+            v => _uwBoundary?.Set("mask_bias", v));
+        ui.AddSlider("uwkit: MASK gain (transition sharpness)", 0.05f, 8f, 1f,
+            v => _uwBoundary?.Set("mask_gain", v));
+        ui.AddSlider("uwkit: MASK softness (m)", 0f, 0.5f, 0.03f,
+            v => _uwBoundary?.Set("line_softness", v));
+        ui.AddSlider("uwkit: fog density (per metre)", 0f, 0.4f, 0.146f,
+            v => _uwBoundary?.Set("fog_density", v));
+        ui.AddSlider("uwkit: fog colour transition (m)", 5f, 200f, 148.3f,
+            v => _uwBoundary?.Set("fog_transition", v));
+        ui.AddToggle("TEST cube above the water", true, on => _testCube.Visible = on);
+        ui.AddSlider("TEST cube height", 6f, 60f, 20f,
+            v => _testCube.Position = new Vector3(0f, v, 0f));
+        ui.AddSlider("TEST cube size", 4f, 60f, 24f,
+            v => ((BoxMesh)_testCube.Mesh).Size = new Vector3(v, v, v));
+        // The meniscus: the line where the water meets the LENS. Drawn from the mask's edge,
+        // so it lands exactly on the waterline rather than near it.
+        ui.AddToggle("Meniscus", true,
+            on => _overlayMat.SetShaderParameter("meniscus_enabled", on));
+        ui.AddSlider("Meniscus thickness (px)", 1f, 64f, 12f,
+            v => _overlayMat.SetShaderParameter("meniscus_px", v));
+        ui.AddSlider("Meniscus opacity", 0f, 1f, 0.9f,
+            v => _overlayMat.SetShaderParameter("meniscus_color", new Color(1f, 1f, 1f, v)));
+        ui.AddToggle("MASK debug fill (white)", false,
+            on => _overlayMat.SetShaderParameter("fill_enabled", on));
+        ui.AddToggle("uwkit: underside (see the surface from below)", true,
+            on => _mat.SetShaderParameter("uw_underside_on", on));
+        // Renamed with its meaning: this is now TIR strength at grazing angles, NOT a
+        // distance tint. Distance colouring belongs entirely to the fog.
+        ui.AddSlider("uwkit: TIR strength (grazing mirror)", 0f, 1f, 0.21f,
+            v => _mat.SetShaderParameter("uw_tir_strength", v));
+        ui.AddSlider("uwkit: UNDERSIDE brightness (looking up)", 0.1f, 8f, 3.82f,
+            v => _mat.SetShaderParameter("uw_underside_brightness", v));
+        ui.AddSlider("uwkit: mirror lift (grazing only)", 0f, 4f, 2.09f,
+            v => _mat.SetShaderParameter("uw_tir_lift", v));
+        ui.AddSlider("uwkit: underside warp", 0f, 0.25f, 0.0475f,
+            v => _mat.SetShaderParameter("uw_underside_warp", v));
+        ui.AddSlider("uwkit: Snell window softness", 0f, 0.5f, 0.1575f,
+            v => _mat.SetShaderParameter("uw_snell_softness", v));
+        ui.AddOptions("uwkit: height provider",
+            new[] { "composite gerstner", "flat", "ripple", "MNA texture" }, 0, i =>
+        {
+            string[] paths =
+            {
+                "res://uwkit/providers/uw_gerstner.glslinc",
+                "res://uwkit/providers/uw_flat.glslinc",
+                "res://uwkit/providers/uw_ripple.glslinc",
+                "res://uwkit/providers/uw_texture.glslinc",
+            };
+            _uwProvider = i == 3 ? 2 : -1;   // only the texture provider needs the MNA window fed
+            _uwBoundary?.Call("set_provider", paths[i]);
+        });
 
 
 

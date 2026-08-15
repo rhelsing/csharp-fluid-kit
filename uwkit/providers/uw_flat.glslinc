@@ -1,0 +1,9 @@
+// uwkit provider — FLAT. The surface is a plane at sea level.
+//
+// The baseline every other provider is judged against, and deliberately the dullest thing
+// that can satisfy the contract. Its job in proof 3 is to make the failure mode visible: a
+// flat sea would let a hardcoded constant pass every test, so if swapping to a real
+// provider does NOT change the boundary, the swap is not doing anything.
+float uw_surface_height(vec2 world_xz) {
+	return p.wave.x;
+}

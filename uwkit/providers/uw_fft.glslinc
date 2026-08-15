@@ -1,0 +1,31 @@
+// uwkit provider — FFT CASCADES (water-kit's threejs-water-pro ocean).
+//
+// The entire per-water code cost of putting uwkit on this ocean, alongside three lines in
+// the surface shader. Nothing inside the kit changed shape to support it.
+//
+// WHY IT IS NOT uw_texture.glslinc. That maps a height texture over a bounded world WINDOW
+// and falls back to sea level outside — right for a sim box that follows a boat or camera.
+// An FFT cascade is the opposite: a periodic TILE repeating forever, so it is fract() and
+// there is no outside.
+//
+// WHY THREE CASCADES, not one. This started as one, and drew a perfectly straight
+// waterline. The reason is scale: the biggest cascade is the swell on a ~4501 m tile, and
+// across the couple of metres a classification plane spans, a 4501 m wave is a constant.
+// The SHAPE — the noise and chop you actually see on the surface — lives in the small
+// cascades (~109 m tile). Summing them is not a refinement, it is the difference between a
+// line that follows the water and a ruler.
+//
+// window.z / meta.y / meta.z carry each cascade's world scale in metres; a scale of 0
+// switches that cascade off, so a one-texture host is unaffected.
+//
+// The displacement texture is (x, y, z) world offset; y (.g) is height.
+float uw_surface_height(vec2 world_xz) {
+	float h = texture(height_tex, fract(world_xz / max(p.window.z, 1e-4))).g;
+	if (kit.meta.y > 0.0) {
+		h += texture(height_tex_b, fract(world_xz / kit.meta.y)).g;
+	}
+	if (kit.meta.z > 0.0) {
+		h += texture(height_tex_c, fract(world_xz / kit.meta.z)).g;
+	}
+	return p.wave.x + h;
+}

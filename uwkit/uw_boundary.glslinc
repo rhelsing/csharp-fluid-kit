@@ -1,0 +1,318 @@
+#version 450
+
+// uwkit — the boundary compute TEMPLATE. Composed at runtime with exactly one provider
+// snippet, which must define:
+//
+//     float uw_surface_height(vec2 world_xz)
+//
+// That single function IS the modularity contract. Everything above and below it is fixed;
+// a water only has to answer "how high is your surface at this world XZ". Composing GLSL
+// from snippets rather than branching on a mode uniform is the pattern GpuStampSolver
+// already uses in this repo, so it is a convention here, not an invention.
+//
+// The provider is substituted at the marker line below. NOTE: do not write that
+// token anywhere else in this file — substitution replaces EVERY occurrence, so a
+// comment mentioning it splices the provider in above the push-constant block and
+// the compile fails with "'p': undeclared identifier". It did exactly that once.
+//
+// PROOF 1's lesson is encoded in the push constants: the projection supplies DISTANCES
+// only (z_near, tangent half-angles, all magnitudes). Direction comes solely from the
+// camera basis. Godot's Projection reports a negative z_near and a negative m11 under the
+// Vulkan convention, and taking either as a direction silently inverts the whole test.
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(rgba16f, set = 0, binding = 0) uniform image2D color_image;
+
+// Texture-backed providers (MNA, FFT) sample this; analytic providers ignore it. Always
+// bound, so one template serves both and neither needs a variant.
+layout(set = 0, binding = 1) uniform sampler2D height_tex;
+// Two OPTIONAL extra height textures. A single texture is enough for a sim window, but an
+// FFT ocean is a stack of cascades at wildly different world scales — and the fine ones are
+// where the SHAPE lives. Sampling only the biggest (a 4501 m tile) across a 2 m plane gives
+// a constant, which is a dead straight waterline. Hosts with one texture bind the same RID
+// three times and set the extra scales to 0, which switches them off.
+layout(set = 0, binding = 4) uniform sampler2D height_tex_b;
+layout(set = 0, binding = 5) uniform sampler2D height_tex_c;
+
+// THE MASK — a screen-space texture RASTERISED from the water geometry itself: 0 above the
+// surface, 1 below. Crest's UnderwaterMaskShared.hlsl, in Godot form. When this is bound
+// the kit stops reconstructing the boundary entirely: same mesh, same displacement, same
+// near-plane clip as the water you can see, so it cannot drift or pop.
+layout(set = 0, binding = 6) uniform sampler2D water_mask_tex;
+
+// PROOF 4: what depth is available POST_TRANSPARENT? Godot's transparent surfaces do not
+// write depth, so a refracting water plane is expected to be INVISIBLE here — this binding
+// exists to establish that as fact rather than folklore, because the answer decides whether
+// underwater fog can be distance-driven or must find the surface analytically per ray.
+layout(set = 0, binding = 2) uniform sampler2D depth_tex;
+
+// UNIFORM BUFFER for anything that does not fit the 128 bytes of push constants — which is
+// everything that is not the camera. The push block is EXACTLY at Vulkan's guaranteed 128
+// (8 vec4s) with no room left, and a composite Gerstner needs 6 bands x 4 floats on its own.
+//
+// Split by change frequency, which is also the right split by meaning: the camera changes
+// every frame and lives in push constants; wave bands and fog colours change when someone
+// moves a slider and live here.
+layout(set = 0, binding = 3, std140) uniform Kit {
+	vec4 bands[8];     // per band: wavelength, steepness, speed, direction(0..1)
+	vec4 meta;         // x = band count, y/z = extra cascade scales, w = line softness (m)
+	vec4 fog_near;     // rgb — SINGLE SOURCE OF TRUTH for the water's colour
+	vec4 fog_far;      // rgb
+	vec4 tune;         // x = mask bias (m), y = mask gain, z = USE MASK flag, w = sample amplitude x
+} kit;
+
+layout(push_constant, std430) uniform Params {
+	vec4 basis_x;      // camera right   (w = underwater brightness)
+	vec4 basis_y;      // camera up      (w = above-water fog fade distance, m)
+	vec4 basis_z;      // camera forward (w = LINE plane distance, m)
+	vec4 origin_near;  // xyz = camera world position, w = z_near (MAGNITUDE)
+	vec4 tan_size;     // x,y = |tan(half fov)|   z,w = render target size
+	vec4 wave;         // x = sea level, y = amplitude, z = frequency, w = time
+	vec4 window;       // xy = height-texture world origin, z = window size (m), w = debug mode
+	vec4 fog;          // x,y = projection m22/m32 (depth linearise), z = density, w = transition (m)
+} p;
+
+//__UW_PROVIDER__
+
+// PROOF 4's findings, encoded:
+//   · reverse-Z, so cleared/far = 0.0 and near = 1.0
+//   · d == 0.0 exactly means NOTHING was drawn (sky) — fog then runs to infinity
+//   · linearising uses the projection's OWN m22/m32 rather than a near/far guess, so it
+//     stays correct whatever convention Godot picks. Every convention assumed by hand in
+//     this file has been wrong once already.
+float uw_view_distance(float d) {
+	if (d <= 0.0) {
+		return 1.0e9;               // sky: no geometry, fog to the horizon
+	}
+	return abs(p.fog.y / (d + p.fog.x));
+}
+
+// Ray vs a WAVY surface. Flat water solves in one step; a displaced surface does not, so
+// take the flat solve and refine it twice by re-sampling the height where the ray actually
+// crossed. Two iterations is enough at swell wavelengths and costs two texture taps.
+float uw_surface_cross(vec3 eye, vec3 dir) {
+	if (abs(dir.y) < 1e-4) {
+		return -1.0;                 // parallel to the surface: never crosses
+	}
+	float t = (uw_surface_height(eye.xz) - eye.y) / dir.y;
+	for (int i = 0; i < 2; i++) {
+		vec3 hit = eye + dir * max(t, 0.0);
+		t = (uw_surface_height(hit.xz) - eye.y) / dir.y;
+	}
+	return t;
+}
+
+
+// Raw water column for ONE screen position, before the above-surface fade. Factored out of
+// main() so the waterline view can evaluate NEIGHBOURING pixels and edge-detect the split —
+// a compute shader has no fwidth(), so the derivative has to be taken by hand.
+float uw_column_raw(vec2 ndc, vec2 uv) {
+	float zn = p.origin_near.w;
+	vec3 near_pt = p.origin_near.xyz
+		+ p.basis_z.xyz * zn
+		+ p.basis_x.xyz * (ndc.x * zn * p.tan_size.x)
+		+ p.basis_y.xyz * (ndc.y * zn * p.tan_size.y);
+	vec3 eye = p.origin_near.xyz;
+	vec3 dir = normalize(near_pt - eye);
+
+	float t_geo = uw_view_distance(texture(depth_tex, uv).r);
+	float t_cross = uw_surface_cross(eye, dir);
+	bool eye_under = eye.y < uw_surface_height(eye.xz);
+
+	if (eye_under) {
+		return min((t_cross > 0.0) ? t_cross : 1.0e9, t_geo);
+	}
+	if (t_cross > 0.0) {
+		return max(0.0, t_geo - t_cross);   // looking down through the surface
+	}
+	return 0.0;                              // looking at sky, no water on this ray
+}
+
+// PROOF 1's classification, restored: is the NEAR-PLANE point for this pixel under the
+// surface? That is the red/blue split, and it is a 2D screen-space thing — the near plane
+// is only z_near from the eye, so the line exists when the camera is within centimetres of
+// the surface, and it bends because each pixel samples the surface at its own world XZ.
+//
+// Deliberately NOT the ray-vs-surface crossing across the whole scene. That version drew a
+// horizon-wide line and shaded the sea, which is not what this view is for.
+// THE MASK. Signed height of this pixel's classification point above the surface, in
+// METRES — positive above water, negative below, zero exactly on it.
+//
+// This replaced a bool. A boolean classification thresholded per pixel produces a
+// STAIRCASE along a near-horizontal boundary: long flat runs and sudden one-pixel jumps,
+// which a 0.4 render scale then magnifies into blocks. Nothing about the surface is
+// stepped — the aliasing was created entirely by asking a yes/no question of a smooth
+// field. Keep the field continuous and the answer is smooth for free.
+//
+// Everything downstream takes this one number: the line is where it is near zero, and the
+// division between above-water and underwater is smoothstep across it.
+float uw_signed_at(vec2 ndc) {
+	// A FLAT LENS THROUGH THE EYE — no forward term, no normalize. Both of those were wrong
+	// for different reasons and both were tried:
+	//
+	//   SPHERE (normalize(dir) * R): a normalized ray's Y varies with screen X as well as Y,
+	//     so the division bows into an arc. That is the "round lens" look.
+	//   PLANE AT DISTANCE D (eye + forward*D + lateral): straight, but `forward * D` pushes
+	//     every sample D metres AHEAD — and downward whenever the camera is pitched down —
+	//     so the line sat below the real waterline with visible water above it.
+	//
+	// Dropping the forward term keeps the lateral offsets only. For a level camera the probe
+	// height is then eye.y + ndc.y * span, which depends on screen Y alone: a straight
+	// horizontal line, centred on the eye. It curves ONLY because each pixel samples the
+	// surface at its own world XZ — i.e. it curves with the water and with nothing else.
+	//
+	// Consequence worth stating: once the eye is deeper than `span`, every probe is under
+	// the surface and the whole screen reads underwater. That is the behaviour you want —
+	// below the water, you see underwater — and it falls out rather than being special-cased.
+	float span = max(p.basis_z.w, p.origin_near.w);
+	vec3 probe = p.origin_near.xyz
+		+ p.basis_x.xyz * (ndc.x * span * p.tan_size.x)
+		+ p.basis_y.xyz * (ndc.y * span * p.tan_size.y);
+
+	// BIAS then GAIN. Bias slides the division up or down in metres — the control that
+	// aligns the line with the visible waterline. Gain steepens or softens how fast the mask
+	// swings through the transition without changing where it sits.
+	// SAMPLE OFFSET, along the horizontal view direction. The wave field MOVES, so shifting
+	// where it is read along the direction of travel shifts its PHASE — which is the only
+	// way to re-time a texture-baked provider like the FFT cascades, where time is already
+	// integrated into the texture and cannot be dialled back.
+	vec3 fwd_h = vec3(p.basis_z.x, 0.0, p.basis_z.z);
+	float fl = length(fwd_h);
+	vec2 sample_xz = probe.xz + (fl > 1e-4 ? fwd_h.xz / fl : vec2(0.0)) * kit.tune.z;
+
+	// SAMPLE AMPLITUDE, about sea level so the datum does not move with it.
+	float h = uw_surface_height(sample_xz);
+	h = p.wave.x + (h - p.wave.x) * kit.tune.w;
+
+	float sd = probe.y - h + kit.tune.x;
+	return sd * max(kit.tune.y, 0.001);
+}
+
+// 1 = fully above water, 0 = fully below, smooth across `meta.w` metres.
+float uw_above_mask(vec2 ndc) {
+	float soft = max(kit.meta.w, 1e-4);
+	return smoothstep(-soft, soft, uw_signed_at(ndc));
+}
+
+vec2 uw_ndc(ivec2 px, ivec2 size) {
+	vec2 n = (vec2(px) + 0.5) / vec2(size) * 2.0 - 1.0;
+	n.y = -n.y;
+	return n;
+}
+
+void main() {
+	ivec2 px = ivec2(gl_GlobalInvocationID.xy);
+	ivec2 size = ivec2(p.tan_size.zw);
+	if (px.x >= size.x || px.y >= size.y) {
+		return;
+	}
+	vec2 uv = (vec2(px) + 0.5) / vec2(size);
+	vec4 c = imageLoad(color_image, px);
+
+	// Debug 1 — depth probe. RED = exactly 0 (nothing drawn), GREEN = d*1000 (reverse-Z far
+	// field), BLUE = pow(d, 0.1). A red screen is a binding bug; green/blue is reverse-Z.
+	if (p.window.w > 0.5 && p.window.w < 1.5) {
+		float d = texture(depth_tex, uv).r;
+		imageStore(color_image, px, vec4(
+			d == 0.0 ? 1.0 : 0.0,
+			clamp(d * 1000.0, 0.0, 1.0),
+			pow(clamp(d, 0.0, 1.0), 0.1), c.a));
+		return;
+	}
+
+	float water = uw_column_raw(uw_ndc(px, size), uv);
+	// Distance to the nearest geometry along this ray. `t_geo` inside uw_column_raw is a
+	// local of that function, so main() needs its own.
+	float t_geo = uw_view_distance(texture(depth_tex, uv).r);
+
+	// Debug 2 — the water column in metres, banded every 5 m so it can be counted by eye.
+	if (p.window.w > 1.5 && p.window.w < 2.5) {
+		float band = fract(water / 5.0);
+		vec3 v = (water <= 0.0) ? vec3(0.05) : mix(vec3(0.0, 0.35, 0.5), vec3(0.6, 1.0, 1.0), band);
+		imageStore(color_image, px, vec4(v, c.a));
+		return;
+	}
+
+	// Debug 5 — THE MASK, read back. Green wherever the rasterised mask says "below". The
+	// water shader's own magenta tag is the ground truth on screen, so the two coinciding
+	// exactly is the pass criterion, not a judgement call.
+	if (p.window.w > 4.5) {
+		float m = texture(water_mask_tex, uv).r;
+		if (m > 0.5) {
+			c.rgb = mix(c.rgb, vec3(0.0, 1.0, 0.2), 0.55);
+		}
+		imageStore(color_image, px, c);
+		return;
+	}
+
+	// Debug 4 — MECHANISM TEST. Paint GREEN wherever the colour buffer's alpha carries the
+	// back-face sentinel. Ground truth is the water shader's own MAGENTA tag, which is the
+	// rasteriser's exact answer. If the green lands exactly on the magenta, a per-fragment
+	// tag survives to the compositor and the mask mechanism works; if it lands anywhere
+	// else, or nowhere, alpha does not survive the pass and mechanism B is out too.
+	if (p.window.w > 3.5) {
+		if (c.a < 0.5) {
+			c.rgb = mix(c.rgb, vec3(0.0, 1.0, 0.2), 0.55);
+		}
+		imageStore(color_image, px, c);
+		return;
+	}
+
+	// Debug 3 — THE MASK, shown. `above` is the division: 1 above water, 0 below, smoothly
+	// graded across the softness band. The white line is simply where it is mid-way, drawn
+	// with the same smooth value so the line itself is antialiased rather than stepped.
+	if (p.window.w > 2.5) {
+		float above = uw_above_mask(uw_ndc(px, size));
+
+		float f3 = 1.0 - exp(-p.fog.z * water);
+		vec3 fc3 = mix(kit.fog_near.rgb, kit.fog_far.rgb,
+			clamp(water / max(p.fog.w, 0.01), 0.0, 1.0));
+		vec3 fogged = mix(c.rgb, fc3, clamp(f3, 0.0, 1.0));
+
+		// Division by the mask, not by a branch.
+		c.rgb = mix(fogged, c.rgb, above);
+
+		// The line: a smooth ridge peaking where above == 0.5.
+		float line = 1.0 - smoothstep(0.0, 0.5, abs(above - 0.5));
+		c.rgb = mix(c.rgb, vec3(1.0), line);
+		imageStore(color_image, px, c);
+		return;
+	}
+
+	// FOG IS FOR BEING IN THE WATER. Looking down into the sea from above, the water's OWN
+	// shader already does depth fade and shore colour — adding compositor fog on top is the
+	// same double count the underside chunk was guilty of, and it reads as haze on the sea.
+	//
+	// But it cannot simply be gated on "eye is below": that is a single bool for the whole
+	// screen, so the entire frame would switch at the crossing — exactly the pop proof 5
+	// removed. Instead it fades out over the first metre or so ABOVE the surface.
+	// THE MASK DECIDES, when one is bound. Rasterised from the water geometry itself, so it
+	// agrees with the water you can see by construction — no phase, no amplitude, no bias.
+	// Falls back to the analytic eye-height fade when no mask is supplied, so waters without
+	// a mask pass still work.
+	if (kit.tune.z > 0.5) {
+		// MASK MODE: the mask says WHERE, the column still says HOW FAR.
+		//
+		// I briefly replaced the column with raw scene depth. That destroyed the underside:
+		// the water writes NO depth, so looking up at it from below there is no geometry on
+		// that ray, t_geo runs to the clamp, and the fog saturates and paints over the very
+		// thing you are looking at. The column knows that looking up means a SHORT distance
+		// to the surface; scene depth does not.
+		water *= texture(water_mask_tex, uv).r;
+	} else {
+		float eye_above = p.origin_near.y - uw_surface_height(p.origin_near.xz);
+		water *= 1.0 - smoothstep(0.0, max(p.basis_y.w, 0.001), eye_above);
+	}
+
+	float f = 1.0 - exp(-p.fog.z * water);
+	vec3 fog_col = mix(kit.fog_near.rgb, kit.fog_far.rgb,
+		clamp(water / max(p.fog.w, 0.01), 0.0, 1.0));
+	c.rgb = mix(c.rgb, fog_col, clamp(f, 0.0, 1.0));
+
+	// ONE brightness knob for everything seen through water, scaled BY the fog factor so it
+	// inherits the no-pop property: where there is no water there is no gain.
+	c.rgb *= mix(1.0, p.basis_x.w, clamp(f, 0.0, 1.0));
+
+	imageStore(color_image, px, c);
+}

@@ -1,0 +1,11 @@
+// uwkit provider — ANALYTIC test ripple. One travelling sine about sea level.
+//
+// Not a real water. It exists so the boundary can be seen to BEND by eye, with a shape
+// simple enough that "is that right?" is answerable without trusting a sim.
+float uw_surface_height(vec2 world_xz) {
+	if (p.wave.y <= 0.0) {
+		return p.wave.x;
+	}
+	float f = p.wave.z * (world_xz.x + world_xz.y) - p.wave.w * 1.6;
+	return p.wave.x + p.wave.y * sin(f);
+}

@@ -1,0 +1,16 @@
+// uwkit provider — HEIGHT TEXTURE over a world-space window.
+//
+// The shape that matters: this is what a real sim publishes. Scene 50's CN-MNA window
+// already exposes exactly (texture, world origin, window size) as mna_tex / mna_origin /
+// mna_window, and water-kit's FFT cascades are the same shape. Any water that can render
+// its height into a texture satisfies the contract with this file unchanged.
+//
+// Outside the window the height falls back to sea level, so a boat-following or
+// camera-following window degrades to a flat sea at its edges rather than to garbage.
+float uw_surface_height(vec2 world_xz) {
+	vec2 uv = (world_xz - p.window.xy) / max(p.window.z, 1e-4);
+	if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) {
+		return p.wave.x;
+	}
+	return p.wave.x + texture(height_tex, uv).r * p.wave.y;
+}

@@ -1,0 +1,28 @@
+// uwkit provider — COMPOSITE GERSTNER, the real one.
+//
+// Sums the SAME bands the water's vertex shader sums, from the kit uniform buffer, so the
+// boundary and the fog are computed against the sea you can actually see. Before this
+// existed the only analytic providers were a flat plane and a single test sine, so raising
+// the wave slider moved the water and nothing else — the fog kept believing in a plane.
+//
+// Matches CompositeGerstner.Wave() term for term, including the one approximation that
+// matters: a Gerstner wave displaces sideways as well as up, so the surface is parametric
+// and "height at world XZ" is not strictly a function. Evaluating at the query XZ and
+// ignoring the horizontal sway is exactly what the CPU GerstnerField.Height() does, so the
+// kit agrees with the buoyancy sampler by construction rather than by luck.
+float uw_surface_height(vec2 world_xz) {
+	float h = 0.0;
+	int n = int(kit.meta.x);
+	for (int i = 0; i < n && i < 8; i++) {
+		float wavelength = kit.bands[i].x;
+		float steepness = kit.bands[i].y;
+		float speed = kit.bands[i].z;
+		float dir = kit.bands[i].w * 2.0 - 1.0;
+		vec2 d = normalize(vec2(cos(3.14159265 * dir), sin(3.14159265 * dir)));
+		float k = 6.28318531 / max(wavelength, 1e-4);
+		float a = steepness / k;
+		float ph = k * (dot(d, world_xz) - speed * p.wave.w);
+		h += a * sin(ph);
+	}
+	return p.wave.x + h;
+}
