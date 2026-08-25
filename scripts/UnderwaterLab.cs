@@ -94,6 +94,11 @@ public partial class UnderwaterLab : Node3D
     private Camera3D _maskCam = null!;
     private ShaderMaterial _maskMat = null!;
     private ColorRect _overlay = null!;
+
+    // ---- kit components: full-frame warp + masked motes ----
+    private GodotObject? _warpFx;
+    private GpuParticles3D _motes = null!;
+    private ShaderMaterial _moteMat = null!;
     private float _underFade = 0.35f;   // metres over which the underside look eases in
     private ShaderMaterial _overlayMat = null!;
 
@@ -253,6 +258,7 @@ public partial class UnderwaterLab : Node3D
         GetViewport().Scaling3DMode = (Viewport.Scaling3DModeEnum)3;   // MetalFX spatial
         BuildUwKit();
         BuildMaskVolume();
+        BuildUwEffects();
         BuildUi();
     }
 
@@ -317,6 +323,66 @@ public partial class UnderwaterLab : Node3D
         GD.Print("[mask] volume + overlay built");
     }
 
+    // uwkit components. Both are mask-driven, so neither is gated on a camera test.
+    private void BuildUwEffects()
+    {
+        // FULL-FRAME WARP. Must join the EXISTING compositor rather than getting its own —
+        // a Camera3D's Compositor overrides the WorldEnvironment's, and two Compositor
+        // objects on two nodes is not additive. In water-kit this silently stopped 01b's
+        // warp running the moment uwkit added one to the camera.
+        var warpScript = GD.Load<GDScript>("res://uwkit/uw_warp_effect.gd");
+        if (warpScript != null)
+        {
+            _warpFx = warpScript.New().AsGodotObject();
+            if (_warpFx is CompositorEffect wfx && _cam.Compositor != null)
+            {
+                var fx = new Godot.Collections.Array<CompositorEffect>(_cam.Compositor.CompositorEffects) { wfx };
+                _cam.Compositor.CompositorEffects = fx;   // fog first, then warp the fogged frame
+                GD.Print("[uwkit] warp added to the camera compositor");
+            }
+        }
+
+        // MOTES. Always emitting — they are 3D objects living IN the water volume, so the
+        // mask makes them visible exactly where the water is. Gating them on a camera bool
+        // was always redundant.
+        var img = Image.CreateEmpty(32, 32, false, Image.Format.Rgba8);
+        for (int y = 0; y < 32; y++)
+        for (int x = 0; x < 32; x++)
+        {
+            float d = new Vector2(x - 15.5f, y - 15.5f).Length() / 15.5f;
+            float a = Mathf.Clamp(1f - d, 0f, 1f);
+            img.SetPixel(x, y, new Color(1f, 1f, 1f, a * a));
+        }
+        var moteTex = ImageTexture.CreateFromImage(img);
+
+        var pm = new ParticleProcessMaterial
+        {
+            EmissionShape = ParticleProcessMaterial.EmissionShapeEnum.Box,
+            EmissionBoxExtents = new Vector3(18f, 10f, 18f),
+            Gravity = new Vector3(0f, 0.02f, 0f),
+            InitialVelocityMin = 0.05f,
+            InitialVelocityMax = 0.25f,
+            ScaleMin = 0.4f,
+            ScaleMax = 1.4f,
+        };
+
+        _moteMat = new ShaderMaterial { Shader = GD.Load<Shader>("res://uwkit/uw_particle.gdshader") };
+        _moteMat.SetShaderParameter("albedo_tex", moteTex);
+        var quad = new QuadMesh { Size = new Vector2(0.10f, 0.10f), Material = _moteMat };
+
+        _motes = new GpuParticles3D
+        {
+            Amount = 600,
+            Lifetime = 14f,
+            LocalCoords = false,   // world space; the emitter reseeds around the camera
+            ProcessMaterial = pm,
+            DrawPass1 = quad,
+            Emitting = true,
+        };
+        _cam.AddChild(_motes);
+        GD.Print("[uwkit] motes built (mask-driven)");
+    }
+
     // ONE data push, every frame, to BOTH materials. If this ever feeds only one of them the
     // mask stops matching the water in a way that looks like a tuning problem and is not.
     // Analytic surface height at the camera, from the same composite the field uses.
@@ -359,6 +425,9 @@ public partial class UnderwaterLab : Node3D
             _uwBoundary.Set("mask_texture", RenderingServer.TextureGetRdTexture(_maskVp.GetTexture().GetRid()));
             _uwBoundary.Set("use_mask", true);
         }
+        // The warp takes an RD texture; the particles take an ordinary viewport texture.
+        _warpFx?.Set("mask_texture", RenderingServer.TextureGetRdTexture(_maskVp.GetTexture().GetRid()));
+        _moteMat?.SetShaderParameter("uw_mask_tex", _maskVp.GetTexture());
     }
 
     // Attach the GDScript boundary effect to this camera's compositor.
@@ -1451,6 +1520,11 @@ public partial class UnderwaterLab : Node3D
             v => ((BoxMesh)_testCube.Mesh).Size = new Vector3(v, v, v));
         // The meniscus: the line where the water meets the LENS. Drawn from the mask's edge,
         // so it lands exactly on the waterline rather than near it.
+        ui.AddToggle("Motes (mask-driven)", true, on => _motes.Visible = on);
+        ui.AddSlider("Mote count", 0f, 2000f, 600f, v => _motes.Amount = Mathf.Max(1, (int)v));
+        ui.AddToggle("Full-frame warp", true, on => _warpFx?.Set("enabled", on));
+        ui.AddSlider("Warp amount", 0f, 0.03f, 0.006f, v => _warpFx?.Set("amount", v));
+        ui.AddSlider("Warp speed", 0f, 3f, 0.7f, v => _warpFx?.Set("speed", v));
         ui.AddToggle("Meniscus", true,
             on => _overlayMat.SetShaderParameter("meniscus_enabled", on));
         ui.AddSlider("Meniscus thickness (px)", 1f, 64f, 12f,

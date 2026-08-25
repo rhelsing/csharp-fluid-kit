@@ -1,0 +1,14 @@
+[remap]
+
+importer="glsl"
+type="RDShaderFile"
+uid="uid://8h20vn7o6h6u"
+path="res://.godot/imported/uw_warp.glsl-3bd9a1faa038f3cc2d66dca361c42e3e.res"
+
+[deps]
+
+source_file="res://uwkit/uw_warp.glsl"
+dest_files=["res://.godot/imported/uw_warp.glsl-3bd9a1faa038f3cc2d66dca361c42e3e.res"]
+
+[params]
+

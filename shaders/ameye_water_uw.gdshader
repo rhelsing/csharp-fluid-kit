@@ -244,6 +244,18 @@ void fragment() {
 		col = mix(col, dm, mna_fade);
 	}
 
+	// BACK FACES ARE DISCARDED WHERE THE MASK SAYS "NOT UNDERWATER".
+	//
+	// Shading them with the topside look was not enough: the fold is still DRAWN, and the
+	// underside of a wave shaded as though it were a top still reads wrong from above.
+	//
+	// The decision is the MASK's, not a camera test — 0 means this pixel is outside the
+	// water volume, so a back face here is a fold seen from outside and should not exist.
+	// Inside the volume the mask is 1 and the underside renders normally.
+	if (!FRONT_FACING && texture(uw_mask_tex, SCREEN_UV).r < 0.5) {
+		discard;
+	}
+
 	// uwkit: the same plane seen from below IS the underside. wave_normal is this shader's
 	// own surface normal, so the ripples from below match the ripples from above.
 	if (!FRONT_FACING && uw_underside_on) {
